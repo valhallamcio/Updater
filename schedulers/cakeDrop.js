@@ -90,7 +90,7 @@ module.exports = {
             for (let player of playerData[serverName]) {
                 if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player)) continue;
                 await pterodactyl.sendCommand(server.serverId, alertCakeDrop.replace("[RECIEVERS]", player));
-                if (server.serverId === "dff4e4d4") {
+                if (server.serverId === "458e7efa") {
                     await pterodactyl.sendCommand(server.serverId, `give ${player} tfc:cake ${cakeAmount}`);
 
                 } else {

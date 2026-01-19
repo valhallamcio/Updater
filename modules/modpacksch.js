@@ -11,6 +11,7 @@
  */
 
 const axios = require('axios');
+const sessionLogger = require('./sessionLogger');
 
 module.exports = {
 
@@ -33,6 +34,13 @@ module.exports = {
      */
     getFTBPackManifest: async function (modPackId, modPackVersion) {
         let response = await axios.get(`https://api.feed-the-beast.com/v1/modpacks/public/modpack/${modPackId}/${modPackVersion}`);
+
+        // Diagnostic logging for API response structure
+        sessionLogger.debug('ModpacksCH', `FTB API response type: ${typeof response.data}`);
+        sessionLogger.debug('ModpacksCH', `FTB API response has files: ${Array.isArray(response.data.files)}`);
+        if (response.data.files && response.data.files.length > 0) {
+            sessionLogger.debug('ModpacksCH', `FTB API response files count: ${response.data.files.length}`);
+        }
 
         return response.data;
     },

@@ -735,5 +735,122 @@ module.exports = {
             .toArray();
             
         return requests;
+    },
+
+    // =========================================================================
+    // PLAYER FUNCTIONS (for Wrapped feature)
+    // =========================================================================
+
+    /**
+     * Finds a player by their Discord ID in the valhallamc.players collection.
+     * @param {string} discordId - Discord user ID
+     * @returns {object|null} Player document or null if not found
+     */
+    getPlayerByDiscordId: async function (discordId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+        
+        console.log(`[Mongo] Searching for discord_id: ${discordId}`);
+        
+        // Discord IDs can be stored as Long, number, or string
+        const query = {
+            $or: [
+                { discord_id: Long.fromString(discordId) },
+                { discord_id: parseInt(discordId) },
+                { discord_id: discordId }
+            ]
+        };
+        
+        console.log(`[Mongo] Query:`, JSON.stringify(query, (key, value) => 
+            typeof value === 'bigint' ? value.toString() : value
+        ));
+        
+        const player = await mongoClient
+            .db('valhallamc')
+            .collection('players')
+            .findOne(query);
+        
+        if (!player) {
+            // Debug: check if collection exists and has documents
+            const count = await mongoClient
+                .db('valhallamc')
+                .collection('players')
+                .countDocuments({});
+            console.log(`[Mongo] Collection 'valhallamc.players' has ${count} documents`);
+            
+            // Check a sample document to see discord_id format
+            const sample = await mongoClient
+                .db('valhallamc')
+                .collection('players')
+                .findOne({ discord_id: { $exists: true } });
+            if (sample) {
+                console.log(`[Mongo] Sample discord_id type: ${typeof sample.discord_id}, value: ${sample.discord_id}`);
+            }
+        }
+
+        return player;
+    },
+
+    /**
+     * Finds a player by their Minecraft username.
+     * @param {string} username - Minecraft username (case-insensitive)
+     * @returns {object|null} Player document or null if not found
+     */
+    getPlayerByUsername: async function (username) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+        
+        const player = await mongoClient
+            .db('valhallamc')
+            .collection('players')
+            .findOne({
+                username: { $regex: new RegExp(`^${username}$`, 'i') }
+            });
+
+        return player;
+    },
+
+    /**
+     * Finds a player by their Minecraft UUID.
+     * UUID is stored as Binary subtype 03 in MongoDB.
+     * @param {string} uuid - Minecraft UUID (dashed or undashed format)
+     * @returns {object|null} Player document or null if not found
+     */
+    getPlayerByUuid: async function (uuid) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+        
+        const { uuidToMongoBase64, normalizeUuid } = require('./uuidUtils');
+        const { Binary } = require('mongodb');
+        
+        // Normalize UUID and convert to MongoDB Binary format
+        const normalizedUuid = normalizeUuid(uuid);
+        const base64 = uuidToMongoBase64(normalizedUuid);
+        const binaryUuid = new Binary(Buffer.from(base64, 'base64'), Binary.SUBTYPE_UUID_OLD);
+        
+        const player = await mongoClient
+            .db('valhallamc')
+            .collection('players')
+            .findOne({ uuid: binaryUuid });
+
+        return player;
+    },
+
+    /**
+     * Gets the main MongoDB client (for advanced queries).
+     * @returns {MongoClient} The main MongoDB client
+     */
+    getClient: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+        return mongoClient;
     }
 };

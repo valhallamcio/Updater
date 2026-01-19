@@ -66,19 +66,57 @@ module.exports = {
      * @param {object} newManifest Object containing the new manifest.
      */
     mergeFromManifest: async function (dir, changeList, newManifest) {
+        // Diagnostic logging for deletions
+        sessionLogger.info('Merger', `Attempting to delete ${changeList.deletions.length} files`);
+        if (changeList.deletions.length > 0) {
+            sessionLogger.info('Merger', `First 3 deletion paths: ${JSON.stringify(changeList.deletions.slice(0, 3))}`);
+        }
+
+        let deletedCount = 0;
+        let notFoundCount = 0;
         for (let path of changeList.deletions) {
-            if (fs.existsSync(`${dir}${path}`)) {
-                await fs.rmSync(`${dir}${path}`, {
+            // Strip leading ./ from path before concatenating
+            const relativePath = path.startsWith('./') ? path.substring(2) : path;
+            const fullPath = `${dir}/${relativePath}`;
+
+            sessionLogger.debug('Merger', `Checking: ${fullPath}`);
+
+            if (fs.existsSync(fullPath)) {
+                await fs.rmSync(fullPath, {
                     recursive: true,
                     force: true
                 });
+                deletedCount++;
+            } else {
+                notFoundCount++;
+                if (notFoundCount <= 3) {
+                    sessionLogger.warn('Merger', `File not found: ${fullPath}`);
+                }
             }
         }
-        sessionLogger.info('Merger', "Removed old files");
+        sessionLogger.info('Merger', `Removed ${deletedCount} old files, ${notFoundCount} files not found`);
+
+        // Helper function to normalize paths (ensure trailing slash)
+        const normalizePath = (path) => path.endsWith('/') ? path : path + '/';
+
         let toDownload = newManifest.files.filter(obj => {
-            const fullPath = `${obj.path}${obj.name}`;
+            const fullPath = normalizePath(obj.path) + obj.name;
             return changeList.additions.includes(fullPath);
         });
+
+        // Diagnostic logging for toDownload filtering
+        sessionLogger.info('Merger', `Filtering ${newManifest.files.length} manifest files against ${changeList.additions.length} additions`);
+        if (newManifest.files.length > 0) {
+            const firstFile = newManifest.files[0];
+            sessionLogger.info('Merger', `First manifest file path format (normalized): "${normalizePath(firstFile.path)}${firstFile.name}"`);
+        }
+        sessionLogger.info('Merger', `Filtered down to ${toDownload.length} files to download`);
+        if (toDownload.length > 0) {
+            sessionLogger.info('Merger', `First 3 files to download: ${JSON.stringify(toDownload.slice(0, 3).map(f => normalizePath(f.path) + f.name))}`);
+        } else if (changeList.additions.length > 0) {
+            sessionLogger.warn('Merger', `WARNING: toDownload is empty but changeList has ${changeList.additions.length} additions! First addition: ${changeList.additions[0]}`);
+        }
+
         await downloadList(toDownload, dir);
         sessionLogger.info('Merger', "Added new files");
     }

@@ -33,6 +33,7 @@ module.exports = {
             "file.delete",
             "file.archive",
             "file.sftp",
+            "activity.read",
         ]
     },
 

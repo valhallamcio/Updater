@@ -136,21 +136,30 @@ module.exports = {
 
         let changelog = await this.compareManifest(customManifest, originalManifest);
 
+        // Helper function to normalize paths (ensure trailing slash)
+        const normalizePath = (path) => path.endsWith('/') ? path : path + '/';
+
         changelog.leftOnly.forEach(dif => {
             sessionLogger.debug('Comparator', `Difference - delete: ${dif.path}, name1: ${dif.name}`);
-            changeList.deletions.push(dif.path + dif.name);
+            changeList.deletions.push(normalizePath(dif.path) + dif.name);
         });
 
         changelog.rightOnly.forEach(dif => {
             sessionLogger.debug('Comparator', `Difference - add: ${dif.path}, name2: ${dif.name}`);
-            changeList.additions.push(dif.path + dif.name);
+            changeList.additions.push(normalizePath(dif.path) + dif.name);
         });
 
         changelog.different.forEach(dif => {
             sessionLogger.debug('Comparator', `Difference - replace: ${dif.left.path}, name1: ${dif.left.name}, name2: ${dif.right.name}`);
-            changeList.deletions.push(dif.left.path + dif.left.name);
-            changeList.additions.push(dif.right.path + dif.right.name);
+            changeList.deletions.push(normalizePath(dif.left.path) + dif.left.name);
+            changeList.additions.push(normalizePath(dif.right.path) + dif.right.name);
         });
+
+        // Diagnostic logging for manifest changes
+        sessionLogger.info('Comparator', `Found ${changeList.deletions.length} deletions and ${changeList.additions.length} additions`);
+        if (changeList.additions.length > 0) {
+            sessionLogger.info('Comparator', `First 3 additions: ${JSON.stringify(changeList.additions.slice(0, 3))}`);
+        }
 
         return changeList;
     },

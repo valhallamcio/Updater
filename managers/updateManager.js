@@ -309,6 +309,12 @@ module.exports = {
 
         const oldManifest = await modpacksch.getFTBPackManifest(pack.modpackID, pack.fileID);
 
+        // Diagnostic logging for manifest structures
+        sessionLogger.info('UpdateManager', `Old manifest has ${oldManifest.files.length} files`);
+        sessionLogger.info('UpdateManager', `Sample old manifest file: ${JSON.stringify(oldManifest.files[0])}`);
+        sessionLogger.info('UpdateManager', `New manifest has ${newManifest.files.length} files`);
+        sessionLogger.info('UpdateManager', `Sample new manifest file: ${JSON.stringify(newManifest.files[0])}`);
+
         rmRecursive(`./${pack.tag}`);
 
         await pterodactyl.sendCommand(pack.serverId, alert);
@@ -320,6 +326,10 @@ module.exports = {
             const path = match ? match[1] : null;
             if (!toCompressList.includes(path) && path != null) toCompressList.push(path);
         }
+
+        // Diagnostic logging for toCompressList
+        sessionLogger.info('UpdateManager', `Generated toCompressList with ${toCompressList.length} items`);
+        sessionLogger.info('UpdateManager', `toCompressList contents: ${JSON.stringify(toCompressList)}`);
 
         await sleep(5000);
 
