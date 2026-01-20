@@ -27,6 +27,92 @@ const header = {
     "Authorization": `Bearer ${pterodactylAPIKey}`,
 };
 
+// API call tracking for debugging rate limits
+const apiCallTracker = {
+    calls: [],
+    callerStats: {},
+
+    track(endpoint, caller) {
+        const now = Date.now();
+        this.calls.push({ endpoint, caller, timestamp: now });
+
+        // Track per-caller stats
+        if (!this.callerStats[caller]) {
+            this.callerStats[caller] = { count: 0, endpoints: {} };
+        }
+        this.callerStats[caller].count++;
+        this.callerStats[caller].endpoints[endpoint] = (this.callerStats[caller].endpoints[endpoint] || 0) + 1;
+
+        // Clean old entries (older than 60 seconds)
+        this.calls = this.calls.filter(c => now - c.timestamp < 60000);
+    },
+
+    getStats() {
+        const now = Date.now();
+        const recentCalls = this.calls.filter(c => now - c.timestamp < 60000);
+        const last10Seconds = this.calls.filter(c => now - c.timestamp < 10000);
+
+        // Group by endpoint
+        const byEndpoint = {};
+        for (const call of recentCalls) {
+            byEndpoint[call.endpoint] = (byEndpoint[call.endpoint] || 0) + 1;
+        }
+
+        // Group by caller
+        const byCaller = {};
+        for (const call of recentCalls) {
+            byCaller[call.caller] = (byCaller[call.caller] || 0) + 1;
+        }
+
+        return {
+            totalLast60s: recentCalls.length,
+            totalLast10s: last10Seconds.length,
+            byEndpoint,
+            byCaller
+        };
+    },
+
+    logStats() {
+        const stats = this.getStats();
+        sessionLogger.info('Pterodactyl', `API Stats: ${stats.totalLast10s}/10s, ${stats.totalLast60s}/60s`);
+        sessionLogger.info('Pterodactyl', `By Caller: ${JSON.stringify(stats.byCaller)}`);
+        sessionLogger.info('Pterodactyl', `By Endpoint: ${JSON.stringify(stats.byEndpoint)}`);
+    }
+};
+
+// Log stats every 10 seconds
+setInterval(() => {
+    const stats = apiCallTracker.getStats();
+    if (stats.totalLast60s > 0) {
+        apiCallTracker.logStats();
+    }
+}, 10000);
+
+// Warn when approaching rate limit
+setInterval(() => {
+    const stats = apiCallTracker.getStats();
+    if (stats.totalLast60s > 100) {
+        sessionLogger.warn('Pterodactyl', `HIGH API USAGE: ${stats.totalLast60s} calls in last 60s!`);
+    }
+}, 5000);
+
+// Helper to extract caller from stack trace
+function getCaller() {
+    const stack = new Error().stack;
+    const lines = stack.split('\n');
+    // Find the first line that's not in pterodactyl.js
+    for (let i = 2; i < lines.length; i++) {
+        if (!lines[i].includes('pterodactyl.js') && !lines[i].includes('node:internal')) {
+            const match = lines[i].match(/at (?:async )?(?:(\S+)\s)?\(?(.+?):(\d+):\d+\)?/);
+            if (match) {
+                const fnName = match[1] || 'anonymous';
+                const file = match[2].split('/').pop();
+                return `${file}:${fnName}`;
+            }
+        }
+    }
+    return 'unknown';
+}
 
 module.exports = {
     /**
@@ -35,7 +121,12 @@ module.exports = {
     safeApiRequest: async function(method, url, data = null, options = {}) {
         const maxRetries = 3;
         const retryDelay = 2000;
-        
+
+        // Track API call
+        const endpoint = url.replace(pterodactylHostName, '').split('?')[0];
+        const caller = getCaller();
+        apiCallTracker.track(endpoint, caller);
+
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 const config = {
@@ -172,7 +263,7 @@ module.exports = {
      */
     getDownloadLink: async function (serverID, path) {
         path = path.replace("+", "%2B");
-        //console.log(`${pterodactylHostName}api/client/servers/${serverID}/files/download?file=/${path}`);
+        apiCallTracker.track('files/download', getCaller());
         try {
             let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/download?file=${path}`, {
                 headers: header
@@ -190,6 +281,7 @@ module.exports = {
      * @returns URL of the upload link.
      */
     getUploadLink: async function (serverID) {
+        apiCallTracker.track('files/upload', getCaller());
         try {
             let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/upload`, {
                 headers: header
@@ -237,6 +329,7 @@ module.exports = {
      * @returns 
      */
     compressFile: async function (serverID, fileList, listPath = "/", ) {
+        apiCallTracker.track('files/compress', getCaller());
         try {
             let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/compress`, {
                 root: listPath,
@@ -259,6 +352,7 @@ module.exports = {
      * @returns 
      */
     decompressFile: async function (serverID, fileName, filePath = "/") {
+        apiCallTracker.track('files/decompress', getCaller());
         try {
             let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/decompress`, {
                 root: filePath,
@@ -281,6 +375,7 @@ module.exports = {
      * @returns 
      */
     deleteFile: async function (serverID, fileList, filePath = "/") {
+        apiCallTracker.track('files/delete', getCaller());
         try {
             let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/delete`, {
                 root: filePath,
@@ -304,6 +399,7 @@ module.exports = {
      * @returns 
      */
     renameFile: async function (serverID, path, newName, filePath = "/") {
+        apiCallTracker.track('files/rename', getCaller());
         try {
             let response = await axios.put(`${pterodactylHostName}api/client/servers/${serverID}/files/rename`, {
                 root: filePath,
@@ -325,11 +421,12 @@ module.exports = {
      * @param {string} command Command to be executed on the server.
      */
     sendCommand: async function (serverID, command) {
+        apiCallTracker.track('command', getCaller());
         try {
             if (!command || typeof command !== 'string') {
                 throw new Error('Invalid command: must be a non-empty string');
             }
-            
+
             // Use axios directly for commands since they often return empty responses
             const response = await axios.post(
                 `${pterodactylHostName}api/client/servers/${serverID}/command`,
@@ -377,6 +474,7 @@ module.exports = {
      * @returns Object containing the list of subusers.
      */
     listUsers: async function (serverID) {
+        apiCallTracker.track('users/list', getCaller());
         try {
             let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/users`, {
                 headers: header
@@ -395,6 +493,7 @@ module.exports = {
      * @param {*} subUserData Object containing the subuser data.
      */
     createSubUser: async function (serverID, subUserData) {
+        apiCallTracker.track('users/create', getCaller());
         try {
             let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/users`, subUserData, {
                 headers: header
@@ -413,6 +512,7 @@ module.exports = {
      * @param {*} subUserData Object containing the updated subuser data.
      */
     updateSubUser: async function (serverID, subUserID, subUserData) {
+        apiCallTracker.track('users/update', getCaller());
         try {
             let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/users/${subUserID}`, subUserData, {
                 headers: header
