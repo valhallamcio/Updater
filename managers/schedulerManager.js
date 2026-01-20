@@ -31,12 +31,11 @@ module.exports = {
 
             let schedulers = 0;
             let activeSchedulers = 0;
-            const staggerDelay = 5000; // 5 seconds between scheduler starts
-
+            
             for (const file of schedulerFiles) {
                 schedulers++;
                 const filePath = path.join(schedulersPath, file);
-
+                
                 try {
                     const scheduler = require(filePath);
 
@@ -51,17 +50,9 @@ module.exports = {
                         }
 
                         if (schedulerConfig[scheduler.name].active && !init) {
-                            const delay = activeSchedulers * staggerDelay;
                             activeSchedulers++;
-
-                            setTimeout(() => {
-                                sessionLogger.info('SchedulerManager', `Starting ${scheduler.name} scheduler`);
-                                scheduler.start(schedulerConfig[scheduler.name]);
-                            }, delay);
-
-                            if (delay > 0) {
-                                sessionLogger.debug('SchedulerManager', `Scheduled ${scheduler.name} to start in ${delay}ms`);
-                            }
+                            sessionLogger.info('SchedulerManager', `Starting ${scheduler.name} scheduler`);
+                            scheduler.start(schedulerConfig[scheduler.name]);
                         } else if (!init) {
                             sessionLogger.debug('SchedulerManager', `Skipping ${scheduler.name} scheduler (inactive)`);
                         }

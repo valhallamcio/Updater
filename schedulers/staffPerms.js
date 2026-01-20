@@ -55,13 +55,6 @@ module.exports = {
         for (let server of servers) {
             //console.log(`Checking server ${server.name}`);
             const subUsers = await pterodactyl.listUsers(server.serverId);
-
-            // Skip if API call failed (null indicates API error, not empty user list)
-            if (!subUsers || !subUsers.data) {
-                sessionLogger.warn('StaffPerms', `Failed to get subusers for server ${server.name} (API error), skipping...`);
-                continue;
-            }
-
             //console.log(subUsers.data);
             for (let staffMail of options.staffMailList) {
 
@@ -73,12 +66,9 @@ module.exports = {
                         continue;
                     } else {
                         sessionLogger.info('StaffPerms', `User ${staffMail} has missing permissions for server ${server.name}! Updating...`);
-                        const result = await pterodactyl.updateSubUser(server.serverId, user.attributes.uuid, {
+                        await pterodactyl.updateSubUser(server.serverId, user.attributes.uuid, {
                             "permissions": options.staffPermissions
                         });
-                        if (!result) {
-                            sessionLogger.warn('StaffPerms', `Failed to update permissions for ${staffMail} on server ${server.name} (API error)`);
-                        }
                         await functions.sleep(1000);
                     }
                     continue;
@@ -92,10 +82,7 @@ module.exports = {
                     "permissions": options.staffPermissions
                 };
 
-                const result = await pterodactyl.createSubUser(server.serverId, userBody);
-                if (!result) {
-                    sessionLogger.warn('StaffPerms', `Failed to add ${staffMail} to server ${server.name} (API error)`);
-                }
+                await pterodactyl.createSubUser(server.serverId, userBody);
 
             }
         }

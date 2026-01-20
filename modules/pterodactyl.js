@@ -27,149 +27,62 @@ const header = {
     "Authorization": `Bearer ${pterodactylAPIKey}`,
 };
 
-/**
- * Request queue for rate limiting Pterodactyl API calls
- */
-class RequestQueue {
-    constructor(options = {}) {
-        this.queue = [];
-        this.isProcessing = false;
-        // 128 req/min = 60000ms/128 = 469ms, use 500ms for safety margin
-        this.minInterval = options.minInterval || 500; // ms between requests
-        this.maxConcurrent = options.maxConcurrent || 3; // reduced for safety
-        this.activeRequests = 0;
-        this.lastRequestTime = 0;
-        this.backoffUntil = 0;
-    }
-
-    async add(fn) {
-        return new Promise((resolve, reject) => {
-            this.queue.push({ fn, resolve, reject });
-            this.processQueue();
-        });
-    }
-
-    async processQueue() {
-        if (this.isProcessing) return;
-        this.isProcessing = true;
-
-        while (this.queue.length > 0) {
-            // Wait for backoff period
-            if (Date.now() < this.backoffUntil) {
-                await new Promise(r => setTimeout(r, this.backoffUntil - Date.now()));
-            }
-
-            // Respect max concurrent limit
-            if (this.activeRequests >= this.maxConcurrent) {
-                await new Promise(r => setTimeout(r, 50));
-                continue;
-            }
-
-            // Respect minimum interval
-            const timeSinceLast = Date.now() - this.lastRequestTime;
-            if (timeSinceLast < this.minInterval) {
-                await new Promise(r => setTimeout(r, this.minInterval - timeSinceLast));
-            }
-
-            const { fn, resolve, reject } = this.queue.shift();
-            this.activeRequests++;
-            this.lastRequestTime = Date.now();
-
-            fn().then(resolve).catch(reject).finally(() => this.activeRequests--);
-        }
-        this.isProcessing = false;
-    }
-
-    setBackoff(ms) {
-        this.backoffUntil = Date.now() + ms;
-        sessionLogger.warn('Pterodactyl', `Rate limit hit, backing off for ${ms}ms`);
-    }
-}
-
-// Tuned for Pterodactyl's 128 req/min client limit (60000ms/128 = 469ms per request)
-const requestQueue = new RequestQueue({ minInterval: 500, maxConcurrent: 3 });
-
 
 module.exports = {
     /**
-     * Safe API request wrapper with response validation and rate limiting
+     * Safe API request wrapper with response validation
      */
     safeApiRequest: async function(method, url, data = null, options = {}) {
         const maxRetries = 3;
         const retryDelay = 2000;
-
-        return requestQueue.add(async () => {
-            for (let attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                    const config = {
-                        method: method,
-                        url: url,
-                        headers: header,
-                        timeout: 30000, // 30 second timeout
-                        validateStatus: (status) => status < 500, // Don't throw on 4xx errors
-                        ...options
-                    };
-
-                    if (data) {
-                        config.data = data;
-                    }
-
-                    // Debug logging: request
-                    sessionLogger.debug('Pterodactyl',
-                        `API Request: ${method} ${url}${data ? ` | Body: ${JSON.stringify(data)}` : ''}`);
-
-                    const response = await axios(config);
-
-                    // Debug logging: response
-                    const dataPreview = response.data
-                        ? JSON.stringify(response.data).substring(0, 200) + (JSON.stringify(response.data).length > 200 ? '...' : '')
-                        : '(empty)';
-                    sessionLogger.debug('Pterodactyl',
-                        `API Response: ${response.status} ${response.statusText} | Data: ${dataPreview}`);
-
-                    // Handle 429 Too Many Requests
-                    if (response.status === 429) {
-                        const retryAfter = parseInt(response.headers['retry-after']) || 30;
-                        requestQueue.setBackoff(retryAfter * 1000);
-
-                        if (attempt < maxRetries) {
-                            await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-                            continue;
-                        }
-                        throw new Error(`Rate limit exceeded (429) after ${maxRetries} attempts`);
-                    }
-
-                    // Check for other error responses
-                    if (response.status >= 400) {
-                        throw new Error(`API returned ${response.status}: ${response.statusText}`);
-                    }
-
-                    // Validate response structure (allow empty data for some endpoints)
-                    if (response.data === undefined) {
-                        throw new Error('API returned undefined response');
-                    }
-
-                    return response;
-
-                } catch (error) {
-                    sessionLogger.error('Pterodactyl',
-                        `API request failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
-
-                    if (attempt < maxRetries) {
-                        await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
-                    } else {
-                        // Enhanced error with more context
-                        const enhancedError = new Error(
-                            `Pterodactyl API error after ${maxRetries} attempts: ${error.message}`
-                        );
-                        enhancedError.originalError = error;
-                        enhancedError.url = url;
-                        enhancedError.method = method;
-                        throw enhancedError;
-                    }
+        
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const config = {
+                    method: method,
+                    url: url,
+                    headers: header,
+                    timeout: 30000, // 30 second timeout
+                    validateStatus: (status) => status < 500, // Don't throw on 4xx errors
+                    ...options
+                };
+                
+                if (data) {
+                    config.data = data;
+                }
+                
+                const response = await axios(config);
+                
+                // Check for error responses
+                if (response.status >= 400) {
+                    throw new Error(`API returned ${response.status}: ${response.statusText}`);
+                }
+                
+                // Validate response structure (allow empty data for some endpoints)
+                if (response.data === undefined) {
+                    throw new Error('API returned undefined response');
+                }
+                
+                return response;
+                
+            } catch (error) {
+                sessionLogger.error('Pterodactyl', 
+                    `API request failed (attempt ${attempt}/${maxRetries}): ${error.message}`);
+                
+                if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, retryDelay * attempt));
+                } else {
+                    // Enhanced error with more context
+                    const enhancedError = new Error(
+                        `Pterodactyl API error after ${maxRetries} attempts: ${error.message}`
+                    );
+                    enhancedError.originalError = error;
+                    enhancedError.url = url;
+                    enhancedError.method = method;
+                    throw enhancedError;
                 }
             }
-        });
+        }
     },
 
     /**
@@ -259,13 +172,15 @@ module.exports = {
      */
     getDownloadLink: async function (serverID, path) {
         path = path.replace("+", "%2B");
+        //console.log(`${pterodactylHostName}api/client/servers/${serverID}/files/download?file=/${path}`);
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/download?file=${path}`;
-            const response = await this.safeApiRequest('GET', url);
+            let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/download?file=${path}`, {
+                headers: header
+            });
+            //console.log(response);
             return response.data.attributes.url;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to get download link for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -276,12 +191,13 @@ module.exports = {
      */
     getUploadLink: async function (serverID) {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/upload`;
-            const response = await this.safeApiRequest('GET', url);
+            let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/upload`, {
+                headers: header
+            });
+            //console.log(response);
             return response.data.attributes.url;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to get upload link for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -318,17 +234,20 @@ module.exports = {
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {Array} fileList List of files to compress.
      * @param {string} listPath Path to the folder containing the files to compress. Defaults to the root directory.
-     * @returns
+     * @returns 
      */
-    compressFile: async function (serverID, fileList, listPath = "/") {
+    compressFile: async function (serverID, fileList, listPath = "/", ) {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/compress`;
-            const body = { root: listPath, files: fileList };
-            const response = await this.safeApiRequest('POST', url, body);
+            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/compress`, {
+                root: listPath,
+                files: fileList,
+            }, {
+                headers: header
+            });
+            //console.log(response);
             return response.data.attributes.name;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to compress files for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -337,17 +256,20 @@ module.exports = {
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {string} fileName Name of the file to decompress.
      * @param {string} filePath Path to the folder containing the file to decompress. Defaults to the root directory.
-     * @returns
+     * @returns 
      */
     decompressFile: async function (serverID, fileName, filePath = "/") {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/decompress`;
-            const body = { root: filePath, file: fileName };
-            const response = await this.safeApiRequest('POST', url, body);
+            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/decompress`, {
+                root: filePath,
+                file: fileName,
+            }, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to decompress file for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -356,17 +278,20 @@ module.exports = {
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {Array} fileList List of files to delete.
      * @param {string} listPath Path to the folder containing the files to delete. Defaults to the root directory.
-     * @returns
+     * @returns 
      */
     deleteFile: async function (serverID, fileList, filePath = "/") {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/delete`;
-            const body = { root: filePath, files: fileList };
-            const response = await this.safeApiRequest('POST', url, body);
+            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/delete`, {
+                root: filePath,
+                files: fileList,
+            }, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to delete files for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -376,17 +301,21 @@ module.exports = {
      * @param {string} path Path to the file to rename on the server.
      * @param {string} newName New name of the file.
      * @param {string} filePath Path to the file to rename. Defaults to the root directory.
-     * @returns
+     * @returns 
      */
     renameFile: async function (serverID, path, newName, filePath = "/") {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/files/rename`;
-            const body = { root: filePath, files: path, name: newName };
-            const response = await this.safeApiRequest('PUT', url, body);
+            let response = await axios.put(`${pterodactylHostName}api/client/servers/${serverID}/files/rename`, {
+                root: filePath,
+                files: path,
+                name: newName
+            }, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to rename file for server ${serverID}:`, error.message);
-            throw error;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -400,34 +329,43 @@ module.exports = {
             if (!command || typeof command !== 'string') {
                 throw new Error('Invalid command: must be a non-empty string');
             }
-
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/command`;
-            const body = { command: command };
-
-            // Use safeApiRequest with custom timeout for commands
-            const response = await this.safeApiRequest('POST', url, body, {
-                timeout: 15000 // 15 second timeout for commands
-            });
-
+            
+            // Use axios directly for commands since they often return empty responses
+            const response = await axios.post(
+                `${pterodactylHostName}api/client/servers/${serverID}/command`,
+                { command: command },
+                { 
+                    headers: header,
+                    timeout: 15000, // 15 second timeout for commands
+                    validateStatus: (status) => status < 500
+                }
+            );
+            
             // Commands often return empty responses - this is normal
-            return { success: true, data: response.data };
-
+            if (response.status >= 200 && response.status < 300) {
+                return { success: true, data: response.data };
+            } else if (response.status >= 400) {
+                throw new Error(`Command failed with status ${response.status}`);
+            }
+            
+            return response.data || { success: true };
+            
         } catch (error) {
             // Don't throw on 502 errors (server might be restarting)
-            if (error.originalError?.response?.status === 502) {
-                sessionLogger.debug('Pterodactyl',
+            if (error.response && error.response.status === 502) {
+                sessionLogger.debug('Pterodactyl', 
                     `502 error sending command to ${serverID} (server may be restarting)`);
                 return { success: true };
             }
-
+            
             // Handle timeout errors gracefully
             if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-                sessionLogger.warn('Pterodactyl',
+                sessionLogger.warn('Pterodactyl', 
                     `Command timeout for server ${serverID} - command may still execute`);
                 return { success: true, timeout: true };
             }
-
-            sessionLogger.error('Pterodactyl',
+            
+            sessionLogger.error('Pterodactyl', 
                 `Failed to send command to server ${serverID}:`, error.message);
             throw error;
         }
@@ -440,12 +378,14 @@ module.exports = {
      */
     listUsers: async function (serverID) {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/users`;
-            const response = await this.safeApiRequest('GET', url);
+            let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/users`, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
-        } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to list users for server ${serverID}:`, error.message);
-            return null; // Return null to indicate API failure (different from empty user list)
+        }
+        catch (error) {
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     }, 
 
@@ -456,12 +396,13 @@ module.exports = {
      */
     createSubUser: async function (serverID, subUserData) {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/users`;
-            const response = await this.safeApiRequest('POST', url, subUserData);
+            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/users`, subUserData, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to create subuser for server ${serverID}:`, error.message);
-            return null;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
@@ -473,12 +414,13 @@ module.exports = {
      */
     updateSubUser: async function (serverID, subUserID, subUserData) {
         try {
-            const url = `${pterodactylHostName}api/client/servers/${serverID}/users/${subUserID}`;
-            const response = await this.safeApiRequest('POST', url, subUserData);
+            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/users/${subUserID}`, subUserData, {
+                headers: header
+            });
+            //console.log(response);
             return response.data;
         } catch (error) {
-            sessionLogger.error('Pterodactyl', `Failed to update subuser for server ${serverID}:`, error.message);
-            return null;
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
         }
     },
 
