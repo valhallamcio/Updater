@@ -18,7 +18,7 @@ const axios = require('axios');
 module.exports = {
     getPlayers: async function () {
 
-        const response = await axios.get(`${process.env.VELOCITY_METRICS_URL}`);
+        const response = await axios.get(`${process.env.VELOCITY_METRICS_URL}`, { timeout: 15000 });
 
         const regex = /bungeecord_online_player\{server="([^"]+)",player="([^"]*)",\} \d+\.\d+/g;
         const servers = {};

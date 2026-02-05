@@ -16,7 +16,7 @@ module.exports = {
         "serverStartupTimeout": 20, // Minutes
         "batchingStrategy": "auto", // "auto" = dynamic based on nodes, "fixed" = use maxBatchSize
         "maxBatchSize": 12, // Only used if batchingStrategy is "fixed"
-        "playerThreshold": 25, // Reboot when less than this many players online
+        "playerThreshold": 50, // Reboot when less than this many players online
         "apiRetryDelay": 2000, // NEW: Delay between API retries
         "apiMaxRetries": 3, // NEW: Max API call retries
         "nodeRebootDelay": 5000, // NEW: Delay between nodes
@@ -33,6 +33,7 @@ module.exports = {
         completedServers: new Set(), // NEW: Track completed servers
         apiCallCount: 0, // NEW: Track API calls
         lastApiCall: 0, // NEW: Rate limiting
+        lastCheckedDate: null, // Track current date for daily reset
         todayStats: {
             lowestPlayerCount: null,
             lowestPlayerTime: null,
@@ -120,9 +121,46 @@ module.exports = {
      */
     mainLoop: async function (options) {
         try {
+            // Check if the date has changed — reset daily stats
+            const today = timeManager.getTodayDateString();
+            if (this.state.lastCheckedDate && this.state.lastCheckedDate !== today) {
+                sessionLogger.info('RebootScheduler', `New day detected (${this.state.lastCheckedDate} → ${today}), resetting daily stats`);
+                this.state.todayStats = {
+                    date: today,
+                    lowestPlayerCount: null,
+                    lowestPlayerTime: null,
+                    rebootTriggered: false,
+                    rebootCompleted: false,
+                    rebootStartTime: null,
+                    rebootEndTime: null,
+                    successfulReboots: 0,
+                    failedReboots: 0,
+                    totalServers: 0,
+                    retryAttempts: {}
+                };
+                // Also clear accumulated state from previous day
+                this.state.failedServers.clear();
+                this.state.completedServers.clear();
+                this.state.activeReboots.clear();
+                this.state.apiCallCount = 0;
+                this.state.isRebootInProgress = false;
+            }
+            this.state.lastCheckedDate = today;
+
+            // Unstick reboot if it's been running for over 2 hours
+            if (this.state.isRebootInProgress && this.state.rebootStartTime) {
+                const elapsed = Date.now() - this.state.rebootStartTime;
+                const maxDuration = 2 * 60 * 60 * 1000; // 2 hours
+                if (elapsed > maxDuration) {
+                    sessionLogger.warn('RebootScheduler', `Reboot has been stuck for ${Math.round(elapsed / 60000)} minutes. Force-resetting state.`);
+                    this.state.isRebootInProgress = false;
+                    this.state.activeReboots.clear();
+                }
+            }
+
             // Update player statistics
             await this.updatePlayerStats();
-            
+
             // Check for reboot scheduling
             if (!this.state.isRebootInProgress && !this.state.todayStats.rebootCompleted) {
                 await this.checkRebootSchedule(options);
@@ -138,8 +176,9 @@ module.exports = {
      */
     initializeTodayStats: async function () {
         const today = timeManager.getTodayDateString();
+        this.state.lastCheckedDate = today;
         const existingStats = await mongo.getRebootHistory(today);
-        
+
         if (existingStats) {
             this.state.todayStats = existingStats;
             // Ensure retryAttempts exists for backward compatibility
@@ -699,14 +738,11 @@ module.exports = {
      * Execute complete reboot for a single server with enhanced error handling
      */
     executeFullServerReboot: async function (server, nodeId) {
-        // Enhanced duplicate prevention
         if (this.stateOperations.isServerActive(server.serverId)) {
-            sessionLogger.warn('RebootScheduler', 
-                `[${server.name}] Already being processed, skipping`);
+            sessionLogger.warn('RebootScheduler', `[${server.name}] Already being processed, skipping`);
             return { success: false, reason: 'duplicate' };
         }
-        
-        // Add to active reboots with validation
+
         if (!this.stateOperations.addActiveReboot(server.serverId, {
             server: server,
             nodeId: nodeId,
@@ -714,66 +750,38 @@ module.exports = {
         })) {
             return { success: false, reason: 'state_conflict' };
         }
-        
-        sessionLogger.info('RebootScheduler', `[${server.name}] Starting reboot sequence`);
-        
-        try {
-            // Phase 1: Execute warnings with timeout protection
-            await this.executeRebootWarningsEnhanced(server);
-            
-            // Phase 2: Ensure server is stopped
-            await this.ensureServerStopped(server);
-            
-            // Phase 3: Start server with monitoring
-            await this.startServerWithMonitoring(server);
-            
-            // Success
-            sessionLogger.info('RebootScheduler', `[${server.name}] Reboot completed successfully`);
-            this.stateOperations.markServerCompleted(server.serverId);
-            
-            
-            if (!this.state.todayStats.successfulReboots) {
-                this.state.todayStats.successfulReboots = 0;
-            }
-            this.state.todayStats.successfulReboots++;
-            
-            return { success: true };
-            
-        } catch (error) {
-            sessionLogger.error('RebootScheduler', 
-                `[${server.name}] Reboot failed: ${error.message}`);
-            
-            // Handle failure with retry logic
-            const rebootInfo = this.state.activeReboots.get(server.serverId);
-            if (rebootInfo) {
-                rebootInfo.attempts++;
-                
-                const maxRetries = this.runtimeConfig?.rebootRetryLimit || 3;
-                if (rebootInfo.attempts < maxRetries) {
-                    sessionLogger.info('RebootScheduler', 
-                        `[${server.name}] Scheduling retry (attempt ${rebootInfo.attempts + 1}/${maxRetries})`);
-                    
-                    // Wait before retry
-                    await functions.sleep(10000 * rebootInfo.attempts); // Exponential backoff
-                    
-                    // Recursive retry
-                    return await this.executeFullServerReboot(server, nodeId);
+
+        const maxRetries = this.runtimeConfig?.rebootRetryLimit || 3;
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            sessionLogger.info('RebootScheduler', `[${server.name}] Reboot attempt ${attempt}/${maxRetries}`);
+            try {
+                await this.executeRebootWarningsEnhanced(server);
+                await this.ensureServerStopped(server);
+                await this.startServerWithMonitoring(server);
+
+                sessionLogger.info('RebootScheduler', `[${server.name}] Reboot completed successfully`);
+                this.stateOperations.markServerCompleted(server.serverId);
+                if (!this.state.todayStats.successfulReboots) this.state.todayStats.successfulReboots = 0;
+                this.state.todayStats.successfulReboots++;
+                return { success: true };
+
+            } catch (error) {
+                sessionLogger.error('RebootScheduler', `[${server.name}] Attempt ${attempt} failed: ${error.message}`);
+                if (attempt < maxRetries) {
+                    const delay = 10000 * attempt;
+                    sessionLogger.info('RebootScheduler', `[${server.name}] Waiting ${delay/1000}s before retry...`);
+                    await functions.sleep(delay);
                 }
             }
-            
-            // Max retries reached
-            this.stateOperations.markServerFailed(server.serverId);
-            
-            
-            if (!this.state.todayStats.failedReboots) {
-                this.state.todayStats.failedReboots = 0;
-            }
-            this.state.todayStats.failedReboots++;
-            
-            await this.alertStaffServerFailure(server, error.message);
-            
-            return { success: false, reason: error.message };
         }
+
+        // All retries exhausted
+        this.stateOperations.markServerFailed(server.serverId);
+        if (!this.state.todayStats.failedReboots) this.state.todayStats.failedReboots = 0;
+        this.state.todayStats.failedReboots++;
+        await this.alertStaffServerFailure(server, `Failed after ${maxRetries} attempts`);
+        return { success: false, reason: `Failed after ${maxRetries} attempts` };
     },
 
     /**
