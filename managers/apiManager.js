@@ -20,6 +20,7 @@ require('dotenv').config();
 const kofiToken = process.env.KOFI_SECRET;
 const config = require("../config/config.json");
 const pterodactyl = require('../modules/pterodactyl');
+const velocityMetrics = require('../modules/velocityMetrics');
 app.use(bodyParser.urlencoded({
     extended: true
 }));
@@ -71,6 +72,12 @@ module.exports = {
                 return res.json({
                     success: true
                 });
+            });
+            
+            app.use('/players', async function (req, res) {
+                let data = await velocityMetrics.getPlayers();
+                res.json(data);
+                return;
             });
 
             app.use('/', async function (req, res) {
