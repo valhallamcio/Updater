@@ -26,13 +26,7 @@ module.exports = {
     async execute(interaction) {
         const servers = await yggdrasil.getServers();
 
-        const embed = new EmbedBuilder()
-            .setColor(0x9c59b6)
-            .setTitle('Server Stats')
-            .setTimestamp()
-            .setFooter({
-                text: "Issues? Create a ticket!"
-            });
+        const fields = [];
 
         for (let s of servers) {
             if (s.status !== 'running') continue;
@@ -41,14 +35,29 @@ module.exports = {
             const memLimitMB = Math.round(s.memoryLimitBytes / 1024 / 1024);
             const uptime = formatUptime(s.uptimeMs);
 
-            embed.addFields({
+            fields.push({
                 name: s.name,
                 value: `**Uptime:** ${uptime}\n**Players:** ${s.players}\n**TPS:** ${Math.round(s.tps * 100) / 100}\n**Memory:** ${memMB}/${memLimitMB} MB`,
             });
         }
 
+        const embeds = [];
+        for (let i = 0; i < fields.length; i += 25) {
+            const embed = new EmbedBuilder()
+                .setColor(0x9c59b6)
+                .addFields(fields.slice(i, i + 25));
+
+            if (i === 0) embed.setTitle('Server Stats');
+            if (i + 25 >= fields.length) {
+                embed.setTimestamp();
+                embed.setFooter({ text: "Issues? Create a ticket!" });
+            }
+
+            embeds.push(embed);
+        }
+
         return interaction.reply({
-            embeds: [embed]
+            embeds
         });
     },
 };
