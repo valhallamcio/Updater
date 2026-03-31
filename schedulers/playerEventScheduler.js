@@ -1,5 +1,5 @@
 const mongo = require("../modules/mongo");
-const velocityMetrics = require("../modules/velocityMetrics");
+const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const functions = require("../modules/functions");
 const sessionLogger = require("../modules/sessionLogger");
@@ -44,7 +44,7 @@ module.exports = {
      */
     checkPlayerTriggers: async function () {
         try {
-            const playersData = await velocityMetrics.getPlayers();
+            const playersData = await yggdrasil.getPlayers();
             const activeTriggers = await mongo.getActiveScheduleJobs('player_trigger');
             
             for (const trigger of activeTriggers) {

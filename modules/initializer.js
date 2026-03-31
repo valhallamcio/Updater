@@ -16,7 +16,7 @@ const sessionLogger = require('./sessionLogger');
 require('dotenv').config();
 
 
-const envVars = ['MONGODB_URL', 'PTERODACTYL_APIKEY', 'DISCORD_TOKEN', 'CURSEFORGE_APIKEY', 'VELOCITY_METRICS_URL', 'KOFI_SECRET'];
+const envVars = ['MONGODB_URL', 'PTERODACTYL_APIKEY', 'DISCORD_TOKEN', 'CURSEFORGE_APIKEY', 'YGGDRASIL_API_TOKEN'];
 
 
 function generateEnvFile() {
@@ -79,10 +79,6 @@ function generateConfigFiles() {
             "active": true,
             "mongoDBName": "",
             "mongoDBserversCollection": ""
-        },
-        "webApi": {
-            "active": true,
-            "port": 3000
         },
         "scheduler": {}
     };

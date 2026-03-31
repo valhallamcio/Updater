@@ -16,7 +16,7 @@ const {
     EmbedBuilder
 } = require('discord.js');
 const mongo = require('../../modules/mongo');
-const { sleep } = require('../../modules/functions');
+const yggdrasil = require('../../modules/yggdrasil');
 
 
 
@@ -26,8 +26,7 @@ module.exports = {
         .setDescription('Shows online servers!'),
     async execute(interaction) {
         const serverList = await mongo.getServers();
-        await sleep(10);
-        const shardList = await mongo.getShards();
+        const yggdrasilServers = await yggdrasil.getServers();
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)
@@ -60,7 +59,8 @@ module.exports = {
             for (let s of versionObj[key]) {
                 var statusEmoji = "<:c:1389899748370157609>";
 
-                if (shardList.some(obj => obj.name === s.name)) {
+                const ygServer = yggdrasilServers.find(y => y.name.trim() === s.name.trim());
+                if (ygServer && ygServer.status === 'running') {
                     onlineCount++;
                     statusEmoji = "<:u:1389899745866027090>";
                 }

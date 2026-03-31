@@ -14,7 +14,7 @@ const {
     SlashCommandBuilder,
     EmbedBuilder
 } = require('discord.js');
-const velocityMetrics = require('../../modules/velocityMetrics');
+const yggdrasil = require('../../modules/yggdrasil');
 const mongo = require('../../modules/mongo');
 
 module.exports = {
@@ -25,7 +25,7 @@ module.exports = {
         await interaction.deferReply();
         const servers = await mongo.getServers();
 
-        let data = await velocityMetrics.getPlayers();
+        let data = await yggdrasil.getPlayers();
 
         //console.log(data);
 

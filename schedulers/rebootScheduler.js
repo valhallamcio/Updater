@@ -1,5 +1,5 @@
 const mongo = require("../modules/mongo");
-const velocityMetrics = require("../modules/velocityMetrics");
+const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");
@@ -207,7 +207,7 @@ module.exports = {
      */
     updatePlayerStats: async function () {
         try {
-            const playersData = await velocityMetrics.getPlayers();
+            const playersData = await yggdrasil.getPlayers();
             let totalPlayers = 0;
             
             // Count total players across all servers
@@ -241,7 +241,7 @@ module.exports = {
         try {
             // Check time window first (original working logic)
             const timeWindow = timeManager.checkRebootWindow();
-            const playersData = await velocityMetrics.getPlayers();
+            const playersData = await yggdrasil.getPlayers();
             
             let totalPlayers = 0;
             for (const serverName in playersData) {

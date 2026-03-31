@@ -4,7 +4,7 @@ const {
 } = require('discord.js');
 const timeManager = require('../../modules/timeManager');
 const mongo = require('../../modules/mongo');
-const velocityMetrics = require('../../modules/velocityMetrics');
+const yggdrasil = require('../../modules/yggdrasil');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -18,7 +18,7 @@ module.exports = {
         
         try {
             // Get current player data
-            const playersData = await velocityMetrics.getPlayers();
+            const playersData = await yggdrasil.getPlayers();
             let totalPlayers = 0;
             for (const serverName in playersData) {
                 totalPlayers += playersData[serverName].length;

@@ -10,8 +10,6 @@
  * Copyright 2024 flaasz
  */
 
-const enhancedCrashReporter = require('./enhancedCrashReporter');
-
 // Initialize session logger for full session tracking
 const sessionLogger = require('./sessionLogger');
 
@@ -32,9 +30,6 @@ function handleError(error, type = 'Unknown') {
         // Session logger failed, but crash reporter will still work
     }
 
-    // Use enhanced crash reporter
-    enhancedCrashReporter.handleCrash(error);
-
     // Preserve original exitOnError behavior
     if (!exitOnError) {
         console.error(`Error occurred! Check crash-logs directory for detailed report.`);
@@ -44,11 +39,7 @@ function handleError(error, type = 'Unknown') {
     process.exit(1);
 }
 
-// Remove default handlers from enhancedCrashReporter to avoid double handling
-process.removeAllListeners('uncaughtException');
-process.removeAllListeners('unhandledRejection');
-
-// Set up our handlers with preserved behavior
+// Set up our handlers
 process.on('uncaughtException', (error) => {
     console.error('\n!!! UNCAUGHT EXCEPTION !!!');
     handleError(error, 'Uncaught Exception');

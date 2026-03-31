@@ -13,7 +13,7 @@
 const functions = require("../modules/functions");
 const mongo = require("../modules/mongo");
 const pterodactyl = require("../modules/pterodactyl");
-const velocityMetrics = require("../modules/velocityMetrics");
+const yggdrasil = require("../modules/yggdrasil");
 const sessionLogger = require("../modules/sessionLogger");
 const {
     alertCakeDrop
@@ -49,7 +49,7 @@ module.exports = {
             let cakeAmount = Math.floor(Math.random() * (options.max - options.min + 1)) + options.min;
 
             let servers = await mongo.getServers();
-            let playerData = await velocityMetrics.getPlayers();
+            let playerData = await yggdrasil.getPlayers();
 
             let totalAmount = 0;
             let totalPlayers = 0;
@@ -79,7 +79,7 @@ module.exports = {
 
     dropCakeManual: async function (cakeAmount) {
         let servers = await mongo.getServers();
-        let playerData = await velocityMetrics.getPlayers();
+        let playerData = await yggdrasil.getPlayers();
 
         let totalAmount = 0;
         let totalPlayers = 0;

@@ -14,8 +14,9 @@ require("./modules/errorHandler");
 require("./modules/initializer");
 const sessionLogger = require("./modules/sessionLogger");
 const scheduler = require("./managers/schedulerManager");
-const api = require("./managers/apiManager");
 const discord = require("./discord/bot");
+const yggdrasil = require("./modules/yggdrasil");
+const liveEmbedManager = require("./modules/liveEmbedManager");
 
 sessionLogger.info('Server', 'Valhalla Updater initializing...');
 
@@ -25,14 +26,16 @@ sessionLogger.info('Server', 'Valhalla Updater initializing...');
         sessionLogger.info('Server', 'Starting Discord bot...');
         const discordPromise = discord.launchBot();
 
-        sessionLogger.info('Server', 'Starting API server...');
-        api.startServer();
-
         sessionLogger.info('Server', 'Loading schedulers...');
         scheduler.loadSchedulers();
 
         // Wait for Discord bot (with retry logic)
         await discordPromise;
+
+        // Start Yggdrasil WebSocket and live embed manager after Discord is ready
+        sessionLogger.info('Server', 'Connecting to Yggdrasil WebSocket...');
+        yggdrasil.connect();
+        await liveEmbedManager.init();
 
         sessionLogger.info('Server', 'All services started successfully!');
     } catch (error) {

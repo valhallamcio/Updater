@@ -15,8 +15,7 @@ const {
     SlashCommandBuilder,
     EmbedBuilder
 } = require('discord.js');
-const mongo = require('../../modules/mongo');
-const moment = require('moment');
+const yggdrasil = require('../../modules/yggdrasil');
 
 
 module.exports = {
@@ -25,7 +24,7 @@ module.exports = {
         .setDescription('Shows server stats!')
         .setDefaultMemberPermissions(8192),
     async execute(interaction) {
-        const shardList = await mongo.getShards();
+        const servers = await yggdrasil.getServers();
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)
@@ -35,17 +34,17 @@ module.exports = {
                 text: "Issues? Create a ticket!"
             });
 
-        let versionObj = {};
+        for (let s of servers) {
+            if (s.status !== 'running') continue;
 
+            const memMB = Math.round(s.memoryBytes / 1024 / 1024);
+            const memLimitMB = Math.round(s.memoryLimitBytes / 1024 / 1024);
+            const uptime = formatUptime(s.uptimeMs);
 
-        for (let s of shardList) {
-
-            if (!s.early_access) {
-                embed.addFields({
-                    name: s.name,
-                    value: `**Uptime:** ${humanReadableTimeDifference(s.started, Date.now())}\n**TPS:** ${Math.round(s.tps * 100) / 100}`,
-                });
-            }
+            embed.addFields({
+                name: s.name,
+                value: `**Uptime:** ${uptime}\n**Players:** ${s.players}\n**TPS:** ${Math.round(s.tps * 100) / 100}\n**Memory:** ${memMB}/${memLimitMB} MB`,
+            });
         }
 
         return interaction.reply({
@@ -54,37 +53,18 @@ module.exports = {
     },
 };
 
+function formatUptime(ms) {
+    if (!ms) return '0s';
+    const seconds = Math.floor(ms / 1000);
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
 
-function humanReadableTimeDifference(startTimestamp, endTimestamp) {
-    const start = moment(startTimestamp);
-    const end = moment(endTimestamp);
-
-    const years = end.diff(start, 'years');
-    start.add(years, 'years');
-
-    const months = end.diff(start, 'months');
-    start.add(months, 'months');
-
-    const days = end.diff(start, 'days');
-    start.add(days, 'days');
-
-    const hours = end.diff(start, 'hours');
-    start.add(hours, 'hours');
-
-    const minutes = end.diff(start, 'minutes');
-    start.add(minutes, 'minutes');
-
-    const seconds = end.diff(start, 'seconds');
-
-    let humanReadableString = '';
-    if (years) humanReadableString += `${years}y `;
-    if (months) humanReadableString += `${months}mo `;
-    if (days) humanReadableString += `${days}d `;
-    if (hours) humanReadableString += `${hours}h `;
-    if (minutes) humanReadableString += `${minutes}m `;
-    if (seconds) humanReadableString += `${seconds}s `;
-
-    humanReadableString = humanReadableString.trim();
-
-    return humanReadableString || '0s';
+    let str = '';
+    if (days) str += `${days}d `;
+    if (hours) str += `${hours}h `;
+    if (minutes) str += `${minutes}m `;
+    if (secs || !str) str += `${secs}s`;
+    return str.trim();
 }
