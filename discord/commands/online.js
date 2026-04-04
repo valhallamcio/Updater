@@ -15,7 +15,6 @@ const {
     EmbedBuilder
 } = require('discord.js');
 const yggdrasil = require('../../modules/yggdrasil');
-const mongo = require('../../modules/mongo');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -23,7 +22,7 @@ module.exports = {
         .setDescription('Shows online players!'),
     async execute(interaction) {
         await interaction.deferReply();
-        const servers = await mongo.getServers();
+        const servers = await yggdrasil.getServers();
 
         let data = await yggdrasil.getPlayers();
 
@@ -43,29 +42,21 @@ module.exports = {
 
         for (let server in data) {
             const fullName = server;
-            
             let serv = servers.find(s => s.name.trim() === server);
-
-            if (!serv) continue;
-            let tag = serv.tag;
-            //if (server.status == "success") serverCount++;
-
             let onlinePlayerCount = data[server].length;
-
             onlineCount += onlinePlayerCount;
 
             if (onlinePlayerCount > 0) {
-
-                if (serv.excludeFromServerList) {
-                    embed.addFields({
-                        name: `${fullName} - **${onlinePlayerCount}**`,
-                        value: `${data[server].toString().replace(/,/g, ", ").replace(/_/g, "\\_")}`
-                    });
-
-                } else {
+                if (serv && serv.tag && !serv.early_access) {
+                    let tag = serv.tag;
                     embed.addFields({
                         name: `**[${tag.toUpperCase()}]** ${fullName} - **${onlinePlayerCount}**`,
                         value: `${data[server].toString().replace(/,/g, ", ").replace(/_/g, "\\_")}\n*${tag.toLowerCase()}.valhallamc.io*`
+                    });
+                } else {
+                    embed.addFields({
+                        name: `${fullName} - **${onlinePlayerCount}**`,
+                        value: `${data[server].toString().replace(/,/g, ", ").replace(/_/g, "\\_")}`
                     });
                 }
             }
