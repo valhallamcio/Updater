@@ -1,5 +1,5 @@
-const mongo = require("../modules/mongo");
 const yggdrasil = require("../modules/yggdrasil");
+const mongo = require("../modules/mongo");
 const pterodactyl = require("../modules/pterodactyl");
 const functions = require("../modules/functions");
 const sessionLogger = require("../modules/sessionLogger");
@@ -99,7 +99,7 @@ module.exports = {
      */
     executePlayerTrigger: async function (trigger, serverName) {
         try {
-            const servers = await mongo.getServers();
+            const servers = await yggdrasil.getServers();
             const server = servers.find(s => s.name.trim() === serverName.trim());
             
             if (!server) return;

@@ -1,5 +1,6 @@
 const mongo = require("../modules/mongo");
 const yggdrasil = require("../modules/yggdrasil");
+const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");
@@ -350,19 +351,19 @@ module.exports = {
         this.state.todayStats.triggerPlayerCount = currentPlayerCount;
         
         // Get all servers that need rebooting
-        const servers = await mongo.getServers();
+        const servers = await yggdrasil.getServers();
         
         // Debug: Log all servers and their exclusion status
         sessionLogger.info('RebootScheduler', `Total servers found: ${servers.length}`);
         servers.forEach(server => {
             const excluded = server.excludeFromServerList;
-            const earlyAccess = server.early_access;
+            const earlyAccess = server.earlyAccess;
             const shouldReboot = this.shouldRebootServer(server);
-            sessionLogger.info('RebootScheduler', `Server ${server.tag}: excludeFromServerList=${excluded}, early_access=${earlyAccess}, shouldReboot=${shouldReboot}`);
+            sessionLogger.info('RebootScheduler', `Server ${server.tag}: excludeFromServerList=${excluded}, earlyAccess=${earlyAccess}, shouldReboot=${shouldReboot}`);
         });
         
         const initialEligibleServers = servers.filter(server => 
-            !server.early_access &&
+            !server.earlyAccess &&
             this.shouldRebootServer(server)
         );
         
@@ -371,8 +372,8 @@ module.exports = {
         // Check for missing GTSE/GTNG specifically
         const gtseServer = servers.find(s => s.tag === 'GTSE');
         const gtngServer = servers.find(s => s.tag === 'GTNG');
-        if (gtseServer) sessionLogger.info('RebootScheduler', `GTSE status: excludeFromServerList=${gtseServer.excludeFromServerList}, early_access=${gtseServer.early_access}`);
-        if (gtngServer) sessionLogger.info('RebootScheduler', `GTNG status: excludeFromServerList=${gtngServer.excludeFromServerList}, early_access=${gtngServer.early_access}`);
+        if (gtseServer) sessionLogger.info('RebootScheduler', `GTSE status: excludeFromServerList=${gtseServer.excludeFromServerList}, earlyAccess=${gtseServer.earlyAccess}`);
+        if (gtngServer) sessionLogger.info('RebootScheduler', `GTNG status: excludeFromServerList=${gtngServer.excludeFromServerList}, earlyAccess=${gtngServer.earlyAccess}`);
         
         // Apply uptime filtering - only reboot servers with >6 hours uptime
         const uptimeFilterResult = await this.filterServersByUptime(initialEligibleServers, 6);

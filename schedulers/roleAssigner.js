@@ -33,7 +33,7 @@ const {
 const {
     getFTBPackData
 } = require("../modules/modpacksch");
-const mongo = require("../modules/mongo");
+const yggdrasil = require("../modules/yggdrasil");
 const {
     ActionRowBuilder,
     ButtonBuilder,
@@ -63,13 +63,13 @@ module.exports = {
         client.on("interactionCreate", async interaction => {
             if (interaction.isButton() && interaction.message.channelId === options.roleChannelId) {
                 try {
-                    let serverList = await mongo.getServers();
+                    let serverList = await yggdrasil.getServers();
                     serverList = await addMentionButton(serverList);
                     let server = serverList.find(server => server.tag === interaction.customId);
                     let replyMessage = "Something went wrong!";
                     //console.log(interaction);
                     const guildMember = await interaction.guild.members.fetch(interaction.user.id);
-                    const role = interaction.guild.roles.cache.find(role => role.id === server.discord_role_id);
+                    const role = interaction.guild.roles.cache.find(role => role.id === server.discordRoleId);
 
                     if (guildMember.roles.cache.has(role.id)) {
                         await guildMember.roles.remove(role);
@@ -94,11 +94,11 @@ module.exports = {
         });
 
         async function buildButtons() {
-            let serverList = await mongo.getServers();
+            let serverList = await yggdrasil.getServers();
             serverListFull = await addMentionButton(serverList);
         
-            serverList = serverListFull.filter(server => server.discord_role_id != "");
-            serverListMissing = serverListFull.filter(server => server.discord_role_id === "");
+            serverList = serverListFull.filter(server => server.discordRoleId != "");
+            serverListMissing = serverListFull.filter(server => server.discordRoleId === "");
             await generateNewRoles(serverListMissing);
         
             const webhook = await getWebhook(options.roleChannelId);
@@ -175,13 +175,9 @@ module.exports = {
                     reason: 'Automated role generation for role assigner.'
                 });
 
-                let update = {
-                    $set: {
-                        discord_role_id: newRole.id
-                    }
-                };
-
-                await mongo.updateServers(server.modpackID, update);
+                await yggdrasil.updateServer(server.tag, {
+                    discord_role_id: newRole.id
+                });
             }
         }
 
@@ -229,7 +225,7 @@ module.exports = {
             let mentionObj = {
                 name: role.name,
                 tag: role.name.toLowerCase(),
-                discord_role_id: role.id
+                discordRoleId: role.id
             };
 
             serverList.unshift(mentionObj);

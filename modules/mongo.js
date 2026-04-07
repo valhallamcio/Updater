@@ -16,8 +16,7 @@ const {
 } = require('mongodb');
 require('dotenv').config();
 const {
-    mongoDBName,
-    mongoDBserversCollection
+    mongoDBName
 } = require("../config/config.json").mongodb;
 
 const mongoClient = new MongoClient(process.env.MONGODB_URL);
@@ -25,25 +24,6 @@ const mongoClient = new MongoClient(process.env.MONGODB_URL);
 let mainClientConnected = false;
 
 module.exports = {
-
-    /**
-     * Gets all current servers data from MongoDB.
-     * @returns Array of objects containing the server data.
-     */
-    getServers: async function () {
-        if (!mainClientConnected) {
-            await mongoClient.connect();
-            mainClientConnected = true;
-        }
-        
-        const serversArray = await mongoClient
-            .db(mongoDBName)
-            .collection(mongoDBserversCollection)
-            .find({}).toArray();
-
-        //console.log(serversArray);
-        return serversArray;
-    },
 
     /**
      * Gets all tickets user closed or participated in by user from MongoDB.
@@ -80,44 +60,6 @@ module.exports = {
         results[0] = array;
         results[1] = contr;
         return results;
-    },
-
-    /**
-     * Update the data of multiple servers in MongoDB.
-     * @param {number} modpackId ID of the modpack on CF/FTB.
-     * @param {object} update Object containing the fields to update.
-     */
-    updateServers: async function (modpackId, update) {
-        if (!mainClientConnected) {
-            await mongoClient.connect();
-            mainClientConnected = true;
-        }
-        
-        await mongoClient
-            .db(mongoDBName)
-            .collection(mongoDBserversCollection)
-            .updateMany({
-                modpackID: modpackId
-            }, update);
-    },
-
-    /**
-     * Update the data of a single server in MongoDB.
-     * @param {number} serverId ID of the server on the panel.
-     * @param {object} update Object containing the fields to update.
-     */
-    updateServer: async function (serverId, update) {
-        if (!mainClientConnected) {
-            await mongoClient.connect();
-            mainClientConnected = true;
-        }
-        
-        await mongoClient
-            .db(mongoDBName)
-            .collection(mongoDBserversCollection)
-            .updateOne({
-                serverId: serverId
-            }, update);
     },
 
     /**

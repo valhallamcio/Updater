@@ -3,6 +3,7 @@ const {
     EmbedBuilder
 } = require('discord.js');
 const mongo = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 const pterodactyl = require('../../modules/pterodactyl');
 const { sleep } = require('../../modules/functions');
 
@@ -62,8 +63,7 @@ module.exports = {
         
         if (focusedOption.name === 'servers' || focusedOption.name === 'server') {
             const focusedValue = focusedOption.value;
-            const { getServers } = require('../../modules/mongo');
-            const serverList = await getServers();
+            const serverList = await yggdrasil.getServers();
             const choices = focusedOption.name === 'servers' ? ["all"] : [];
 
             for (const server of serverList) {
@@ -140,7 +140,7 @@ module.exports = {
             }
             
             // Get server data
-            const allServers = await mongo.getServers();
+            const allServers = await yggdrasil.getServers();
             const serversToExecute = [];
             
             for (const serverName of serverNames) {
@@ -224,7 +224,7 @@ module.exports = {
         const delay = (interaction.options.getInteger('delay') || 1) * 1000;
         
         // Parse servers
-        const allServers = await mongo.getServers();
+        const allServers = await yggdrasil.getServers();
         let serversToExecute = [];
         
         if (serversInput.toLowerCase() === 'all') {
@@ -336,7 +336,7 @@ module.exports = {
         }
         
         // Find the server
-        const allServers = await mongo.getServers();
+        const allServers = await yggdrasil.getServers();
         let server = allServers.find(s => 
             s.name.trim() === serverName.trim() ||
             s.name.trim().toLowerCase() === serverName.trim().toLowerCase() ||

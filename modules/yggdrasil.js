@@ -54,6 +54,15 @@ async function getServers() {
 }
 
 /**
+ * Updates a server's fields via the Yggdrasil API.
+ * @param {string} tag - Server tag to update.
+ * @param {object} fields - Fields to update (e.g. { modpack_version, fileID }).
+ */
+async function updateServer(tag, fields) {
+    await client.patch(`/servers/${tag}`, fields);
+}
+
+/**
  * Connects the WebSocket to the Yggdrasil API for real-time events.
  */
 function connect() {
@@ -76,8 +85,9 @@ function connect() {
         ws.on('message', (data) => {
             try {
                 const message = JSON.parse(data.toString());
-                if (message.event) {
-                    emitter.emit(message.event, message.data || message);
+                const eventName = message.type || message.event;
+                if (eventName) {
+                    emitter.emit(eventName, message.payload || message.data || message);
                 }
             } catch (err) {
                 sessionLogger.error('Yggdrasil', 'Failed to parse WebSocket message', err.message);
@@ -136,6 +146,7 @@ function isConnected() {
 module.exports = {
     getPlayers,
     getServers,
+    updateServer,
     connect,
     disconnect,
     isConnected,

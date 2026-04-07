@@ -15,7 +15,6 @@ const {
     SlashCommandBuilder,
     EmbedBuilder
 } = require('discord.js');
-const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
 
 
@@ -25,8 +24,7 @@ module.exports = {
         .setName('servers')
         .setDescription('Shows online servers!'),
     async execute(interaction) {
-        const serverList = await mongo.getServers();
-        const yggdrasilServers = await yggdrasil.getServers();
+        const serverList = await yggdrasil.getServers();
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)
@@ -37,17 +35,15 @@ module.exports = {
             });
 
         let onlineCount = 0;
-        let serverCount = 0;
 
         let versionObj = {};
 
         for (let server of serverList) {
             if (server.excludeFromServerList) continue;
-            serverCount++;
 
-            if (!versionObj[server.server_version]) versionObj[server.server_version] = [];
+            if (!versionObj[server.serverVersion]) versionObj[server.serverVersion] = [];
 
-            versionObj[server.server_version].push(server);
+            versionObj[server.serverVersion].push(server);
         }
 
         // Sort the versions in descending order
@@ -59,22 +55,23 @@ module.exports = {
             for (let s of versionObj[key]) {
                 var statusEmoji = "<:c:1389899748370157609>";
 
-                const ygServer = yggdrasilServers.find(y => y.name.trim() === s.name.trim());
-                if (ygServer && ygServer.status === 'running') {
+                if (s.status === 'running') {
                     onlineCount++;
                     statusEmoji = "<:u:1389899745866027090>";
                 }
 
                 if (s.tag == "PLUS") statusEmoji = "";
-                if (!excludedTags.includes(s.tag) && !s.early_access) {
-                    str += `- **${s.tag.toUpperCase()} | ${s.name}** ${statusEmoji}\n ${s.tag.toLowerCase()}.valhallamc.io *(v.${s.modpack_version})*\n`;
+                if (!excludedTags.includes(s.tag) && !s.earlyAccess) {
+                    str += `- **${s.tag.toUpperCase()} | ${s.name}** ${statusEmoji}\n ${s.tag.toLowerCase()}.valhallamc.io *(v.${s.modpackVersion})*\n`;
                 }
             }
 
-            embed.addFields({
-                name: `Minecraft ${key}`,
-                value: str
-            });
+            if (str) {
+                embed.addFields({
+                    name: `Minecraft ${key}`,
+                    value: str
+                });
+            }
         }
 
         embed.setDescription(`Servers online: ${onlineCount}`);

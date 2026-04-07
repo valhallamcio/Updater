@@ -47,7 +47,7 @@ module.exports = {
             onlineCount += onlinePlayerCount;
 
             if (onlinePlayerCount > 0) {
-                if (serv && serv.tag && !serv.early_access) {
+                if (serv && serv.tag && !serv.earlyAccess) {
                     let tag = serv.tag;
                     embed.addFields({
                         name: `**[${tag.toUpperCase()}]** ${fullName} - **${onlinePlayerCount}**`,

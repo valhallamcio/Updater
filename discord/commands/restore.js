@@ -14,9 +14,7 @@ const fs = require('fs').promises; // Use promises with fs for consistency with 
 const {
     SlashCommandBuilder
 } = require('discord.js');
-const {
-    getServers
-} = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 const updater = require('../../managers/updateManager');
 
 module.exports = {
@@ -37,7 +35,7 @@ module.exports = {
             .setAutocomplete(true)),
     async autocomplete(interaction) {
         const focusedValue = interaction.options.getFocused(true);
-        const serverList = await getServers();
+        const serverList = await yggdrasil.getServers();
         let choices = [];
 
         if (focusedValue.name === "server") {
@@ -74,7 +72,7 @@ module.exports = {
         await interaction.deferReply();
         const query = interaction.options.getString('server');
         const backup = interaction.options.getString('backup');
-        const serverList = await getServers();
+        const serverList = await yggdrasil.getServers();
         await interaction.editReply("Update manager is starting...");
 
         const message = await interaction.fetchReply();

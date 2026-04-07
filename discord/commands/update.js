@@ -13,7 +13,7 @@
 const {
     SlashCommandBuilder
 } = require('discord.js');
-const { getServers } = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 const updater = require('../../managers/updateManager');
 
 module.exports = {
@@ -34,7 +34,7 @@ module.exports = {
 
 	async autocomplete(interaction) {
 		const focusedValue = interaction.options.getFocused();
-        const serverList = await getServers();
+        const serverList = await yggdrasil.getServers();
 		const choices = [];
 
         for (const server of serverList) {
@@ -52,7 +52,7 @@ module.exports = {
     async execute(interaction) {
         const query = interaction.options.getString('server');
         const versionOverride = interaction.options.getString('version');
-        const serverList = await getServers();
+        const serverList = await yggdrasil.getServers();
         await interaction.deferReply();
         await interaction.editReply("Update manager is starting...");
 

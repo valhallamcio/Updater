@@ -11,7 +11,6 @@
  */
 
 const functions = require("../modules/functions");
-const mongo = require("../modules/mongo");
 const pterodactyl = require("../modules/pterodactyl");
 const yggdrasil = require("../modules/yggdrasil");
 const sessionLogger = require("../modules/sessionLogger");
@@ -48,7 +47,7 @@ module.exports = {
 
             let cakeAmount = Math.floor(Math.random() * (options.max - options.min + 1)) + options.min;
 
-            let servers = await mongo.getServers();
+            let servers = await yggdrasil.getServers();
             let playerData = await yggdrasil.getPlayers();
 
             let totalAmount = 0;
@@ -56,6 +55,10 @@ module.exports = {
 
             for (let serverName in playerData) {
                 let server = servers.find(s => s.name.trim() === serverName);
+                if (!server) {
+                    sessionLogger.warn('CakeDrop', `Server '${serverName}' not found, skipping`);
+                    continue;
+                }
 
                 for (let player of playerData[serverName]) {
                     if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player)) continue;
@@ -78,7 +81,7 @@ module.exports = {
     },
 
     dropCakeManual: async function (cakeAmount) {
-        let servers = await mongo.getServers();
+        let servers = await yggdrasil.getServers();
         let playerData = await yggdrasil.getPlayers();
 
         let totalAmount = 0;
@@ -86,6 +89,10 @@ module.exports = {
 
         for (let serverName in playerData) {
             let server = servers.find(s => s.name.trim() === serverName);
+            if (!server) {
+                sessionLogger.warn('CakeDrop', `Server '${serverName}' not found, skipping`);
+                continue;
+            }
 
             for (let player of playerData[serverName]) {
                 if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player)) continue;

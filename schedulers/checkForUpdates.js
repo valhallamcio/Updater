@@ -12,7 +12,7 @@
 
 const curseforge = require("../modules/curseforge");
 const modpacksch = require("../modules/modpacksch");
-const mongo = require("../modules/mongo");
+const yggdrasil = require("../modules/yggdrasil");
 const functions = require("../modules/functions");
 const {
     EmbedBuilder
@@ -45,7 +45,7 @@ module.exports = {
     updateCheck: async function () {
         sessionLogger.info('CheckForUpdates', "Checking for updates...");
 
-        let servers = await mongo.getServers();
+        let servers = await yggdrasil.getServers();
         let numberOfUpdates = 0;
 
         for (let server of servers) {
@@ -77,7 +77,7 @@ module.exports = {
             } else {
                 const newVersionNumber = functions.getVersion(packManifest.name);
 
-                sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpack_version} -> v${newVersionNumber})`);
+                sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
                 updateRequired = true;
                 numberOfUpdates++;
 
@@ -88,7 +88,7 @@ module.exports = {
                             iconURL: packLogo,
                         })
                         .setTitle("<a:Update:1242446803345866883><a:U_:1242446802083385426><a:pd:1242446800586280960><a:ate:1242446799093104650>")
-                        .setDescription(`An update was detected for ${server.name}! (v${server.modpack_version} -> v${newVersionNumber})\n\nLearn more here: [Changelog](${packURL})`)
+                        .setDescription(`An update was detected for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})\n\nLearn more here: [Changelog](${packURL})`)
                         .setColor("#00f597")
                         .setFooter({
                             text: "To run automated update use /update",
@@ -102,14 +102,10 @@ module.exports = {
                 }
             }
 
-            let update = {
-                $set: {
-                    newestFileID: newestUpdateId,
-                    requiresUpdate: updateRequired
-                }
-            };
-
-            await mongo.updateServers(server.modpackID, update);
+            await yggdrasil.updateServer(server.tag, {
+                newestFileID: newestUpdateId,
+                requiresUpdate: updateRequired
+            });
             //console.log(newestUpdateId);
         }
 

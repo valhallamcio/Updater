@@ -4,6 +4,7 @@ const mongo = require('./mongo');
 const yggdrasil = require('./yggdrasil');
 const sessionLogger = require('./sessionLogger');
 
+
 let discordClient = null;
 let debounceTimer = null;
 const DEBOUNCE_MS = 2000;
@@ -53,10 +54,9 @@ async function updateAllEmbeds() {
         const liveEmbeds = await mongo.getLiveEmbeds();
         if (liveEmbeds.length === 0) return;
 
-        const serverList = await mongo.getServers();
-        const yggdrasilServers = await yggdrasil.getServers();
+        const servers = await yggdrasil.getServers();
 
-        const currentHash = generateServerStateHash(serverList, yggdrasilServers);
+        const currentHash = generateServerStateHash(servers);
 
         const needsUpdate = liveEmbeds.some(embed => embed.lastHash !== currentHash);
         if (!needsUpdate) return;
@@ -65,7 +65,7 @@ async function updateAllEmbeds() {
 
         for (const embedData of liveEmbeds) {
             if (embedData.lastHash !== currentHash) {
-                await updateSingleEmbed(embedData, serverList, yggdrasilServers, currentHash);
+                await updateSingleEmbed(embedData, servers, currentHash);
             }
         }
     } catch (error) {
@@ -76,7 +76,7 @@ async function updateAllEmbeds() {
 /**
  * Updates a single live embed Discord message.
  */
-async function updateSingleEmbed(embedData, serverList, yggdrasilServers, newHash) {
+async function updateSingleEmbed(embedData, servers, newHash) {
     try {
         const channel = await discordClient.channels.fetch(embedData.channelId);
         if (!channel) {
@@ -92,7 +92,7 @@ async function updateSingleEmbed(embedData, serverList, yggdrasilServers, newHas
             return;
         }
 
-        const updatedEmbed = generateServerEmbed(serverList, yggdrasilServers);
+        const updatedEmbed = generateServerEmbed(servers);
         await message.edit({ embeds: [updatedEmbed] });
         await mongo.updateLiveEmbedHash(embedData.messageId, newHash);
 
@@ -113,9 +113,8 @@ async function updateSingleEmbed(embedData, serverList, yggdrasilServers, newHas
  * Registers a new live embed for automatic updates.
  */
 async function registerEmbed(messageId, channelId, guildId, userId) {
-    const serverList = await mongo.getServers();
-    const yggdrasilServers = await yggdrasil.getServers();
-    const hash = generateServerStateHash(serverList, yggdrasilServers);
+    const servers = await yggdrasil.getServers();
+    const hash = generateServerStateHash(servers);
 
     await mongo.storeLiveEmbed(messageId, channelId, guildId, userId, hash);
     sessionLogger.info('LiveEmbedManager', `Registered live embed ${messageId}`);
@@ -131,11 +130,10 @@ async function removeEmbed(messageId) {
 
 /**
  * Generates the server status embed.
- * @param {Array} serverList Array of server objects from MongoDB.
- * @param {Array} yggdrasilServers Array of server objects from Yggdrasil API.
+ * @param {Array} servers Array of server objects from Yggdrasil API.
  * @returns {EmbedBuilder} The generated embed.
  */
-function generateServerEmbed(serverList, yggdrasilServers) {
+function generateServerEmbed(servers) {
     const embed = new EmbedBuilder()
         .setColor(0x9c59b6)
         .setTitle('Server List')
@@ -147,10 +145,10 @@ function generateServerEmbed(serverList, yggdrasilServers) {
     let onlineCount = 0;
     let versionObj = {};
 
-    for (let server of serverList) {
+    for (let server of servers) {
         if (server.excludeFromServerList) continue;
-        if (!versionObj[server.server_version]) versionObj[server.server_version] = [];
-        versionObj[server.server_version].push(server);
+        if (!versionObj[server.serverVersion]) versionObj[server.serverVersion] = [];
+        versionObj[server.serverVersion].push(server);
     }
 
     const sortedVersions = Object.keys(versionObj).sort((a, b) => compareVersions(b, a));
@@ -162,15 +160,14 @@ function generateServerEmbed(serverList, yggdrasilServers) {
         for (let s of versionObj[key]) {
             var statusEmoji = "<:c:1389899748370157609>";
 
-            const ygServer = yggdrasilServers.find(y => y.name.trim() === s.name.trim());
-            if (ygServer && ygServer.status === 'running') {
+            if (s.status === 'running') {
                 onlineCount++;
                 statusEmoji = "<:u:1389899745866027090>";
             }
 
             if (s.tag == "PLUS") statusEmoji = "";
-            if (!excludedTags.includes(s.tag) && !s.early_access) {
-                str += `- **${s.tag.toUpperCase()} | ${s.name}** ${statusEmoji}\n ${s.tag.toLowerCase()}.valhallamc.io *(v.${s.modpack_version})*\n`;
+            if (!excludedTags.includes(s.tag) && !s.earlyAccess) {
+                str += `- **${s.tag.toUpperCase()} | ${s.name}** ${statusEmoji}\n ${s.tag.toLowerCase()}.valhallamc.io *(v.${s.modpackVersion})*\n`;
             }
         }
 
@@ -189,21 +186,16 @@ function generateServerEmbed(serverList, yggdrasilServers) {
 /**
  * Generates a hash of the current server state for change detection.
  */
-function generateServerStateHash(serverList, yggdrasilServers) {
-    const stateData = {
-        servers: serverList.map(server => ({
-            tag: server.tag,
-            name: server.name,
-            modpack_version: server.modpack_version,
-            server_version: server.server_version,
-            excludeFromServerList: server.excludeFromServerList,
-            early_access: server.early_access
-        })),
-        statuses: yggdrasilServers.map(s => ({
-            name: s.name,
-            status: s.status
-        }))
-    };
+function generateServerStateHash(servers) {
+    const stateData = servers.map(server => ({
+        tag: server.tag,
+        name: server.name,
+        modpackVersion: server.modpackVersion,
+        serverVersion: server.serverVersion,
+        excludeFromServerList: server.excludeFromServerList,
+        earlyAccess: server.earlyAccess,
+        status: server.status
+    }));
 
     return crypto.createHash('sha256').update(JSON.stringify(stateData)).digest('hex');
 }

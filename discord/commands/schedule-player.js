@@ -2,10 +2,8 @@ const {
     SlashCommandBuilder,
     EmbedBuilder
 } = require('discord.js');
-const {
-    getServers
-} = require('../../modules/mongo');
 const mongo = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -66,7 +64,7 @@ module.exports = {
         
         if (focusedOption.name === 'servers') {
             const focusedValue = focusedOption.value;
-            const serverList = await getServers();
+            const serverList = await yggdrasil.getServers();
             const choices = ["all"];
 
             for (const server of serverList) {
@@ -143,14 +141,14 @@ module.exports = {
         // Parse servers
         let serverNames = [];
         if (serversInput.toLowerCase() === 'all') {
-            const allServers = await getServers();
+            const allServers = await yggdrasil.getServers();
             serverNames = allServers.filter(s => !s.excludeFromServerList).map(s => s.name);
         } else {
             serverNames = serversInput.split(',').map(s => s.trim());
         }
         
         // Validate servers exist (with improved matching like /execute command)
-        const allServers = await getServers();
+        const allServers = await yggdrasil.getServers();
         const validServers = [];
         for (const serverName of serverNames) {
             // Try exact match first, then case-insensitive, then tag match

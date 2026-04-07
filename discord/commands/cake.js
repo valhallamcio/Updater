@@ -30,9 +30,9 @@ module.exports = {
         await interaction.deferReply();
         let cakeAmount = interaction.options.getInteger('amount');
         if (cakeAmount === null) cakeAmount = 1;
-        interaction.editReply(`Dropping ${cakeAmount} cakes! 🍰`);
+        await interaction.editReply(`Dropping ${cakeAmount} cakes! 🍰`);
 
         const cakes = await dropCakeManual(cakeAmount);
-        interaction.editReply(cakes, `🍰`);
+        await interaction.editReply(cakes);
     },
 };

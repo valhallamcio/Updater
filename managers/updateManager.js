@@ -37,7 +37,7 @@ const {
     alertScheduledUpdate,
     updateMessage
 } = require('../config/messages.json');
-const mongo = require('../modules/mongo');
+const yggdrasil = require('../modules/yggdrasil');
 const {
     sendWebhook
 } = require('../discord/webhook');
@@ -94,7 +94,7 @@ module.exports = {
 
         const alert = alertScheduledUpdate.replace("[NEWVERSION]", newVersionNumber);
 
-        let progressLog = `Update sequence started for **${pack.name}** (${pack.modpack_version} -> ${newVersionNumber}).`;
+        let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await interaction.edit(progressLog);
 
         await pterodactyl.sendCommand(pack.serverId, alert);
@@ -189,14 +189,14 @@ module.exports = {
         const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
 
         const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
-        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${pack.fileID}.tar.gz`);
+        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`);
 
         await sleep(1000);
         await pterodactyl.deleteFile(pack.serverId, [compress]);
 
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
-        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${pack.fileID}.tar.gz`, `./${pack.tag}/compare/main`);
+        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`, `./${pack.tag}/compare/main`);
 
         progressLog += ` Done!\n- Comparing changes...`;
         await interaction.edit(progressLog);
@@ -256,23 +256,20 @@ module.exports = {
 
         progressLog += ` Done!\n- Updating data and sending update message...`;
         await interaction.edit(progressLog);
-        let dbUpdate = {
-            $set: {
-                modpack_version: newVersionNumber,
-                fileID: pack.newestFileID,
-                newestFileID: pack.newestFileID,
-                requiresUpdate: false
-            }
-        };
-        mongo.updateServer(pack.serverId, dbUpdate);
+        await yggdrasil.updateServer(pack.tag, {
+            modpack_version: newVersionNumber,
+            fileID: pack.newestFileID,
+            newestFileID: pack.newestFileID,
+            requiresUpdate: false
+        });
 
         //TODO ai summary ???
         const packData = await curseforge.getPackData(pack.modpackID);
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newVersionNumber)
-            .replace("[OLDVERSION]", pack.modpack_version)
+            .replace("[OLDVERSION]", pack.modpackVersion)
             .replace("[CHANGELOGURL]", `https://www.curseforge.com/minecraft/modpacks/${packData.slug}/files/${pack.newestFileID}`)
-            .replace("[PINGROLE]", `<@&${pack.discord_role_id}>`)
+            .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "");
 
         const updateWebhook = {
@@ -298,7 +295,7 @@ module.exports = {
 
         const alert = alertScheduledUpdate.replace("[NEWVERSION]", newVersionNumber);
 
-        let progressLog = `Update sequence started for **${pack.name}** (${pack.modpack_version} -> ${newVersionNumber}).`;
+        let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await interaction.edit(progressLog);
 
         await pterodactyl.sendCommand(pack.serverId, alert);
@@ -344,14 +341,14 @@ module.exports = {
         const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
 
         const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
-        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${pack.fileID}.tar.gz`);
+        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`);
 
         await sleep(1000);
         await pterodactyl.deleteFile(pack.serverId, [compress]);
 
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
-        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${pack.fileID}.tar.gz`, `./${pack.tag}/compare/main`);
+        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`, `./${pack.tag}/compare/main`);
 
         progressLog += ` Done!\n- Generating current server manifest...`;
         await interaction.edit(progressLog);
@@ -421,23 +418,20 @@ module.exports = {
 
         progressLog += ` Done!\n- Updating data and sending update message...`;
         await interaction.edit(progressLog);
-        let dbUpdate = {
-            $set: {
-                modpack_version: newVersionNumber,
-                fileID: pack.newestFileID,
-                newestFileID: pack.newestFileID,
-                requiresUpdate: false
-            }
-        };
-        await mongo.updateServer(pack.serverId, dbUpdate);
+        await yggdrasil.updateServer(pack.tag, {
+            modpack_version: newVersionNumber,
+            fileID: pack.newestFileID,
+            newestFileID: pack.newestFileID,
+            requiresUpdate: false
+        });
 
         //TODO ai summary ???
         const packData = await modpacksch.getFTBPackData(pack.modpackID);
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newVersionNumber)
-            .replace("[OLDVERSION]", pack.modpack_version)
+            .replace("[OLDVERSION]", pack.modpackVersion)
             .replace("[CHANGELOGURL]", `https://www.feed-the-beast.com/modpacks/${pack.modpackID}?tab=versions`)
-            .replace("[PINGROLE]", `<@&${pack.discord_role_id}>`)
+            .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "");
 
         const updateWebhook = {
@@ -459,7 +453,7 @@ module.exports = {
 
         let restoredPackData = backup.match(/^.+?_(.+)_(.+)\.tar\.gz$/);
 
-        let progressLog = `Restore sequence started for **${pack.name}** (${pack.modpack_version} -> ${restoredPackData[1]}).`;
+        let progressLog = `Restore sequence started for **${pack.name}** (${pack.modpackVersion} -> ${restoredPackData[1]}).`;
         await interaction.edit(progressLog);
 
         progressLog += `\n- Shutting down the server...`;
@@ -509,14 +503,11 @@ module.exports = {
         progressLog += ` Done!\n- Restore sequence completed. Updating data...`;
         await interaction.edit(progressLog);
 
-        let dbUpdate = {
-            $set: {
-                modpack_version: restoredPackData[1],
-                fileID: restoredPackData[2],
-                requiresUpdate: true
-            }
-        };
-        await mongo.updateServer(pack.serverId, dbUpdate);
+        await yggdrasil.updateServer(pack.tag, {
+            modpack_version: restoredPackData[1],
+            fileID: restoredPackData[2],
+            requiresUpdate: true
+        });
 
     },
 
@@ -552,10 +543,10 @@ module.exports = {
         
         // Get current version based on pack info
         const allVersions = await gtnh.getAllVersions();
-        currentVersionUrl = allVersions.find(url => url.includes(`GT_New_Horizons_${pack.modpack_version}_Server_Java_17-21.zip`));
+        currentVersionUrl = allVersions.find(url => url.includes(`GT_New_Horizons_${pack.modpackVersion}_Server_Java_17-21.zip`));
         
         if (!currentVersionUrl) {
-            const errorMsg = `Current version ${pack.modpack_version} not found in available GTNH versions!`;
+            const errorMsg = `Current version ${pack.modpackVersion} not found in available GTNH versions!`;
             sessionLogger.error('UpdateManager', errorMsg);
             await interaction.edit(errorMsg);
             return;
@@ -633,14 +624,14 @@ module.exports = {
         const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
         
         const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
-        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${currentVersion}.tar.gz`);
+        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`);
         
         await sleep(1000);
         await pterodactyl.deleteFile(pack.serverId, [compress]);
         
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
-        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpack_version}_${currentVersion}.tar.gz`, `./${pack.tag}/compare/main`);
+        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`, `./${pack.tag}/compare/main`);
         
         progressLog += ` Done!\n- Comparing changes...`;
         await interaction.edit(progressLog);
@@ -775,15 +766,10 @@ module.exports = {
         progressLog += ` Done!\n- Updating data and sending update message...`;
         await interaction.edit(progressLog);
         // Use consistent database update
-        let dbUpdate = {
-            $set: {
-                modpack_version: newestVersion,
-                fileID: null, // GTNH doesn't use fileID concept like CF/FTB
-                newestFileID: null, // GTNH doesn't use fileID concept like CF/FTB
-                requiresUpdate: false
-            }
-        };
-        await mongo.updateServer(pack.serverId, dbUpdate);
+        await yggdrasil.updateServer(pack.tag, {
+            modpack_version: newestVersion,
+            requiresUpdate: false
+        });
 
         // Use consistent webhook structure
         // Note: GTNH doesn't have a specific pack data endpoint like CF/FTB for logo/summary
@@ -791,7 +777,7 @@ module.exports = {
             .replace("[NEWVERSION]", newestVersion)
             .replace("[OLDVERSION]", currentVersion) // Use the extracted currentVersion
             .replace("[CHANGELOGURL]", `https://wiki.gtnewhorizons.com/wiki/Upcoming_Features`) // Standard GTNH changelog link
-            .replace("[PINGROLE]", `<@&${pack.discord_role_id}>`)
+            .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "Check the GTNH wiki for detailed changes."); // Placeholder summary
 
         const updateWebhook = {

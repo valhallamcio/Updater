@@ -18,9 +18,7 @@ const {
     AttachmentBuilder
 } = require('discord.js');
 const sessionLogger = require('../../modules/sessionLogger');
-const {
-    getServers
-} = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 const {
     sendCommand
 } = require('../../modules/pterodactyl');
@@ -50,7 +48,7 @@ async function getCachedServers() {
     }
     
     // Otherwise, fetch fresh data and update cache
-    const servers = await getServers();
+    const servers = await yggdrasil.getServers();
     serverListCache.data = servers;
     serverListCache.timestamp = now;
     
@@ -75,7 +73,7 @@ module.exports = {
     async autocomplete(interaction) {
         const focusedValue = interaction.options.getFocused();
         const serverList = await getCachedServers();
-        const choices = ["all", "Velocity"];
+        const choices = ["all", "Bifrost"]; // Include special options
 
         // Process server names to ensure they don't exceed Discord's 25-character limit
         for (const server of serverList) {
@@ -116,9 +114,9 @@ module.exports = {
             }
             await interaction.reply(`Sent \`${command}\` to **all** servers! 🚀`);
             return;
-        } else if (query === 'Velocity') {
+        } else if (query === 'Bifrost') {
             sendCommand(velocityID, command);
-            await interaction.reply(`Sent \`${command}\` to **Velocity**! 🚀`);
+            await interaction.reply(`Sent \`${command}\` to **Bifrost**! 🚀`);
 
         } else {
             // Handle truncated server names in the query

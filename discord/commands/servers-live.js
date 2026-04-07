@@ -3,7 +3,6 @@ const {
     EmbedBuilder,
     PermissionFlagsBits
 } = require('discord.js');
-const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
 const liveEmbedManager = require('../../modules/liveEmbedManager');
 
@@ -25,10 +24,9 @@ module.exports = {
         await interaction.deferReply();
 
         try {
-            const serverList = await mongo.getServers();
-            const yggdrasilServers = await yggdrasil.getServers();
+            const servers = await yggdrasil.getServers();
 
-            const embed = liveEmbedManager.generateServerEmbed(serverList, yggdrasilServers);
+            const embed = liveEmbedManager.generateServerEmbed(servers);
 
             // Send the embed
             const message = await interaction.editReply({

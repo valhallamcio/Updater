@@ -11,7 +11,7 @@
  */
 
 const functions = require("../modules/functions");
-const mongo = require("../modules/mongo");
+const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const sessionLogger = require("../modules/sessionLogger");
 
@@ -50,7 +50,7 @@ module.exports = {
     givePerms: async function (options) {
 
         sessionLogger.info('StaffPerms', "Checking staff permissions...");
-        const servers = await mongo.getServers();
+        const servers = await yggdrasil.getServers();
 
         for (let server of servers) {
             //console.log(`Checking server ${server.name}`);
