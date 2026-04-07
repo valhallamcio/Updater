@@ -97,8 +97,8 @@ module.exports = {
             let serverList = await yggdrasil.getServers();
             serverListFull = await addMentionButton(serverList);
         
-            serverList = serverListFull.filter(server => server.discordRoleId != "");
-            serverListMissing = serverListFull.filter(server => server.discordRoleId === "");
+            serverList = serverListFull.filter(server => server.discordRoleId != "" && server.discordRoleId);
+            serverListMissing = serverListFull.filter(server => (!server.discordRoleId || server.discordRoleId === "") && server.modpackID);
             await generateNewRoles(serverListMissing);
         
             const webhook = await getWebhook(options.roleChannelId);
@@ -182,17 +182,22 @@ module.exports = {
         }
 
         async function generateEmoji(server) {
-            if (!server.hostname) return;
+            if (!server.hostname || !server.modpackID) return;
             const channel = await client.channels.fetch(options.roleChannelId);
             sessionLogger.info('RoleAssigner', `Creating new emoji for ${server.name}!`);
             let emojiURL = "";
 
-            if (server.platform === 'feedthebeast') {
-                const packData = await getFTBPackData(server.modpackID);
-                emojiURL = packData.art[0].url;
-            } else {
-                const packData = await getPackData(server.modpackID);
-                emojiURL = packData.logo.url;
+            try {
+                if (server.platform === 'feedthebeast') {
+                    const packData = await getFTBPackData(server.modpackID);
+                    emojiURL = packData.art[0].url;
+                } else {
+                    const packData = await getPackData(server.modpackID);
+                    emojiURL = packData.logo.url;
+                }
+            } catch (error) {
+                sessionLogger.warn('RoleAssigner', `Failed to get pack data for ${server.name}: ${error.message}`);
+                return;
             }
 
             const response = await axios.get(emojiURL, {
