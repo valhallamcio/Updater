@@ -1,6 +1,5 @@
 const mongo = require("../modules/mongo");
 const yggdrasil = require("../modules/yggdrasil");
-const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");

@@ -42,7 +42,6 @@ const {
     sendWebhook
 } = require('../discord/webhook');
 const manifest = require('../modules/manifest');
-const { verify } = require('crypto');
 const sessionLogger = require('../modules/sessionLogger');
 const {
     active,

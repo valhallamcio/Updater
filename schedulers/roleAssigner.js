@@ -9,9 +9,6 @@
  * -----
  * Copyright 2024 flaasz
  */
-const {
-    rmSync
-} = require("fs-extra");
 const sharp = require('sharp');
 const axios = require('axios');
 const sessionLogger = require("../modules/sessionLogger");
@@ -24,9 +21,6 @@ const {
 const {
     getPackData
 } = require("../modules/curseforge");
-const {
-    download
-} = require("../modules/downloader");
 const {
     sleep
 } = require("../modules/functions");
@@ -95,10 +89,10 @@ module.exports = {
 
         async function buildButtons() {
             let serverList = await yggdrasil.getServers();
-            serverListFull = await addMentionButton(serverList);
+            const serverListFull = await addMentionButton(serverList);
         
             serverList = serverListFull.filter(server => server.discordRoleId != "" && server.discordRoleId);
-            serverListMissing = serverListFull.filter(server => (!server.discordRoleId || server.discordRoleId === "") && server.modpackID);
+            const serverListMissing = serverListFull.filter(server => (!server.discordRoleId || server.discordRoleId === "") && server.modpackID);
             await generateNewRoles(serverListMissing);
         
             const webhook = await getWebhook(options.roleChannelId);
@@ -205,7 +199,7 @@ module.exports = {
             });
             const buffer = response.data;
 
-            resizedBuffer = await sharp(buffer)
+            const resizedBuffer = await sharp(buffer)
                 .resize({
                     width: 128,
                     height: 128,

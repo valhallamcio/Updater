@@ -9,7 +9,7 @@
 
 const fs = require('fs-extra');
 const path = require('path');
-const { normalizeUuid, isValidUuid, uuidToMongoBase64 } = require('./uuidUtils');
+const { normalizeUuid, uuidToMongoBase64 } = require('./uuidUtils');
 const { readSnbtFile, extractQuestStats, extractChunkStats, extractEssentialsStats, parseSNBT, getDimIdFromName } = require('./snbtParser');
 const mongo = require('./mongo');
 

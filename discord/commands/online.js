@@ -36,7 +36,6 @@ module.exports = {
             });
 
         let onlineCount = 0;
-        let serverCount = 0;
 
 
 

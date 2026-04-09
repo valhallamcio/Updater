@@ -78,7 +78,7 @@ module.exports = {
 
             // Initialize progress bar
             const totalSize = zip.toBuffer().length;
-            const bar = new ProgressBar(`Compressing ${filesToCompress.split("/").at(-1)} [:bar] :rate/bps :percent :etas`, {
+            const bar = new ProgressBar(`Compressing ${outputPath.split("/").at(-1)} [:bar] :rate/bps :percent :etas`, {
                 complete: '=',
                 incomplete: ' ',
                 width: 40,
