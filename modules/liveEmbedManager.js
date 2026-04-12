@@ -39,7 +39,7 @@ async function init() {
  * Debounced update scheduler — avoids flooding Discord API when multiple events fire at once.
  */
 function scheduleUpdate() {
-    if (debounceTimer) clearTimeout(debounceTimer);
+    if (debounceTimer) return;
     debounceTimer = setTimeout(() => {
         debounceTimer = null;
         updateAllEmbeds();
@@ -55,7 +55,6 @@ async function updateAllEmbeds() {
         if (liveEmbeds.length === 0) return;
 
         const servers = await yggdrasil.getServers();
-
         const currentHash = generateServerStateHash(servers);
 
         const needsUpdate = liveEmbeds.some(embed => embed.lastHash !== currentHash);
@@ -80,14 +79,14 @@ async function updateSingleEmbed(embedData, servers, newHash) {
     try {
         const channel = await discordClient.channels.fetch(embedData.channelId);
         if (!channel) {
-            sessionLogger.warn('LiveEmbedManager', `Channel ${embedData.channelId} not found, removing embed`);
+            sessionLogger.warn('LiveEmbedManager', `Channel ${embedData.channelId} not found, REMOVING embed ${embedData.messageId} from DB`);
             await mongo.removeLiveEmbed(embedData.messageId);
             return;
         }
 
         const message = await channel.messages.fetch(embedData.messageId);
         if (!message) {
-            sessionLogger.warn('LiveEmbedManager', `Message ${embedData.messageId} not found, removing embed`);
+            sessionLogger.warn('LiveEmbedManager', `Message ${embedData.messageId} not found, REMOVING from DB`);
             await mongo.removeLiveEmbed(embedData.messageId);
             return;
         }
@@ -99,12 +98,12 @@ async function updateSingleEmbed(embedData, servers, newHash) {
         sessionLogger.info('LiveEmbedManager', `Updated live embed ${embedData.messageId}`);
     } catch (error) {
         if (error.code === 10008 || error.code === 10003) {
-            sessionLogger.warn('LiveEmbedManager', `Message/Channel not found, removing embed ${embedData.messageId}`);
+            sessionLogger.warn('LiveEmbedManager', `Discord error code ${error.code} (message/channel not found), REMOVING embed ${embedData.messageId} from DB`);
             await mongo.removeLiveEmbed(embedData.messageId);
         } else if (error.code === 50013) {
-            sessionLogger.warn('LiveEmbedManager', `Missing permissions to update embed ${embedData.messageId}`);
+            sessionLogger.warn('LiveEmbedManager', `Missing permissions (50013) to update embed ${embedData.messageId}`);
         } else {
-            sessionLogger.error('LiveEmbedManager', `Error updating live embed ${embedData.messageId}:`, error.message);
+            sessionLogger.error('LiveEmbedManager', `Error updating live embed ${embedData.messageId} (code=${error.code}):`, error.message);
         }
     }
 }
