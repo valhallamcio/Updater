@@ -53,10 +53,17 @@ module.exports = {
             let response = await axios.get(`https://api.curseforge.com/v1/mods/${modPackId}/files/${versionId}`, {
                 headers: header
             });
-            //console.log(response);
-            return response.data.data.downloadUrl;
+            const fileData = response.data.data;
+            if (fileData.downloadUrl) return fileData.downloadUrl;
+
+            // Fallback: construct CDN URL when downloadUrl is null (author disabled direct downloads)
+            const idPart1 = Math.floor(versionId / 1000);
+            const idPart2 = versionId % 1000;
+            const fallbackUrl = `https://edge.forgecdn.net/files/${idPart1}/${idPart2}/${fileData.fileName}`;
+            sessionLogger.info('CurseForge', `downloadUrl null for ${modPackId}/${versionId}, using CDN fallback: ${fallbackUrl}`);
+            return fallbackUrl;
         } catch (error) {
-            sessionLogger.error('CurseForge', 'Error getting pack data:', error);
+            sessionLogger.error('CurseForge', 'Error getting file link:', error);
         }
     },
 
