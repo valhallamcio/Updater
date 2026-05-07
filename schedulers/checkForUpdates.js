@@ -49,6 +49,8 @@ module.exports = {
         let numberOfUpdates = 0;
 
         for (let server of servers) {
+            if (server.platform === "github") continue;
+
             let newestUpdateId = 0;
             let updateRequired = false;
             let packManifest = {};
@@ -75,7 +77,7 @@ module.exports = {
             if (server.fileID === newestUpdateId) {
                 sessionLogger.info('CheckForUpdates', `No updates found for ${server.name}.`);
             } else {
-                const newVersionNumber = functions.getVersion(packManifest.name);
+                const newVersionNumber = functions.getVersion(packManifest.name) || 'unknown';
 
                 sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
                 updateRequired = true;

@@ -136,9 +136,11 @@ class SessionLogger {
 
     formatLogEntry(level, source, message, ...args) {
         const timestamp = moment().format('HH:mm:ss');
-        const formattedArgs = args.length > 0 ? ' ' + args.map(arg => 
-            typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-        ).join(' ') : '';
+        const formattedArgs = args.length > 0 ? ' ' + args.map(arg => {
+            if (arg instanceof Error) return `${arg.message}\n${arg.stack}`;
+            if (typeof arg === 'object') return JSON.stringify(arg);
+            return String(arg);
+        }).join(' ') : '';
         
         return `[${timestamp}] [${source}/${level}]: ${message}${formattedArgs}`;
     }
