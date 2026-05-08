@@ -91,8 +91,15 @@ module.exports = {
             let serverList = await yggdrasil.getServers();
             const serverListFull = await addMentionButton(serverList);
         
-            serverList = serverListFull.filter(server => server.discordRoleId != "" && server.discordRoleId);
-            const serverListMissing = serverListFull.filter(server => (!server.discordRoleId || server.discordRoleId === "") && server.modpackID);
+            const seen = new Set();
+            const deduped = serverListFull.filter(server => {
+                if (seen.has(server.tag)) return false;
+                seen.add(server.tag);
+                return true;
+            });
+
+            serverList = deduped.filter(server => server.discordRoleId != "" && server.discordRoleId);
+            const serverListMissing = deduped.filter(server => !server.discordRoleId || server.discordRoleId === "");
             await generateNewRoles(serverListMissing);
         
             const webhook = await getWebhook(options.roleChannelId);
