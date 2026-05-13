@@ -38,8 +38,11 @@ module.exports = {
 
         let versionObj = {};
 
+        const seen = new Set();
         for (let server of serverList) {
             if (server.excludeFromServerList) continue;
+            if (seen.has(server.tag)) continue;
+            seen.add(server.tag);
 
             if (!versionObj[server.serverVersion]) versionObj[server.serverVersion] = [];
 

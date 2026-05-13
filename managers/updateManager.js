@@ -84,7 +84,8 @@ module.exports = {
      * @param {object} interaction Object with the interaction data.(for Discord)
      */
 
-    updateCF: async function (pack, versionOverride, interaction) {
+    updateCF: async function (pack, versionOverride, interaction, serverIds = null) {
+        const allServerIds = serverIds && serverIds.length > 0 ? serverIds : [pack.serverId];
 
         const packManifest = await modpacksch.getCFPackManifest(pack.modpackID, pack.newestFileID);
 
@@ -96,7 +97,7 @@ module.exports = {
         let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await interaction.edit(progressLog);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         let newestServerPackID = await curseforge.getServerFileId(pack.modpackID, pack.newestFileID);
         let currentServerPackID = await curseforge.getServerFileId(pack.modpackID, pack.fileID);
@@ -151,27 +152,27 @@ module.exports = {
         await interaction.edit(progressLog);
         await download(newestServerpackURL, `./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Downloading reference server pack...`;
         await interaction.edit(progressLog);
         await download(currentServerPackURL, `./${pack.tag}/downloads/old/${pack.tag}_${currentServerPackID}.zip`);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Decompressing new pack files...`;
         await interaction.edit(progressLog);
         await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`, `./${pack.tag}/compare/new`);
         await checkMods(`./${pack.tag}/compare/new`);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Decompressing reference pack files...`;
         await interaction.edit(progressLog);
         await decompress(`./${pack.tag}/downloads/old/${pack.tag}_${currentServerPackID}.zip`, `./${pack.tag}/compare/old`);
         await checkMods(`./${pack.tag}/compare/old`);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         let toCompressList = [];
 
@@ -179,19 +180,20 @@ module.exports = {
             toCompressList.push(file);
         });
 
-        progressLog += ` Done!\n- Shutting down the server...`;
+        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.shutdown(pack.serverId);
+        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
 
         progressLog += ` Done!\n- Compressing and downloading current server files...`;
         await interaction.edit(progressLog);
-        const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
+        const primaryId = allServerIds[0];
+        const compress = await pterodactyl.compressFile(primaryId, toCompressList);
 
-        const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
+        const downloadLink = await pterodactyl.getDownloadLink(primaryId, compress);
         await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`);
 
         await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [compress]);
+        await pterodactyl.deleteFile(primaryId, [compress]);
 
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
@@ -226,28 +228,26 @@ module.exports = {
         await interaction.edit(progressLog);
         await compressDirectory(`${pack.tag}/compare/main`, `${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`);
 
-        progressLog += ` Done!\n- Uploading compressed update to the server...`;
+        progressLog += ` Done!\n- Uploading and deploying to ${allServerIds.length > 1 ? `${allServerIds.length} instances` : 'the server'}...`;
         await interaction.edit(progressLog);
-        const uploadUrl = await pterodactyl.getUploadLink(pack.serverId);
-        await upload(`${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`, uploadUrl);
-
 
         //DANGER ZONE - LINES BELOW MODIFY THE SERVER FILES ON LIVE BRANCH
 
-        progressLog += ` Done!\n- Unpacking the update...`;
-        await interaction.edit(progressLog);
-        await pterodactyl.deleteFile(pack.serverId, toCompressList);
-        await sleep(1000);
-        await pterodactyl.decompressFile(pack.serverId, `update_${pack.tag}_${pack.newestFileID}.zip`);
-        await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [`update_${pack.tag}_${pack.newestFileID}.zip`]);
+        for (const sid of allServerIds) {
+            const uploadUrl = await pterodactyl.getUploadLink(sid);
+            await upload(`${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`, uploadUrl);
+            await pterodactyl.deleteFile(sid, toCompressList);
+            await sleep(1000);
+            await pterodactyl.decompressFile(sid, `update_${pack.tag}_${pack.newestFileID}.zip`);
+            await sleep(1000);
+            await pterodactyl.deleteFile(sid, [`update_${pack.tag}_${pack.newestFileID}.zip`]);
+        }
 
         //DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
 
-
-        progressLog += ` Done!\n- Starting the server...`;
+        progressLog += ` Done!\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.sendPowerAction(pack.serverId, "start");
+        for (const sid of allServerIds) await pterodactyl.sendPowerAction(sid, "start");
 
         progressLog += ` Done!\n- Update sequence completed. Cleaning up...`;
         await interaction.edit(progressLog);
@@ -286,7 +286,8 @@ module.exports = {
      * @param {object} pack Object with the server data.
      * @param {object} interaction Object with the interaction data.(for Discord)
      */
-    updateFTB: async function (pack, versionOverride, interaction) {
+    updateFTB: async function (pack, versionOverride, interaction, serverIds = null) {
+        const allServerIds = serverIds && serverIds.length > 0 ? serverIds : [pack.serverId];
         const newManifest = await modpacksch.getFTBPackManifest(pack.modpackID, pack.newestFileID);
 
         let newVersionNumber = getVersion(newManifest.name);
@@ -297,7 +298,7 @@ module.exports = {
         let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await interaction.edit(progressLog);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += `\n- Getting pack manifests...`;
         await interaction.edit(progressLog);
@@ -313,7 +314,7 @@ module.exports = {
 
         rmRecursive(`./${pack.tag}`);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         let toCompressList = [];
         for (let file of oldManifest.files) {
@@ -329,21 +330,22 @@ module.exports = {
 
         await sleep(5000);
 
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        progressLog += ` Done!\n- Shutting down the server...`;
+        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.shutdown(pack.serverId);
+        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
 
         progressLog += ` Done!\n- Compressing and downloading current server files...`;
         await interaction.edit(progressLog);
-        const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
+        const ftbPrimaryId = allServerIds[0];
+        const compress = await pterodactyl.compressFile(ftbPrimaryId, toCompressList);
 
-        const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
+        const downloadLink = await pterodactyl.getDownloadLink(ftbPrimaryId, compress);
         await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`);
 
         await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [compress]);
+        await pterodactyl.deleteFile(ftbPrimaryId, [compress]);
 
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
@@ -388,28 +390,26 @@ module.exports = {
         await interaction.edit(progressLog);
         await compressDirectory(`${pack.tag}/compare/main`, `${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`);
 
-        progressLog += ` Done!\n- Uploading compressed update to the server...`;
+        progressLog += ` Done!\n- Uploading and deploying to ${allServerIds.length > 1 ? `${allServerIds.length} instances` : 'the server'}...`;
         await interaction.edit(progressLog);
-        const uploadUrl = await pterodactyl.getUploadLink(pack.serverId);
-        await upload(`${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`, uploadUrl);
-
 
         //DANGER ZONE - LINES BELOW MODIFY THE SERVER FILES ON LIVE BRANCH
 
-        progressLog += ` Done!\n- Unpacking the update...`;
-        await interaction.edit(progressLog);
-        await pterodactyl.deleteFile(pack.serverId, toCompressList);
-        await sleep(1000);
-        await pterodactyl.decompressFile(pack.serverId, `update_${pack.tag}_${pack.newestFileID}.zip`);
-        await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [`update_${pack.tag}_${pack.newestFileID}.zip`]);
+        for (const sid of allServerIds) {
+            const uploadUrl = await pterodactyl.getUploadLink(sid);
+            await upload(`${pack.tag}/update_${pack.tag}_${pack.newestFileID}.zip`, uploadUrl);
+            await pterodactyl.deleteFile(sid, toCompressList);
+            await sleep(1000);
+            await pterodactyl.decompressFile(sid, `update_${pack.tag}_${pack.newestFileID}.zip`);
+            await sleep(1000);
+            await pterodactyl.deleteFile(sid, [`update_${pack.tag}_${pack.newestFileID}.zip`]);
+        }
 
         //DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
 
-
-        progressLog += ` Done!\n- Starting the server...`;
+        progressLog += ` Done!\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.sendPowerAction(pack.serverId, "start");
+        for (const sid of allServerIds) await pterodactyl.sendPowerAction(sid, "start");
 
         progressLog += ` Done!\n- Update sequence completed. Cleaning up...`;
         await interaction.edit(progressLog);
@@ -448,16 +448,17 @@ module.exports = {
      * @param {string} backup The backup file to restore from.
      * @param {object} interaction Object containing the interaction data. (for Discord)
      */
-    restore: async function (pack, backup, interaction) {
+    restore: async function (pack, backup, interaction, serverIds = null) {
+        const allServerIds = serverIds && serverIds.length > 0 ? serverIds : [pack.serverId];
 
         let restoredPackData = backup.match(/^.+?_(.+)_(.+)\.tar\.gz$/);
 
         let progressLog = `Restore sequence started for **${pack.name}** (${pack.modpackVersion} -> ${restoredPackData[1]}).`;
         await interaction.edit(progressLog);
 
-        progressLog += `\n- Shutting down the server...`;
+        progressLog += `\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.shutdown(pack.serverId);
+        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
 
         progressLog += ` Done!\n- Repacking backup to zip...`;
         await interaction.edit(progressLog);
@@ -465,12 +466,9 @@ module.exports = {
 
         await compressDirectory(`${pack.tag}/backup`, `${pack.tag}/${pack.tag}_${restoredPackData[1]}_${restoredPackData[2]}.zip`);
 
-        progressLog += ` Done!\n- Uploading backup to the server...`;
-        await interaction.edit(progressLog);
-        const uploadUrl = await pterodactyl.getUploadLink(pack.serverId);
-        await upload(`${pack.tag}/${pack.tag}_${restoredPackData[1]}_${restoredPackData[2]}.zip`, uploadUrl);
+        const zipFile = `${pack.tag}_${restoredPackData[1]}_${restoredPackData[2]}.zip`;
 
-        progressLog += ` Done!\n- Deleting update files...`;
+        progressLog += ` Done!\n- Uploading and deploying to ${allServerIds.length > 1 ? `${allServerIds.length} instances` : 'the server'}...`;
         await interaction.edit(progressLog);
 
         let toDeleteList = [];
@@ -481,22 +479,22 @@ module.exports = {
 
         // DANGER ZONE - LINES BELOW MODIFY THE SERVER FILES ON LIVE BRANCH
 
-        await pterodactyl.deleteFile(pack.serverId, toDeleteList);
-        await sleep(1000);
-
-        progressLog += ` Done!\n- Unpacking the backup...`;
-        await interaction.edit(progressLog);
-
-        await pterodactyl.decompressFile(pack.serverId, `${pack.tag}_${restoredPackData[1]}_${restoredPackData[2]}.zip`);
-        await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [`${pack.tag}_${restoredPackData[1]}_${restoredPackData[2]}.zip`]);
+        for (const sid of allServerIds) {
+            const uploadUrl = await pterodactyl.getUploadLink(sid);
+            await upload(`${pack.tag}/${zipFile}`, uploadUrl);
+            await pterodactyl.deleteFile(sid, toDeleteList);
+            await sleep(1000);
+            await pterodactyl.decompressFile(sid, zipFile);
+            await sleep(1000);
+            await pterodactyl.deleteFile(sid, [zipFile]);
+        }
 
         // DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
 
-        /*progressLog += ` Done!\n- Starting the server...`;
+        /*progressLog += ` Done!\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
 
-        await pterodactyl.sendPowerAction(pack.serverId, "start");*/
+        for (const sid of allServerIds) await pterodactyl.sendPowerAction(sid, "start");*/
         rmRecursive(`./${pack.tag}`);
 
         progressLog += ` Done!\n- Restore sequence completed. Updating data...`;
@@ -516,7 +514,8 @@ module.exports = {
      * @param {string} versionOverride Optional specific version to update to.
      * @param {object} interaction Object with the interaction data (for Discord).
      */
-    updateGTNH: async function (pack, versionOverride, interaction) {
+    updateGTNH: async function (pack, versionOverride, interaction, serverIds = null) {
+        const allServerIds = serverIds && serverIds.length > 0 ? serverIds : [pack.serverId];
         const gtnh = require('../modules/gregtechnewhorizons');
         
         // Get current and latest version URLs
@@ -567,8 +566,7 @@ module.exports = {
         let progressLog = `Update sequence started for **${pack.name}** (${currentVersion} -> ${newestVersion}).`;
         await interaction.edit(progressLog);
         
-        // Send update alert to server
-        await pterodactyl.sendCommand(pack.serverId, alert);
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
           // Clear working directory
         rmRecursive(`./${pack.tag}`);
         
@@ -584,29 +582,29 @@ module.exports = {
         progressLog += `\n- Downloading new server pack (version ${newestVersion})...`;
         await interaction.edit(progressLog);
         await download(newestVersionUrl, `./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`);
-        
-        await pterodactyl.sendCommand(pack.serverId, alert);
-        
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
         progressLog += ` Done!\n- Downloading reference server pack (version ${currentVersion})...`;
         await interaction.edit(progressLog);
         await download(currentVersionUrl, `./${pack.tag}/downloads/old/${pack.tag}_${currentVersion}.zip`);
-        
-        await pterodactyl.sendCommand(pack.serverId, alert);
-        
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
         // Extract packs
         progressLog += ` Done!\n- Decompressing new pack files...`;
         await interaction.edit(progressLog);
         await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`, `./${pack.tag}/compare/new`);
         await checkMods(`./${pack.tag}/compare/new`);
-        
-        await pterodactyl.sendCommand(pack.serverId, alert);
-        
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
         progressLog += ` Done!\n- Decompressing reference pack files...`;
         await interaction.edit(progressLog);
         await decompress(`./${pack.tag}/downloads/old/${pack.tag}_${currentVersion}.zip`, `./${pack.tag}/compare/old`);
         await checkMods(`./${pack.tag}/compare/old`);
-        
-        await pterodactyl.sendCommand(pack.serverId, alert);
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
         
         // Get current server files
         let toCompressList = [];
@@ -614,19 +612,20 @@ module.exports = {
             toCompressList.push(file);
         });
         
-        progressLog += ` Done!\n- Shutting down the server...`;
+        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.shutdown(pack.serverId);
-        
+        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+
         progressLog += ` Done!\n- Compressing and downloading current server files...`;
         await interaction.edit(progressLog);
-        const compress = await pterodactyl.compressFile(pack.serverId, toCompressList);
-        
-        const downloadLink = await pterodactyl.getDownloadLink(pack.serverId, compress);
+        const primaryId = allServerIds[0];
+        const compress = await pterodactyl.compressFile(primaryId, toCompressList);
+
+        const downloadLink = await pterodactyl.getDownloadLink(primaryId, compress);
         await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`);
-        
+
         await sleep(1000);
-        await pterodactyl.deleteFile(pack.serverId, [compress]);
+        await pterodactyl.deleteFile(primaryId, [compress]);
         
         progressLog += ` Done!\n- Unpacking current server files...`;
         await interaction.edit(progressLog);
@@ -722,41 +721,32 @@ module.exports = {
         await interaction.edit(progressLog);
         const zipName = `update_${pack.tag}_${newestVersion}.zip`; // Use consistent naming
         const zipPath = `${pack.tag}/${zipName}`;
-        await compressDirectory(`${pack.tag}/compare/main`, zipPath);        progressLog += ` Done!\n- Uploading compressed update to the server...`;
+        await compressDirectory(`${pack.tag}/compare/main`, zipPath);
+        progressLog += ` Done!\n- Uploading and deploying to ${allServerIds.length > 1 ? `${allServerIds.length} instances` : 'the server'}...`;
         await interaction.edit(progressLog);
-        const uploadUrl = await pterodactyl.getUploadLink(pack.serverId);
-        await upload(zipPath, uploadUrl);
-
 
         // DANGER ZONE - LINES BELOW MODIFY THE SERVER FILES ON LIVE BRANCH
 
-        progressLog += ` Done!\n- Deleting old modpack files from server...`;
-        await interaction.edit(progressLog);
-        
-        // This is similar to the CurseForge and FTB update methods - delete all
-        // top-level directories from old modpack, but preserve excluded files
-        await pterodactyl.deleteFile(pack.serverId, toCompressList.filter(item => {
+        const filteredDeleteList = toCompressList.filter(item => {
             // Don't delete excluded folders or files
             return !gtnh.isExcluded(item);
-        }));
-        await sleep(1000); // Give server time for deletion operation
+        });
 
-
-        progressLog += ` Done!\n- Unpacking the update (will not overwrite excluded files if they weren't deleted)...`;
-        await interaction.edit(progressLog);
-        await pterodactyl.decompressFile(pack.serverId, zipName); // Unpack the uploaded zip
-        await sleep(1000); // Give server time
-
-        progressLog += ` Done!\n- Deleting uploaded zip archive...`;
-        await interaction.edit(progressLog);
-        await pterodactyl.deleteFile(pack.serverId, [zipName]); // Delete the zip
+        for (const sid of allServerIds) {
+            const uploadUrl = await pterodactyl.getUploadLink(sid);
+            await upload(zipPath, uploadUrl);
+            await pterodactyl.deleteFile(sid, filteredDeleteList);
+            await sleep(1000);
+            await pterodactyl.decompressFile(sid, zipName);
+            await sleep(1000);
+            await pterodactyl.deleteFile(sid, [zipName]);
+        }
 
         // DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
 
-
-        progressLog += ` Done!\n- Starting the server...`;
+        progressLog += ` Done!\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await interaction.edit(progressLog);
-        await pterodactyl.sendPowerAction(pack.serverId, "start"); // Use consistent start action
+        for (const sid of allServerIds) await pterodactyl.sendPowerAction(sid, "start");
 
         progressLog += ` Done!\n- Update sequence completed. Cleaning up...`;
         await interaction.edit(progressLog);

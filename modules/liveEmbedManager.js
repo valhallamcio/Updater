@@ -143,9 +143,12 @@ function generateServerEmbed(servers) {
 
     let onlineCount = 0;
     let versionObj = {};
+    const seen = new Set();
 
     for (let server of servers) {
         if (server.excludeFromServerList) continue;
+        if (seen.has(server.tag)) continue;
+        seen.add(server.tag);
         if (!versionObj[server.serverVersion]) versionObj[server.serverVersion] = [];
         versionObj[server.serverVersion].push(server);
     }

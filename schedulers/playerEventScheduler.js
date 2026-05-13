@@ -100,7 +100,7 @@ module.exports = {
     executePlayerTrigger: async function (trigger, serverName) {
         try {
             const servers = await yggdrasil.getServers();
-            const server = servers.find(s => s.name.trim() === serverName.trim());
+            const server = servers.find(s => s.tag === serverName || s.name.trim() === serverName.trim());
             
             if (!server) return;
             

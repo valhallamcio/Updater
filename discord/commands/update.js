@@ -33,20 +33,20 @@ module.exports = {
                 .setRequired(false)),
 
 	async autocomplete(interaction) {
-		const focusedValue = interaction.options.getFocused();
+		const focusedValue = interaction.options.getFocused().toLowerCase();
         const serverList = await yggdrasil.getServers();
 		const choices = [];
+		const seen = new Set();
 
         for (const server of serverList) {
-            if (server.requiresUpdate === true) {
-                choices.push(server.name);
+            if (server.requiresUpdate === true && !seen.has(server.tag)) {
+                seen.add(server.tag);
+                choices.push({ name: `${server.tag.toUpperCase()} | ${server.name}`, value: server.tag });
             }
         }
 
-		const filtered = choices.filter(choice => choice.startsWith(focusedValue));
-		await interaction.respond(
-			filtered.map(choice => ({ name: choice, value: choice })),
-		);
+		const filtered = choices.filter(c => c.name.toLowerCase().includes(focusedValue) || c.value.includes(focusedValue));
+		await interaction.respond(filtered);
 	},
 
     async execute(interaction) {
@@ -58,22 +58,29 @@ module.exports = {
 
         const message = await interaction.fetchReply();
 
-        const server = serverList.find(server => server.name === query || server.tag === query.toLowerCase());
+        const server = serverList.find(s => s.name === query || s.tag === query.toLowerCase());
         if (!server || server.requiresUpdate === false) {
             await message.edit(`Server **${query}** not found or doesn't need an update!`);
             return;
         }
 
+        const allInstances = serverList.filter(s => s.tag === server.tag);
+        const serverIds = allInstances.map(s => s.serverId);
+
+        if (serverIds.length > 1) {
+            await message.edit(`Update manager is starting... (${serverIds.length} instances for ${server.tag.toUpperCase()})`);
+        }
+
         let time = Date.now();
         switch (server.platform) {
-            case "curseforge": 
-                await updater.updateCF(server, versionOverride, message);
+            case "curseforge":
+                await updater.updateCF(server, versionOverride, message, serverIds);
                 break;
             case "feedthebeast":
-                await updater.updateFTB(server, versionOverride, message);
+                await updater.updateFTB(server, versionOverride, message, serverIds);
                 break;
             case "gregtechnewhorizons":
-                await updater.updateGTNH(server, versionOverride, message);
+                await updater.updateGTNH(server, versionOverride, message, serverIds);
                 break;
             default:
                 await message.edit('Platform not supported!');

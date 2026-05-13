@@ -41,7 +41,7 @@ module.exports = {
 
         for (let server in data) {
             const fullName = server;
-            let serv = servers.find(s => s.name.trim() === server);
+            let serv = servers.find(s => s.tag === server || s.name.trim() === server);
             let onlinePlayerCount = data[server].length;
             onlineCount += onlinePlayerCount;
 
