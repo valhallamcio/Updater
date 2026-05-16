@@ -54,7 +54,7 @@ module.exports = {
             let totalPlayers = 0;
 
             for (let serverName in playerData) {
-                let server = servers.find(s => s.name.trim() === serverName);
+                let server = servers.find(s => s.tag === serverName);
                 if (!server) {
                     sessionLogger.warn('CakeDrop', `Server '${serverName}' not found, skipping`);
                     continue;
@@ -88,7 +88,7 @@ module.exports = {
         let totalPlayers = 0;
 
         for (let serverName in playerData) {
-            let server = servers.find(s => s.name.trim() === serverName);
+            let server = servers.find(s => s.tag === serverName);
             if (!server) {
                 sessionLogger.warn('CakeDrop', `Server '${serverName}' not found, skipping`);
                 continue;
