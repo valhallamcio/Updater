@@ -47,22 +47,26 @@ module.exports = {
 
             const allTagServers = servers.filter(s => s.tag === tag && !s.earlyAccess);
 
+            const domain = `${tag.toLowerCase()}.valhallamc.io`;
             const instances = Object.entries(instanceMap).map(([instanceKey, usernames]) => {
                 const matched = allTagServers.find(s =>
                     s.name === instanceKey || s.id === instanceKey || s.serverId === instanceKey
                 );
                 return {
                     name: matched ? matched.name : (instanceKey === '_default' ? serv.name : instanceKey),
-                    players: usernames
+                    players: usernames,
+                    domain
                 };
             });
 
-            tagGroups[tag] = { mainName: serv.name, instances, domain: `*${tag.toLowerCase()}.valhallamc.io*` };
+            tagGroups[tag] = { mainName: serv.name, instances };
             onlineCount += players.length;
         }
 
-        const platformGroupKeys = ['gregtechnewhorizons'];
-        for (const platform of platformGroupKeys) {
+        const platformGroups = {
+            'gregtechnewhorizons': 'GregTech: New Horizons'
+        };
+        for (const [platform, displayName] of Object.entries(platformGroups)) {
             const matchingTags = Object.keys(tagGroups).filter(tag => {
                 const serv = servers.find(s => s.tag === tag);
                 return serv && serv.platform === platform;
@@ -70,42 +74,35 @@ module.exports = {
             if (matchingTags.length <= 1) continue;
 
             const mergedInstances = [];
-            const domains = [];
-            let mainName = null;
             for (const tag of matchingTags) {
-                if (!mainName) mainName = tagGroups[tag].mainName;
                 mergedInstances.push(...tagGroups[tag].instances);
-                domains.push(tagGroups[tag].domain);
                 delete tagGroups[tag];
             }
             tagGroups[`__platform_${platform}`] = {
-                mainName,
-                instances: mergedInstances,
-                domain: domains.join(' · ')
+                mainName: displayName,
+                instances: mergedInstances
             };
         }
 
-        for (const [key, group] of Object.entries(tagGroups)) {
+        for (const group of Object.values(tagGroups)) {
             const totalPlayers = group.instances.reduce((sum, i) => sum + i.players.length, 0);
-            const domain = group.domain;
 
             if (group.instances.length === 1) {
                 const inst = group.instances[0];
                 embed.addFields({
                     name: `${inst.name} - **${inst.players.length}**`,
-                    value: `-# ${formatPlayers(inst.players)}\n${domain}`
+                    value: `-# ${formatPlayers(inst.players)}\n*${inst.domain}*`
                 });
             } else {
                 let value = '';
                 for (const inst of group.instances) {
-                    value += `${inst.name} - ${inst.players.length}\n`;
+                    value += `${inst.name} · ${inst.players.length} · ${inst.domain}\n`;
                     value += `-# ${formatPlayers(inst.players)}\n`;
                 }
-                value += domain;
 
                 embed.addFields({
                     name: `${group.mainName} - **${totalPlayers}**`,
-                    value: value
+                    value: value.trimEnd()
                 });
             }
         }
