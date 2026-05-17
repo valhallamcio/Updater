@@ -93,19 +93,13 @@ module.exports = {
                 const inst = group.instances[0];
                 embed.addFields({
                     name: `${inst.name} - **${inst.players.length}**`,
-                    value: `${formatPlayers(inst.players)}\n${domain}`
+                    value: `-# ${formatPlayers(inst.players)}\n${domain}`
                 });
             } else {
-                const mainInst = group.instances.find(i => i.name === group.mainName);
-                const otherInsts = group.instances.filter(i => i !== mainInst);
-
                 let value = '';
-                if (mainInst) {
-                    value += `${formatPlayers(mainInst.players)}\n`;
-                }
-                for (const inst of otherInsts) {
-                    value += `-# ${inst.name} - ${inst.players.length}\n`;
-                    value += `${formatPlayers(inst.players)}\n`;
+                for (const inst of group.instances) {
+                    value += `${inst.name} - ${inst.players.length}\n`;
+                    value += `-# ${formatPlayers(inst.players)}\n`;
                 }
                 value += domain;
 
