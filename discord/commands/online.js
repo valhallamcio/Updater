@@ -72,8 +72,14 @@ module.exports = {
                     value: `${formatPlayers(inst.players)}\n${domain}`
                 });
             } else {
+                const mainInst = group.instances.find(i => i.name === group.mainName);
+                const otherInsts = group.instances.filter(i => i !== mainInst);
+
                 let value = '';
-                for (const inst of group.instances) {
+                if (mainInst) {
+                    value += `${formatPlayers(mainInst.players)}\n`;
+                }
+                for (const inst of otherInsts) {
                     value += `-# ${inst.name} - ${inst.players.length}\n`;
                     value += `${formatPlayers(inst.players)}\n`;
                 }
