@@ -57,13 +57,37 @@ module.exports = {
                 };
             });
 
-            tagGroups[tag] = { mainName: serv.name, instances };
+            tagGroups[tag] = { mainName: serv.name, instances, domain: `*${tag.toLowerCase()}.valhallamc.io*` };
             onlineCount += players.length;
         }
 
-        for (const [tag, group] of Object.entries(tagGroups)) {
+        const platformGroupKeys = ['gregtechnewhorizons'];
+        for (const platform of platformGroupKeys) {
+            const matchingTags = Object.keys(tagGroups).filter(tag => {
+                const serv = servers.find(s => s.tag === tag);
+                return serv && serv.platform === platform;
+            });
+            if (matchingTags.length <= 1) continue;
+
+            const mergedInstances = [];
+            const domains = [];
+            let mainName = null;
+            for (const tag of matchingTags) {
+                if (!mainName) mainName = tagGroups[tag].mainName;
+                mergedInstances.push(...tagGroups[tag].instances);
+                domains.push(tagGroups[tag].domain);
+                delete tagGroups[tag];
+            }
+            tagGroups[`__platform_${platform}`] = {
+                mainName,
+                instances: mergedInstances,
+                domain: domains.join(' · ')
+            };
+        }
+
+        for (const [key, group] of Object.entries(tagGroups)) {
             const totalPlayers = group.instances.reduce((sum, i) => sum + i.players.length, 0);
-            const domain = `*${tag.toLowerCase()}.valhallamc.io*`;
+            const domain = group.domain;
 
             if (group.instances.length === 1) {
                 const inst = group.instances[0];
