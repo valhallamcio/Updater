@@ -44,10 +44,11 @@ async function getPlayers() {
     return result;
 }
 
-/**
- * Fetches server list from the Yggdrasil API.
- * Returns array of server objects with: tag, name, status, tps, players, serverVersion, modpackVersion, platform, etc.
- */
+async function getPlayersDetailed() {
+    const response = await client.get('/players/');
+    return response.data.data;
+}
+
 async function getServers() {
     const response = await client.get('/servers/');
     return response.data.data;
@@ -145,6 +146,7 @@ function isConnected() {
 
 module.exports = {
     getPlayers,
+    getPlayersDetailed,
     getServers,
     updateServer,
     connect,
