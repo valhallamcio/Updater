@@ -48,7 +48,7 @@ module.exports = {
             let cakeAmount = Math.floor(Math.random() * (options.max - options.min + 1)) + options.min;
 
             let servers = await yggdrasil.getServers();
-            let playerData = await yggdrasil.getPlayers();
+            let playerData = await yggdrasil.getPlayersDetailed();
 
             let totalAmount = 0;
             let totalPlayers = 0;
@@ -60,14 +60,24 @@ module.exports = {
                     continue;
                 }
 
-                for (let player of playerData[serverName]) {
-                    if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player)) continue;
-                    await pterodactyl.sendCommand(server.serverId, alertCakeDrop.replace("[RECIEVERS]", player));
-                    if (server.serverId === "dff4e4d4") {
-                        await pterodactyl.sendCommand(server.serverId, `give ${player} tfc:cake ${cakeAmount}`);
+                let allTagServers = servers.filter(s => s.tag === serverName);
 
+                for (let player of playerData[serverName]) {
+                    if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player.username)) continue;
+
+                    let targetServer = server;
+                    if (player.instance) {
+                        let matched = allTagServers.find(s =>
+                            s.name === player.instance || s.id === player.instance || s.serverId === player.instance
+                        );
+                        if (matched) targetServer = matched;
+                    }
+
+                    await pterodactyl.sendCommand(targetServer.serverId, alertCakeDrop.replace("[RECIEVERS]", player.username));
+                    if (targetServer.serverId === "dff4e4d4") {
+                        await pterodactyl.sendCommand(targetServer.serverId, `give ${player.username} tfc:cake ${cakeAmount}`);
                     } else {
-                        await pterodactyl.sendCommand(server.serverId, `give ${player} minecraft:cake ${cakeAmount}`);
+                        await pterodactyl.sendCommand(targetServer.serverId, `give ${player.username} minecraft:cake ${cakeAmount}`);
                     }
                     totalAmount += cakeAmount;
                     totalPlayers++;
@@ -82,7 +92,7 @@ module.exports = {
 
     dropCakeManual: async function (cakeAmount) {
         let servers = await yggdrasil.getServers();
-        let playerData = await yggdrasil.getPlayers();
+        let playerData = await yggdrasil.getPlayersDetailed();
 
         let totalAmount = 0;
         let totalPlayers = 0;
@@ -94,14 +104,24 @@ module.exports = {
                 continue;
             }
 
-            for (let player of playerData[serverName]) {
-                if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player)) continue;
-                await pterodactyl.sendCommand(server.serverId, alertCakeDrop.replace("[RECIEVERS]", player));
-                if (server.serverId === "458e7efa") {
-                    await pterodactyl.sendCommand(server.serverId, `give ${player} tfc:cake ${cakeAmount}`);
+            let allTagServers = servers.filter(s => s.tag === serverName);
 
+            for (let player of playerData[serverName]) {
+                if (require("../config/config.json").scheduler.cakeDrop.exclude.includes(player.username)) continue;
+
+                let targetServer = server;
+                if (player.instance) {
+                    let matched = allTagServers.find(s =>
+                        s.name === player.instance || s.id === player.instance || s.serverId === player.instance
+                    );
+                    if (matched) targetServer = matched;
+                }
+
+                await pterodactyl.sendCommand(targetServer.serverId, alertCakeDrop.replace("[RECIEVERS]", player.username));
+                if (targetServer.serverId === "458e7efa") {
+                    await pterodactyl.sendCommand(targetServer.serverId, `give ${player.username} tfc:cake ${cakeAmount}`);
                 } else {
-                    await pterodactyl.sendCommand(server.serverId, `give ${player} minecraft:cake ${cakeAmount}`);
+                    await pterodactyl.sendCommand(targetServer.serverId, `give ${player.username} minecraft:cake ${cakeAmount}`);
                 }
                 totalAmount += cakeAmount;
                 totalPlayers++;
