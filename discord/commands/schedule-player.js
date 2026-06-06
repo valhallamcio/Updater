@@ -29,7 +29,7 @@ module.exports = {
                         .setRequired(true))
                 .addBooleanOption(option =>
                     option.setName('onetime')
-                        .setDescription('Execute only once (default: false)')
+                        .setDescription('Execute only once (default: true)')
                         .setRequired(false))
                 .addBooleanOption(option =>
                     option.setName('onjoin')
@@ -135,7 +135,8 @@ module.exports = {
         const playerId = interaction.options.getString('player');
         const serversInput = interaction.options.getString('servers');
         const commandsInput = interaction.options.getString('commands');
-        const oneTime = interaction.options.getBoolean('onetime') || false;
+        // Default to one-time: absent (null) → true; an explicit `onetime:false` is respected.
+        const oneTime = interaction.options.getBoolean('onetime') ?? true;
         const onJoin = interaction.options.getBoolean('onjoin') || false;
         
         // Parse servers
