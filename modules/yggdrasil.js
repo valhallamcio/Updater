@@ -29,8 +29,10 @@ let intentionalClose = false;
 
 /**
  * Fetches online players from the Yggdrasil API.
- * Returns the same shape as the old velocityMetrics.getPlayers():
- * { "ServerName": ["player1", "player2"], ... }
+ * Keyed by server TAG (e.g. "gtnh"), value is an array of usernames:
+ * { "gtnh": ["player1", "player2"], ... }
+ * NOTE: keys are tags, not display names — consumers that look up by a stored
+ * server name must resolve it to a tag first (see playerEventScheduler).
  */
 async function getPlayers() {
     const response = await client.get('/players/');

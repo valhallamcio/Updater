@@ -46,14 +46,31 @@ module.exports = {
         try {
             const playersData = await yggdrasil.getPlayers();
             const activeTriggers = await mongo.getActiveScheduleJobs('player_trigger');
-            
+            if (activeTriggers.length === 0) return;
+
+            // playersData is keyed by server TAG (e.g. "gtnh"), but triggers store
+            // full server NAMES (e.g. "GT New Horizons") — so a direct
+            // playersData[serverName] lookup is always undefined and the player is
+            // never seen as online. Resolve each stored identifier (name or tag)
+            // back to its tag before looking it up.
+            const servers = await yggdrasil.getServers();
+            const resolveTag = (id) => {
+                const needle = String(id).trim().toLowerCase();
+                const match = servers.find(s =>
+                    s.tag.toLowerCase() === needle ||
+                    s.name.trim().toLowerCase() === needle
+                );
+                return match ? match.tag : id;
+            };
+
             for (const trigger of activeTriggers) {
                 const { playerId, serverNames, commands, onJoin, lastSeenServers = [] } = trigger;
-                
-                // Track current servers where player is online
+
+                // Track current servers (by their stored identifier) where the player is online.
                 const currentServers = [];
                 for (const serverName of serverNames) {
-                    if (playersData[serverName] && playersData[serverName].includes(playerId)) {
+                    const online = playersData[resolveTag(serverName)];
+                    if (online && online.some(u => u.toLowerCase() === String(playerId).toLowerCase())) {
                         currentServers.push(serverName);
                     }
                 }
