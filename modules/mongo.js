@@ -26,6 +26,31 @@ let mainClientConnected = false;
 module.exports = {
 
     /**
+     * Prefix-searches the Bifrost players collection by username for autocomplete.
+     * Case-insensitive, anchored prefix, capped result set — never loads all ~49k
+     * players. Lives in the `bifrost` DB (not mongoDBName), same Mongo cluster.
+     * @param {string} query Username prefix the user is typing.
+     * @param {number} limit Max results (Discord caps autocomplete at 25).
+     * @returns {Promise<string[]>} Matching usernames.
+     */
+    searchPlayerUsernames: async function (query, limit = 25) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const escaped = String(query || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const filter = escaped ? { username: { $regex: `^${escaped}`, $options: 'i' } } : {};
+        const docs = await mongoClient
+            .db('bifrost')
+            .collection('players')
+            .find(filter, { projection: { username: 1, _id: 0 } })
+            .limit(limit)
+            .toArray();
+        return docs.map(d => d.username).filter(Boolean);
+    },
+
+    /**
      * Gets all tickets user closed or participated in by user from MongoDB.
      * @param {*} id Id of the user.
      * @param {*} username Username of the user.

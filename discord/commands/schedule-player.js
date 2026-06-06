@@ -17,7 +17,8 @@ module.exports = {
                 .addStringOption(option =>
                     option.setName('player')
                         .setDescription('Player username to monitor')
-                        .setRequired(true))
+                        .setRequired(true)
+                        .setAutocomplete(true))
                 .addStringOption(option =>
                     option.setName('servers')
                         .setDescription('Server names (comma-separated, or "all")')
@@ -62,7 +63,15 @@ module.exports = {
     async autocomplete(interaction) {
         const focusedOption = interaction.options.getFocused(true);
         
-        if (focusedOption.name === 'servers') {
+        if (focusedOption.name === 'player') {
+            // Search the full Bifrost playerbase (~49k) — triggers are usually set
+            // for offline players, so online-only would miss the common case.
+            const usernames = await mongo.searchPlayerUsernames(focusedOption.value, 25);
+            usernames.sort((a, b) => a.localeCompare(b));
+            await interaction.respond(
+                usernames.map(u => ({ name: u, value: u })),
+            );
+        } else if (focusedOption.name === 'servers') {
             const focusedValue = focusedOption.value;
             const serverList = await yggdrasil.getServers();
             const choices = ["all"];
