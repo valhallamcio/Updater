@@ -3,6 +3,7 @@ const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");
+const rebootAlerts = require("../modules/rebootAlerts");
 const { EmbedBuilder } = require("discord.js");
 const sessionLogger = require("../modules/sessionLogger");
 
@@ -31,6 +32,7 @@ module.exports = {
         activeReboots: new Map(), // serverId -> { attempts, startTime, nodeId }
         failedServers: new Set(), // NEW: Track failed servers
         completedServers: new Set(), // NEW: Track completed servers
+        cancelRequested: new Set(), // serverIds whose in-progress warning window should abort before stop
         apiCallCount: 0, // NEW: Track API calls
         lastApiCall: 0, // NEW: Rate limiting
         lastCheckedDate: null, // Track current date for daily reset
@@ -737,7 +739,7 @@ module.exports = {
     /**
      * Execute complete reboot for a single server with enhanced error handling
      */
-    executeFullServerReboot: async function (server, nodeId) {
+    executeFullServerReboot: async function (server, nodeId, opts = {}) {
         if (this.stateOperations.isServerActive(server.serverId)) {
             sessionLogger.warn('RebootScheduler', `[${server.name}] Already being processed, skipping`);
             return { success: false, reason: 'duplicate' };
@@ -756,7 +758,14 @@ module.exports = {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             sessionLogger.info('RebootScheduler', `[${server.name}] Reboot attempt ${attempt}/${maxRetries}`);
             try {
-                await this.executeRebootWarningsEnhanced(server);
+                // Warning window also honors a cancel request: returning false means a
+                // staff member cancelled mid-countdown — abort without stopping the server.
+                const warned = await this.executeRebootWarningsEnhanced(server, opts);
+                if (warned === false) {
+                    sessionLogger.warn('RebootScheduler', `[${server.name}] Reboot cancelled before stop`);
+                    this.stateOperations.removeActiveReboot(server.serverId);
+                    return { success: false, reason: 'cancelled' };
+                }
                 await this.ensureServerStopped(server);
                 await this.startServerWithMonitoring(server);
 
@@ -785,35 +794,184 @@ module.exports = {
     },
 
     /**
-     * Enhanced warning sequence with better error handling
+     * Resolved player-alert config (config.json -> scheduler.rebootScheduler.playerAlerts),
+     * with defaults so the scheduler works even before the config block is added.
      */
-    executeRebootWarningsEnhanced: async function (server) {
-        const warnings = [
-            { command: 'say SCHEDULED REBOOT IN 15 MINUTES - Please prepare to disconnect', delay: 300000 },
-            { command: 'say SCHEDULED REBOOT IN 10 MINUTES', delay: 300000 },
-            { command: 'say SCHEDULED REBOOT IN 5 MINUTES', delay: 240000 },
-            { command: 'say SCHEDULED REBOOT IN 1 MINUTE - SAVE YOUR WORK', delay: 45000 },
-            { command: 'say REBOOTING IN 15 SECONDS', delay: 10000 },
-            { command: 'save-all', delay: 5000 }
-        ];
-        
-        for (let i = 0; i < warnings.length; i++) {
-            try {
-                await pterodactyl.sendCommand(server.serverId, warnings[i].command);
-                
-                sessionLogger.debug('RebootScheduler', 
-                    `[${server.name}] Sent warning: ${warnings[i].command}`);
-                
-                if (i < warnings.length - 1) {
-                    await functions.sleep(warnings[i].delay);
-                }
-                
-            } catch (error) {
-                sessionLogger.warn('RebootScheduler', 
-                    `[${server.name}] Warning command failed: ${error.message}`);
-                // Continue with next warning
+    getAlertConfig: function () {
+        const a = (this.runtimeConfig && this.runtimeConfig.playerAlerts) || {};
+        return {
+            enabled: a.enabled !== false,
+            dryRun: a.dryRun === true,
+            commandGapMs: a.commandGapMs != null ? a.commandGapMs : 250,
+            defaultWarnWindowMinutes: a.defaultWarnWindowMinutes != null ? a.defaultWarnWindowMinutes : 15,
+            maxWarnWindowMinutes: a.maxWarnWindowMinutes != null ? a.maxWarnWindowMinutes : 15,
+            milestonesSeconds: Array.isArray(a.milestonesSeconds) ? a.milestonesSeconds : [900, 600, 300, 60],
+            channels: a.channels,
+            sounds: a.sounds,
+        };
+    },
+
+    /**
+     * Send a batch of console commands to a server with a small gap between them.
+     * In dry-run mode the commands are logged instead of sent (safe testing).
+     */
+    sendAlertCommands: async function (server, cmds, gapMs, dryRun) {
+        for (const cmd of cmds) {
+            if (dryRun) {
+                sessionLogger.info('RebootScheduler', `[DRYRUN ${server.tag || server.name}] ${cmd}`);
+                continue;
             }
+            try {
+                await pterodactyl.sendCommand(server.serverId, cmd);
+            } catch (error) {
+                sessionLogger.warn('RebootScheduler', `[${server.name}] alert command failed: ${error.message}`);
+            }
+            if (gapMs) await functions.sleep(gapMs);
         }
+    },
+
+    /**
+     * Request cancellation of an in-progress (or about-to-run) warning window for a server.
+     * The warning loop checks this each iteration and aborts before the server is stopped.
+     * @returns {boolean} true if the server currently has an active reboot.
+     */
+    cancelServerReboot: function (serverId) {
+        const active = this.state.activeReboots.has(serverId);
+        this.state.cancelRequested.add(serverId);
+        return active;
+    },
+
+    /**
+     * Clear per-server reboot bookkeeping so the same server can be rebooted again later.
+     * The batch path resets these sets wholesale in processRebootQueue; single ad-hoc/scheduled
+     * reboots must clean up after themselves or `isServerActive` would block the next one.
+     */
+    resetSingleServerState: function (serverId) {
+        this.state.completedServers.delete(serverId);
+        this.state.failedServers.delete(serverId);
+        this.state.activeReboots.delete(serverId);
+        this.state.cancelRequested.delete(serverId);
+    },
+
+    /**
+     * Version-aware reboot warning sequence.
+     *
+     * Builds a mix of title / actionbar / bossbar / playsound / tellraw / say console commands
+     * appropriate to the server's Minecraft version (see modules/rebootAlerts.js) and paces them
+     * over a warning window so the server is stopped at the end. `say` is kept as a fallback so
+     * something still shows if a fancier channel is unavailable.
+     *
+     * @param {object} server server object (needs serverId, serverVersion, tag/name)
+     * @param {object} opts    { warnWindowMinutes } — defaults to config defaultWarnWindowMinutes
+     * @returns {Promise<boolean>} false if cancelled mid-window (caller must NOT stop the server)
+     */
+    executeRebootWarningsEnhanced: async function (server, opts = {}) {
+        const ac = this.getAlertConfig();
+        const version = server.serverVersion || server.minecraftVersion || server.version;
+        const dryRun = ac.dryRun;
+        const gapMs = ac.commandGapMs;
+        const serverName = server.name || server.tag;
+        // enabled:false keeps the timing/save-all but suppresses every player-facing channel.
+        const channels = ac.enabled
+            ? ac.channels
+            : { title: false, actionbar: false, bossbar: false, chat: false, sound: false, say: false };
+        const buildOpts = { channels, sounds: ac.sounds, serverName };
+
+        let warnMin = opts.warnWindowMinutes != null ? opts.warnWindowMinutes : ac.defaultWarnWindowMinutes;
+        warnMin = Math.max(0, Math.min(Number(warnMin) || 0, ac.maxWarnWindowMinutes));
+        const warnSeconds = Math.round(warnMin * 60);
+
+        const milestones = ac.milestonesSeconds
+            .filter(s => s > 0 && s <= warnSeconds)
+            .sort((a, b) => b - a);
+        // Always announce once at the start of the window (even for an odd window length).
+        const announceAt = [...new Set([warnSeconds, ...milestones])].filter(s => s > 0).sort((a, b) => b - a);
+        const FINAL = Math.min(60, warnSeconds); // final per-second countdown window
+
+        sessionLogger.info('RebootScheduler',
+            `[${serverName}] Reboot warnings: version=${version || 'unknown'} window=${warnMin}min` +
+            `${dryRun ? ' (DRY RUN)' : ''}`);
+
+        this.state.cancelRequested.delete(server.serverId);
+
+        const rebootAt = Date.now() + warnSeconds * 1000;
+        const doneMilestones = new Set();
+        let bossbarUp = false;
+        let savedAll = false;
+        let lastCountdownSec = null; // dedup: render each countdown second once
+
+        while (true) {
+            if (this.state.cancelRequested.has(server.serverId)) {
+                sessionLogger.warn('RebootScheduler', `[${serverName}] Warning window cancelled`);
+                if (bossbarUp) {
+                    await this.sendAlertCommands(server, rebootAlerts.buildBossbarTeardown(version), gapMs, dryRun);
+                }
+                if (channels?.chat !== false && rebootAlerts.caps(version).known) {
+                    await this.sendAlertCommands(server,
+                        [`tellraw @a ${JSON.stringify({ text: '[!] Restart cancelled.', color: 'green' })}`], gapMs, dryRun);
+                }
+                this.state.cancelRequested.delete(server.serverId);
+                return false;
+            }
+
+            const secondsLeft = Math.max(0, Math.round((rebootAt - Date.now()) / 1000));
+            if (secondsLeft <= 0) break;
+
+            // Milestone announcements (skip ones inside the per-second window, except the initial).
+            for (const m of announceAt) {
+                if (secondsLeft <= m && !doneMilestones.has(m)) {
+                    doneMilestones.add(m);
+                    if (m > FINAL || m === warnSeconds) {
+                        await this.sendAlertCommands(server,
+                            rebootAlerts.buildMilestoneCommands(version, m, buildOpts), gapMs, dryRun);
+                    }
+                    break;
+                }
+            }
+
+            // Enter the final window: stand up the bossbar once (no-op below 1.13).
+            if (!bossbarUp && secondsLeft <= FINAL) {
+                bossbarUp = true;
+                const setup = rebootAlerts.buildBossbarSetup(version, FINAL);
+                if (setup.length) await this.sendAlertCommands(server, setup, gapMs, dryRun);
+            }
+
+            // Per-second countdown inside the final window — once per distinct second, sent as a
+            // tight burst (no inter-command gap) so the send time can't make the countdown drift.
+            if (secondsLeft <= FINAL && secondsLeft !== lastCountdownSec) {
+                lastCountdownSec = secondsLeft;
+                const cd = rebootAlerts.buildCountdownCommands(version, secondsLeft, buildOpts);
+                if (cd.length) await this.sendAlertCommands(server, cd, 0, dryRun);
+            }
+
+            // Flush the world right before stopping.
+            if (!savedAll && secondsLeft <= 5) {
+                savedAll = true;
+                if (dryRun) sessionLogger.info('RebootScheduler', `[DRYRUN ${serverName}] save-all`);
+                else await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
+            }
+
+            // Poll fast (200ms) inside the final window so each whole second is caught on time
+            // regardless of how long the sends took; coarse polling (<=5s) in the dead zones,
+            // which also keeps cancel requests responsive.
+            let sleepMs;
+            if (secondsLeft <= FINAL) {
+                sleepMs = 200;
+            } else {
+                const nextMilestone = announceAt.filter(m => m < secondsLeft).sort((a, b) => b - a)[0] || 0;
+                const target = Math.max(FINAL, nextMilestone);
+                sleepMs = Math.min(5000, Math.max(1000, (secondsLeft - target) * 1000));
+            }
+            await functions.sleep(sleepMs);
+        }
+
+        if (bossbarUp) {
+            await this.sendAlertCommands(server, rebootAlerts.buildBossbarTeardown(version), gapMs, dryRun);
+        }
+        if (!savedAll && !dryRun) {
+            await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
+        }
+        return true;
     },
 
     /**
