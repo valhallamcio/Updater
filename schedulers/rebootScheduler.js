@@ -769,6 +769,12 @@ module.exports = {
                 await this.ensureServerStopped(server);
                 await this.startServerWithMonitoring(server);
 
+                // Safety net: clear any reboot bossbar that survived into the fresh world
+                // (covers a save race), so rejoining players never see a stuck countdown bar.
+                if (rebootAlerts.caps(server.serverVersion).hasBossbar) {
+                    await pterodactyl.sendCommand(server.serverId, `bossbar remove ${rebootAlerts.BOSSBAR_ID}`).catch(() => {});
+                }
+
                 sessionLogger.info('RebootScheduler', `[${server.name}] Reboot completed successfully`);
                 this.stateOperations.markServerCompleted(server.serverId);
                 if (!this.state.todayStats.successfulReboots) this.state.todayStats.successfulReboots = 0;
@@ -897,7 +903,6 @@ module.exports = {
         const rebootAt = Date.now() + warnSeconds * 1000;
         const doneMilestones = new Set();
         let bossbarUp = false;
-        let savedAll = false;
         let lastCountdownSec = null; // dedup: render each countdown second once
 
         while (true) {
@@ -944,13 +949,6 @@ module.exports = {
                 if (cd.length) await this.sendAlertCommands(server, cd, 0, dryRun);
             }
 
-            // Flush the world right before stopping.
-            if (!savedAll && secondsLeft <= 5) {
-                savedAll = true;
-                if (dryRun) sessionLogger.info('RebootScheduler', `[DRYRUN ${serverName}] save-all`);
-                else await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
-            }
-
             // Poll fast (200ms) inside the final window so each whole second is caught on time
             // regardless of how long the sends took; coarse polling (<=5s) in the dead zones,
             // which also keeps cancel requests responsive.
@@ -965,12 +963,15 @@ module.exports = {
             await functions.sleep(sleepMs);
         }
 
+        // Tear down the bossbar BEFORE the final save: /bossbar is a PERSISTENT custom bossbar
+        // stored in the world, so if it's still present when the world saves it survives the
+        // restart and reappears (stuck) for rejoining players. Remove -> save -> stop guarantees
+        // a clean world. (save-all is also issued here as the pre-stop world flush.)
         if (bossbarUp) {
             await this.sendAlertCommands(server, rebootAlerts.buildBossbarTeardown(version), gapMs, dryRun);
         }
-        if (!savedAll && !dryRun) {
-            await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
-        }
+        if (dryRun) sessionLogger.info('RebootScheduler', `[DRYRUN ${serverName}] save-all`);
+        else await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
         return true;
     },
 
