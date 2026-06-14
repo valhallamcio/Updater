@@ -3,7 +3,7 @@
  *
  * Cancels a pending scheduled reboot (deactivates the schedule_jobs doc) and, if the warning
  * window is already running, signals rebootScheduler to abort before the server is stopped.
- * Staff-only.
+ * Handles instanced servers: a tag aborts every instance's countdown. Staff-only.
  */
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
@@ -36,37 +36,46 @@ module.exports = {
 
     async execute(interaction) {
         await interaction.deferReply();
-        const tag = interaction.options.getString('server');
+        const input = interaction.options.getString('server');
+
+        const servers = await yggdrasil.getServers();
+        // Accept a tag or a specific serverId; normalize to a tag.
+        const byId = servers.find(s => s.serverId === input);
+        const tag = byId ? byId.tag : input;
 
         const jobs = await mongo.getActiveScheduleJobs('scheduled_reboot');
         const job = jobs.find(j => j.serverTag && j.serverTag.toLowerCase() === tag.toLowerCase());
 
-        // Resolve serverId for an in-progress abort even if the pending job was already consumed.
-        let serverId = job ? job.serverId : null;
-        if (!serverId) {
-            const servers = await yggdrasil.getServers();
-            const s = servers.find(sv => sv.tag && sv.tag.toLowerCase() === tag.toLowerCase());
-            serverId = s ? s.serverId : null;
+        // serverIds whose in-progress countdowns we must abort: the specific instance if the job
+        // targeted one, else every instance of the tag.
+        let instanceIds;
+        if (job && job.instanceServerId) {
+            instanceIds = [job.instanceServerId];
+        } else {
+            instanceIds = servers
+                .filter(s => s.tag && s.tag.toLowerCase() === tag.toLowerCase())
+                .map(s => s.serverId);
         }
+        if (byId && !instanceIds.includes(byId.serverId)) instanceIds.push(byId.serverId);
 
         let cancelledPending = false;
-        let abortedRunning = false;
+        let abortedRunning = 0;
         if (job) {
             await mongo.deactivateScheduleJob(job._id);
             cancelledPending = true;
         }
-        if (serverId) {
-            abortedRunning = rebootScheduler.cancelServerReboot(serverId);
+        for (const id of instanceIds) {
+            if (rebootScheduler.cancelServerReboot(id)) abortedRunning++;
         }
 
-        if (!cancelledPending && !abortedRunning) {
+        if (!cancelledPending && abortedRunning === 0) {
             await interaction.editReply(`No pending or in-progress reboot found for \`${tag}\`.`);
             return;
         }
 
         const parts = [];
         if (cancelledPending) parts.push('pending schedule removed');
-        if (abortedRunning) parts.push('in-progress countdown aborted');
+        if (abortedRunning > 0) parts.push(`${abortedRunning} in-progress countdown(s) aborted`);
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)

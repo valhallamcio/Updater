@@ -63,59 +63,69 @@ module.exports = {
         await mongo.deactivateScheduleJob(job._id).catch(() => {});
 
         const servers = await yggdrasil.getServers();
-        const server = servers.find(s => s.tag === job.serverTag)
-            || servers.find(s => s.serverId === job.serverId);
+        // instanceServerId set => one specific instance; otherwise reboot EVERY instance of the tag
+        // (instanced servers share a tag but have distinct serverIds). Resolved at fire time so
+        // instance count changes are picked up.
+        const instances = job.instanceServerId
+            ? servers.filter(s => s.serverId === job.instanceServerId)
+            : servers.filter(s => s.tag === job.serverTag);
 
-        if (!server) {
+        if (!instances.length) {
             sessionLogger.error('ScheduledRebootScheduler',
-                `Scheduled reboot for "${job.serverTag}" skipped: server not found`);
+                `Scheduled reboot for "${job.serverTag}" skipped: no matching server(s) at fire time`);
             await this.notifyStaff(0xff0000, 'Scheduled Reboot Failed',
-                `Server \`${job.serverTag}\` was not found at fire time.`);
+                `\`${job.serverTag}\` had no matching server(s) at fire time.`);
             return;
         }
 
+        const label = instances.length > 1
+            ? `${job.serverTag} (${instances.length} instances)`
+            : (instances[0].name || job.serverTag);
         sessionLogger.info('ScheduledRebootScheduler',
-            `Firing scheduled reboot: ${server.tag} (warn ${job.warnWindow}min, by ${job.requestedBy || 'unknown'})`);
+            `Firing scheduled reboot: ${label} (warn ${job.warnWindow}min, by ${job.requestedBy || 'unknown'})`);
         await this.notifyStaff(0xffa500, 'Scheduled Reboot Started',
-            `**${server.name || server.tag}** rebooting now (warning window: ${job.warnWindow} min)` +
+            `**${label}** rebooting now (warning window: ${job.warnWindow} min)` +
             `${job.reason ? `\nReason: ${job.reason}` : ''}`);
 
-        const result = await rebootScheduler.executeFullServerReboot(
-            server,
-            server.node || 'scheduled',
-            { warnWindowMinutes: job.warnWindow },
-        );
-
-        // Let the same server be scheduled again later (clears completed/failed bookkeeping).
-        rebootScheduler.resetSingleServerState(server.serverId);
+        // Reboot every instance concurrently; each runs its own warning countdown + stop/start.
+        const results = await Promise.all(instances.map(s =>
+            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', { warnWindowMinutes: job.warnWindow })
+                .then(r => ({ s, r }))
+                .catch(e => ({ s, r: { success: false, reason: e.message } }))
+        ));
+        // Let each server be scheduled again later (clears completed/failed bookkeeping).
+        for (const { s } of results) rebootScheduler.resetSingleServerState(s.serverId);
 
         // Record outcome alongside the batch reboots.
         try {
             const today = timeManager.getTodayDateString();
             const hist = (await mongo.getRebootHistory(today)) || { date: today };
             hist.scheduledReboots = hist.scheduledReboots || [];
-            hist.scheduledReboots.push({
-                tag: server.tag,
-                requestedBy: job.requestedBy || null,
-                reason: job.reason || null,
-                success: !!(result && result.success),
-                reason_detail: result && result.reason ? result.reason : null,
-                firedAt: new Date().toISOString(),
-            });
+            for (const { s, r } of results) {
+                hist.scheduledReboots.push({
+                    tag: s.tag,
+                    instance: s.name || null,
+                    requestedBy: job.requestedBy || null,
+                    reason: job.reason || null,
+                    success: !!(r && r.success),
+                    reason_detail: r && r.reason ? r.reason : null,
+                    firedAt: new Date().toISOString(),
+                });
+            }
             await mongo.updateRebootHistory(today, hist);
         } catch (err) {
             sessionLogger.warn('ScheduledRebootScheduler', `Failed to record history: ${err.message}`);
         }
 
-        if (result && result.success) {
+        const ok = results.filter(x => x.r && x.r.success).length;
+        const failed = results.filter(x => !(x.r && x.r.success));
+        if (failed.length === 0) {
             await this.notifyStaff(0x00ff00, 'Scheduled Reboot Complete',
-                `**${server.name || server.tag}** rebooted successfully.`);
-        } else if (result && result.reason === 'cancelled') {
-            await this.notifyStaff(0x9c59b6, 'Scheduled Reboot Cancelled',
-                `**${server.name || server.tag}** reboot was cancelled.`);
+                `**${label}** rebooted successfully (${ok}/${results.length}).`);
         } else {
-            await this.notifyStaff(0xff0000, 'Scheduled Reboot Failed',
-                `**${server.name || server.tag}** failed to reboot: ${result ? result.reason : 'unknown'}`);
+            const detail = failed.map(x => `${x.s.name || x.s.tag}: ${x.r ? x.r.reason : 'unknown'}`).join('\n');
+            await this.notifyStaff(ok > 0 ? 0xffa500 : 0xff0000, 'Scheduled Reboot Issues',
+                `**${label}**: ${ok}/${results.length} ok.\nProblems:\n${detail}`);
         }
     },
 

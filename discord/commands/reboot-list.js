@@ -6,6 +6,7 @@
 
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const mongo = require('../../modules/mongo');
+const yggdrasil = require('../../modules/yggdrasil');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -25,6 +26,9 @@ module.exports = {
             return;
         }
 
+        const servers = await yggdrasil.getServers().catch(() => []);
+        const instanceCount = (tag) => servers.filter(s => s.tag === tag).length;
+
         const embed = new EmbedBuilder()
             .setColor(0xffa500)
             .setTitle(`⏰ Pending Reboots (${jobs.length})`)
@@ -32,8 +36,11 @@ module.exports = {
 
         for (const job of jobs.slice(0, 25)) {
             const unix = Math.floor(job.fireAt / 1000);
+            const n = instanceCount(job.serverTag);
+            const target = job.instanceServerId ? 'single instance' : (n > 1 ? `all ${n} instances` : 'whole server');
             const lines = [
                 `Reboots <t:${unix}:R> (<t:${unix}:t>)`,
+                `Target: ${target}`,
                 `Warning window: ${job.warnWindow} min`,
                 `By: ${job.requestedBy || 'unknown'}`,
             ];
