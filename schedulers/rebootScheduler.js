@@ -363,8 +363,9 @@ module.exports = {
             sessionLogger.info('RebootScheduler', `Server ${server.tag}: excludeFromServerList=${excluded}, earlyAccess=${earlyAccess}, shouldReboot=${shouldReboot}`);
         });
         
-        const initialEligibleServers = servers.filter(server => 
-            !server.earlyAccess &&
+        // earlyAccess is no longer an exclusion: supporter early-access instances (e.g. il2/mg2
+        // SUP) are live, populated servers that need the same reboot rotation as everything else.
+        const initialEligibleServers = servers.filter(server =>
             this.shouldRebootServer(server)
         );
         
