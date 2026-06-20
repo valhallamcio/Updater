@@ -41,6 +41,7 @@ module.exports = {
         "interval": 1,
         "roleChannelId": "",
         "MentionRoleId": "",
+        "BifrostRoleId": "",
         "defaultEmojiId": "",
     },
 
@@ -59,6 +60,7 @@ module.exports = {
                 try {
                     let serverList = await yggdrasil.getServers();
                     serverList = await addMentionButton(serverList);
+                    serverList = await addBifrostButton(serverList);
                     let server = serverList.find(server => server.tag === interaction.customId);
                     let replyMessage = "Something went wrong!";
                     //console.log(interaction);
@@ -89,8 +91,9 @@ module.exports = {
 
         async function buildButtons() {
             let serverList = await yggdrasil.getServers();
-            const serverListFull = await addMentionButton(serverList);
-        
+            let serverListFull = await addMentionButton(serverList);
+            serverListFull = await addBifrostButton(serverListFull);
+
             const seen = new Set();
             const deduped = serverListFull.filter(server => {
                 if (seen.has(server.tag)) return false;
@@ -235,6 +238,24 @@ module.exports = {
             };
 
             serverList.unshift(mentionObj);
+            return serverList;
+        }
+
+        async function addBifrostButton(serverList) {
+            if (!options.BifrostRoleId) return serverList;
+
+            const channel = await client.channels.fetch(options.roleChannelId);
+
+            let role = channel.guild.roles.cache.find(role => role.id === options.BifrostRoleId);
+            if (!role) return serverList;
+
+            let bifrostObj = {
+                name: role.name,
+                tag: role.name.toLowerCase(),
+                discordRoleId: role.id
+            };
+
+            serverList.unshift(bifrostObj);
             return serverList;
         }
 
