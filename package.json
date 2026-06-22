@@ -22,7 +22,7 @@
   "description": "An all-in one updater for Minecraft modpacks hosted on CurseForge and FeedTheBeast.",
   "main": "server.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node --test --test-force-exit test/*.test.js",
     "start": "node server.js"
   },
   "author": "",

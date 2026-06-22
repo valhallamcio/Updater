@@ -89,7 +89,9 @@ module.exports = {
 
         // Reboot every instance concurrently; each runs its own warning countdown + stop/start.
         const results = await Promise.all(instances.map(s =>
-            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', { warnWindowMinutes: job.warnWindow })
+            // scheduled:true => don't treat a server the daily batch already rebooted today as a
+            // "duplicate" (completedServers lingers until the GMT+3 day rollover). See rebootScheduler.isServerActive.
+            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', { warnWindowMinutes: job.warnWindow, scheduled: true })
                 .then(r => ({ s, r }))
                 .catch(e => ({ s, r: { success: false, reason: e.message } }))
         ));

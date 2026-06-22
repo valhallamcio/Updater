@@ -64,9 +64,14 @@ module.exports = {
             return module.exports.state.activeReboots.delete(serverId);
         },
         
-        isServerActive(serverId) {
+        // ignoreCompleted: scheduled/ad-hoc reboots (vote-restart, staff /reboot) must NOT be
+        // blocked just because the daily batch already rebooted this server today. completedServers
+        // is only cleared on the GMT+3 day rollover, so otherwise the FIRST vote/reboot of a
+        // batch-rebooted server, fired any time later that day, is wrongly skipped as "duplicate".
+        // They still honor activeReboots (a genuinely in-flight reboot of the same server).
+        isServerActive(serverId, ignoreCompleted = false) {
             return module.exports.state.activeReboots.has(serverId) ||
-                   module.exports.state.completedServers.has(serverId);
+                   (!ignoreCompleted && module.exports.state.completedServers.has(serverId));
         },
         
         markServerFailed(serverId) {
@@ -741,7 +746,9 @@ module.exports = {
      * Execute complete reboot for a single server with enhanced error handling
      */
     executeFullServerReboot: async function (server, nodeId, opts = {}) {
-        if (this.stateOperations.isServerActive(server.serverId)) {
+        // opts.scheduled => a vote/staff scheduled reboot: ignore completedServers (stale from the
+        // daily batch) so it isn't wrongly skipped as a "duplicate"; still skip a genuinely in-flight one.
+        if (this.stateOperations.isServerActive(server.serverId, opts.scheduled)) {
             sessionLogger.warn('RebootScheduler', `[${server.name}] Already being processed, skipping`);
             return { success: false, reason: 'duplicate' };
         }

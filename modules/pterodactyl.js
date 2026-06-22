@@ -80,13 +80,14 @@ const apiCallTracker = {
     }
 };
 
-// Log stats every 10 seconds
+// Log stats every 10 seconds. unref so this telemetry timer never keeps the process alive on its
+// own (prod stays up via the schedulers/Discord/HTTP handles; lets `node --test` exit cleanly).
 setInterval(() => {
     const stats = apiCallTracker.getStats();
     if (stats.totalLast60s > 0) {
         apiCallTracker.logStats();
     }
-}, 10000);
+}, 10000).unref();
 
 // Warn when approaching rate limit
 setInterval(() => {
@@ -94,7 +95,7 @@ setInterval(() => {
     if (stats.totalLast60s > 100) {
         sessionLogger.warn('Pterodactyl', `HIGH API USAGE: ${stats.totalLast60s} calls in last 60s!`);
     }
-}, 5000);
+}, 5000).unref();
 
 // Helper to extract caller from stack trace
 function getCaller() {
