@@ -35,29 +35,43 @@ module.exports = {
         const tagGroups = {};
         for (const [tag, players] of Object.entries(rawData)) {
             if (players.length === 0) continue;
-            const serv = servers.find(s => s.tag === tag);
-            if (!serv || serv.earlyAccess) continue;
+            // A tag can have several docs (supporter-split packs ship a hidden
+            // `...SUP` early-access copy alongside the public copy). Pick the
+            // PUBLIC copy as the tag's face — never let an early-access/excluded
+            // copy represent the tag, or `find()` ordering would drop the whole
+            // pack (and every player on it) from /online.
+            const tagServers = servers.filter(s => s.tag === tag);
+            // Prefer a fully-public copy as the pack's face; fall back to any
+            // non-supporter copy (so an `excludeFromServerList`-only pack like gtff
+            // stays visible on /online, matching prior behavior). Only a pack whose
+            // every copy is early-access has no public face and is skipped.
+            const serv = tagServers.find(s => !s.earlyAccess && !s.excludeFromServerList)
+                || tagServers.find(s => !s.earlyAccess);
+            if (!serv) continue; // every copy is early-access — genuinely hidden pack
 
+            const domain = `${tag.toLowerCase()}.valhallamc.io`;
+
+            // Group players by instance, but fold early-access / excluded instances
+            // into the public pack name: supporter players still count as online,
+            // the supporter instance name stays hidden on Discord.
             const instanceMap = {};
             for (const player of players) {
                 const key = player.instance || '_default';
-                if (!instanceMap[key]) instanceMap[key] = [];
-                instanceMap[key].push(player.username);
+                const doc = tagServers.find(s =>
+                    s.name === key || s.id === key || s.serverId === key
+                );
+                const displayName = (!doc || doc.earlyAccess || doc.excludeFromServerList)
+                    ? serv.name
+                    : doc.name;
+                if (!instanceMap[displayName]) instanceMap[displayName] = [];
+                instanceMap[displayName].push(player.username);
             }
 
-            const allTagServers = servers.filter(s => s.tag === tag && !s.earlyAccess);
-
-            const domain = `${tag.toLowerCase()}.valhallamc.io`;
-            const instances = Object.entries(instanceMap).map(([instanceKey, usernames]) => {
-                const matched = allTagServers.find(s =>
-                    s.name === instanceKey || s.id === instanceKey || s.serverId === instanceKey
-                );
-                return {
-                    name: matched ? matched.name : (instanceKey === '_default' ? serv.name : instanceKey),
-                    players: usernames,
-                    domain
-                };
-            });
+            const instances = Object.entries(instanceMap).map(([name, usernames]) => ({
+                name,
+                players: usernames,
+                domain
+            }));
 
             tagGroups[tag] = { mainName: serv.name, instances };
             onlineCount += players.length;

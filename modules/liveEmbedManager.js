@@ -146,7 +146,9 @@ function generateServerEmbed(servers) {
     const seen = new Set();
 
     for (let server of servers) {
-        if (server.excludeFromServerList) continue;
+        // Skip hidden AND early-access copies before claiming the tag (see servers.js):
+        // an early-access copy must never claim a tag it'll later be filtered out of.
+        if (server.excludeFromServerList || server.earlyAccess) continue;
         if (seen.has(server.tag)) continue;
         seen.add(server.tag);
         if (!versionObj[server.serverVersion]) versionObj[server.serverVersion] = [];

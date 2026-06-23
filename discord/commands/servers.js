@@ -40,7 +40,10 @@ module.exports = {
 
         const seen = new Set();
         for (let server of serverList) {
-            if (server.excludeFromServerList) continue;
+            // Skip hidden AND early-access copies before claiming the tag — otherwise
+            // an early-access copy ordered first would claim the tag in `seen`, then get
+            // filtered out at display time, taking the whole pack down with it.
+            if (server.excludeFromServerList || server.earlyAccess) continue;
             if (seen.has(server.tag)) continue;
             seen.add(server.tag);
 
