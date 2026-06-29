@@ -817,6 +817,16 @@ module.exports = {
             enabled: a.enabled !== false,
             dryRun: a.dryRun === true,
             commandGapMs: a.commandGapMs != null ? a.commandGapMs : 250,
+            // save-all then idle this long before stop/kill so a slow modded world finishes
+            // flushing to disk (a later force-kill can't lose chunks). 0 disables the wait.
+            preStopSaveWaitSeconds: a.preStopSaveWaitSeconds != null ? a.preStopSaveWaitSeconds : 90,
+            // How long a graceful `stop` gets to bring the server offline before we consider a kill.
+            // A clean modded shutdown does its own world save; give it room so kill stays a last resort.
+            stopGraceSeconds: a.stopGraceSeconds != null ? a.stopGraceSeconds : 120,
+            // A `kill` is SIGKILL — never send it while the JVM is mid-write (region corruption).
+            // Only kill once CPU is below this (save finished / process hung), or the cap below elapses.
+            killIdleCpuPercent: a.killIdleCpuPercent != null ? a.killIdleCpuPercent : 20,
+            killIdleMaxWaitSeconds: a.killIdleMaxWaitSeconds != null ? a.killIdleMaxWaitSeconds : 120,
             defaultWarnWindowMinutes: a.defaultWarnWindowMinutes != null ? a.defaultWarnWindowMinutes : 15,
             maxWarnWindowMinutes: a.maxWarnWindowMinutes != null ? a.maxWarnWindowMinutes : 15,
             milestonesSeconds: Array.isArray(a.milestonesSeconds) ? a.milestonesSeconds : [900, 600, 300, 60],
@@ -973,8 +983,8 @@ module.exports = {
 
         // Tear down the bossbar BEFORE the final save: /bossbar is a PERSISTENT custom bossbar
         // stored in the world, so if it's still present when the world saves it survives the
-        // restart and reappears (stuck) for rejoining players. Remove -> save -> stop guarantees
-        // a clean world. (save-all is also issued here as the pre-stop world flush.)
+        // restart and reappears (stuck) for rejoining players. Remove -> save persists the removal.
+        // (The authoritative pre-stop flush + 90s wait lives in ensureServerStopped, which runs next.)
         if (bossbarUp) {
             await this.sendAlertCommands(server, rebootAlerts.buildBossbarTeardown(version), gapMs, dryRun);
         }
@@ -987,37 +997,117 @@ module.exports = {
      * Ensure server is properly stopped with verification
      */
     ensureServerStopped: async function (server) {
+        const ac = this.getAlertConfig();
+
+        // Hard guarantee for EVERY reboot path (daily batch, scheduled, vote): flush the world and
+        // give it time to finish BEFORE any stop/kill. save-all is async on the backend, so the
+        // wait — not the command — is what lets a slow modded save (PRI-class worlds) reach disk.
+        const saveWaitMs = (ac.preStopSaveWaitSeconds || 0) * 1000;
+        if (saveWaitMs > 0) {
+            try {
+                await pterodactyl.sendCommand(server.serverId, 'save-all');
+            } catch (error) {
+                sessionLogger.warn('RebootScheduler', `[${server.name}] pre-stop save-all failed: ${error.message}`);
+            }
+            sessionLogger.info('RebootScheduler',
+                `[${server.name}] save-all issued; waiting ${saveWaitMs / 1000}s for world flush before stop`);
+            await functions.sleep(saveWaitMs);
+        }
+
+        const stopGraceMs = (ac.stopGraceSeconds != null ? ac.stopGraceSeconds : 120) * 1000;
         const maxStopAttempts = 3;
-        
+
         for (let attempt = 1; attempt <= maxStopAttempts; attempt++) {
             try {
                 // Send stop command
                 await pterodactyl.sendPowerAction(server.serverId, 'stop');
-                
-                // Wait for server to stop
-                const stopped = await this.waitForServerState(server, 'offline', 60000);
-                
+
+                // Wait for the graceful stop (which does its own world save) to bring it offline.
+                const stopped = await this.waitForServerState(server, 'offline', stopGraceMs);
+
                 if (stopped) {
-                    sessionLogger.info('RebootScheduler', 
-                        `[${server.name}] Server stopped successfully`);
+                    sessionLogger.info('RebootScheduler',
+                        `[${server.name}] Server stopped cleanly`);
                     return true;
                 }
-                
-                // If not stopped, try kill
-                sessionLogger.warn('RebootScheduler', 
-                    `[${server.name}] Server not stopping, sending kill command`);
-                
-                await pterodactyl.sendPowerAction(server.serverId, 'kill');
-                
+
+                // Still up after the grace window. A kill is SIGKILL — issuing it now could truncate
+                // an in-flight region write. forceKillWhenIdle waits until the JVM is idle (save done
+                // or hung) before killing, and returns early if the server stops on its own meanwhile.
+                sessionLogger.warn('RebootScheduler',
+                    `[${server.name}] Not offline after ${stopGraceMs / 1000}s — force-kill once idle`);
+
+                if (await this.forceKillWhenIdle(server, ac)) {
+                    return true; // stopped on its own during the kill-wait
+                }
+
+                // A kill was issued — confirm it actually brought the server offline before declaring
+                // success (don't loop back and `stop` an already-dead server, which would error out).
+                if (await this.waitForServerState(server, 'offline', 30000)) {
+                    sessionLogger.info('RebootScheduler', `[${server.name}] Server killed and confirmed offline`);
+                    return true;
+                }
+
                 await functions.sleep(5000);
-                
+
             } catch (error) {
-                sessionLogger.error('RebootScheduler', 
+                sessionLogger.error('RebootScheduler',
                     `[${server.name}] Stop attempt ${attempt} failed: ${error.message}`);
             }
         }
-        
+
         throw new Error('Failed to stop server after multiple attempts');
+    },
+
+    /**
+     * Force-kill a server that ignored `stop`, but ONLY once it is safe to do so. A Pterodactyl
+     * `kill` is a SIGKILL: if it lands while the JVM is mid-write (saving region/level data) it can
+     * corrupt the world. So poll the server and only kill when:
+     *   - CPU has dropped below `killIdleCpuPercent` (save finished, or the process is wedged idle), or
+     *   - the `killIdleMaxWaitSeconds` hard cap elapses (server hung at high CPU — kill as last resort).
+     * Returns true if the server reached 'offline' on its own first (no kill was needed).
+     *
+     * NOTE: pterodactyl.getStatus() returns current_state:'unknown' + cpu_absolute:0 on an API error.
+     * We must NOT read that as "idle" and kill — an API blip during a save would then corrupt the
+     * world. Only a CONFIRMED known state with a real low CPU triggers the idle kill.
+     */
+    forceKillWhenIdle: async function (server, ac = this.getAlertConfig()) {
+        const idleCpu = ac.killIdleCpuPercent != null ? ac.killIdleCpuPercent : 20;
+        const maxWaitMs = (ac.killIdleMaxWaitSeconds != null ? ac.killIdleMaxWaitSeconds : 120) * 1000;
+        const pollMs = 5000;
+        const start = Date.now();
+
+        while (Date.now() - start < maxWaitMs) {
+            const status = await pterodactyl.getStatus(server.serverId); // returns a safe default on error
+            const state = status && status.attributes && status.attributes.current_state;
+            const cpu = status && status.attributes && status.attributes.resources
+                ? status.attributes.resources.cpu_absolute : null;
+
+            if (state === 'offline') {
+                sessionLogger.info('RebootScheduler', `[${server.name}] Stopped on its own — no kill needed`);
+                return true;
+            }
+
+            // 'unknown' == getStatus swallowed an API error (cpu is a meaningless 0); keep waiting.
+            if (state && state !== 'unknown' && typeof cpu === 'number' && cpu < idleCpu) {
+                sessionLogger.warn('RebootScheduler',
+                    `[${server.name}] Idle (CPU ${cpu.toFixed(1)}%) — sending kill`);
+                await pterodactyl.sendPowerAction(server.serverId, 'kill')
+                    .catch(e => sessionLogger.error('RebootScheduler', `[${server.name}] kill failed: ${e.message}`));
+                return false;
+            }
+
+            sessionLogger.info('RebootScheduler',
+                `[${server.name}] Still working (state=${state || '?'}, CPU ${typeof cpu === 'number' ? cpu.toFixed(1) + '%' : '?'}) — waiting before kill`);
+            await functions.sleep(pollMs);
+        }
+
+        // Hard cap reached: server is wedged at high CPU (or status unreadable). Kill as last resort.
+        sessionLogger.warn('RebootScheduler',
+            `[${server.name}] Kill grace (${maxWaitMs / 1000}s) exhausted — force-killing`);
+        await pterodactyl.sendPowerAction(server.serverId, 'kill')
+            .catch(e => sessionLogger.error('RebootScheduler', `[${server.name}] kill failed: ${e.message}`));
+        return false;
     },
 
     /**

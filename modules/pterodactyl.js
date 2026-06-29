@@ -530,8 +530,23 @@ module.exports = {
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {number} timeToKill Time in seconds to wait before killing the server. Default is 30 seconds.
      * @param {number} interval Interval in seconds to check the server status. Default interval is 3 seconds.
+     * @param {number} preSaveWaitSeconds save-all then idle this long before stopping, so a slow modded
+     *                                     world finishes flushing to disk before the stop/kill. Default 90s; 0 disables.
      */
-    shutdown: async function (serverID, timeToKill = 30, interval = 3) {
+    shutdown: async function (serverID, timeToKill = 30, interval = 3, preSaveWaitSeconds = 90) {
+        // Flush the world and let it settle BEFORE the stop. shutdown() force-kills an idling server
+        // after timeToKill, so without this an in-flight modded save could be truncated.
+        if (preSaveWaitSeconds > 0) {
+            try {
+                await this.sendCommand(serverID, "save-all");
+            } catch (error) {
+                // server may already be offline / unreachable — nothing to flush, proceed to stop.
+                sessionLogger.warn('Pterodactyl', `Pre-stop save-all failed for ${serverID}: ${error.message}`);
+            }
+            sessionLogger.info('Pterodactyl', `save-all issued for ${serverID}; waiting ${preSaveWaitSeconds}s for world flush before stop`);
+            await new Promise(resolve => setTimeout(resolve, preSaveWaitSeconds * 1000));
+        }
+
         const progressBar = new progress(`Shutting down the server [:bar] :percent :etas`, {
             width: 40,
             complete: '=',
@@ -541,29 +556,41 @@ module.exports = {
         });
 
         let iterator = 0;
+        let killWaitSeconds = 0; // time spent waiting in the kill phase (iterator freezes at timeToKill)
+        const killHardCapSeconds = 600; // never wait more than 10 min before a last-resort kill
         await this.sendPowerAction(serverID, "stop");
 
         return new Promise((resolve, reject) => {
             let shutdownSequence = setInterval(async () => {
                 try {
                     let status = await this.getStatus(serverID);
+                    const state = status.attributes.current_state;
+                    const cpu = status.attributes.resources.cpu_absolute;
 
-                    if (status.attributes.current_state === "offline") {
+                    if (state === "offline") {
                         progressBar.update(1);
                         clearInterval(shutdownSequence);
-                        resolve();
+                        return resolve(); // stop here — don't fall through into the kill block
                     } else if (iterator < timeToKill) {
                         progressBar.tick(interval);
                         iterator += interval;
                     }
                     if (iterator >= timeToKill) {
+                        killWaitSeconds += interval;
                         progressBar.update(0.99);
                         sessionLogger.warn('Pterodactyl', 'Server shutdown taking longer than expected...');
                         process.stdout.moveCursor(76, -2);
 
-                        if (status.attributes.resources.cpu_absolute < 10) {
+                        // A kill is SIGKILL — only send it when the JVM is CONFIRMED idle (save done /
+                        // hung), never mid-write. getStatus() returns state 'unknown' + cpu 0 on an API
+                        // error, so guard on a known state; a hard cap stops an API outage hanging the
+                        // update (or a server wedged at high CPU) forever.
+                        const idle = state !== 'unknown' && cpu < 10;
+                        const capped = killWaitSeconds >= killHardCapSeconds;
+                        if (idle || capped) {
                             progressBar.update(1);
-                            sessionLogger.info('Pterodactyl', 'Server is idling. Killing it...');
+                            sessionLogger.info('Pterodactyl',
+                                idle ? 'Server is idling. Killing it...' : 'Kill grace exhausted. Killing it...');
                             await this.sendPowerAction(serverID, "kill");
                             clearInterval(shutdownSequence);
                             resolve();

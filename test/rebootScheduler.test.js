@@ -14,6 +14,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const rs = require('../schedulers/rebootScheduler');
+const pterodactyl = require('../modules/pterodactyl');
+const functions = require('../modules/functions');
 
 function reset() {
     rs.state.activeReboots.clear();
@@ -55,4 +57,176 @@ test('executeFullServerReboot: scheduled reboot still returns duplicate when one
     const r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X' }, 'node', { scheduled: true });
     assert.deepStrictEqual(r, { success: false, reason: 'duplicate' });
     reset(); // drop the seeded active entry so nothing leaks to other tests
+});
+
+/*
+ * Pre-stop world flush (requested 2026-06-29): EVERY reboot path must `save-all` then idle the full
+ * window BEFORE any stop/kill, so a slow modded save (PRI-class worlds) reaches disk and the 60s
+ * force-kill in ensureServerStopped can't truncate it. The wait — not the command — is the guarantee
+ * (save-all is async on the backend). Asserts ordering: save-all -> 90s sleep -> stop power action.
+ */
+test('ensureServerStopped: save-all + full wait happen BEFORE any stop/kill', async () => {
+    reset();
+    const log = [];
+    const orig = {
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        getStatus: pterodactyl.getStatus,
+        sleep: functions.sleep,
+        runtimeConfig: rs.runtimeConfig,
+    };
+    pterodactyl.sendCommand = async (id, cmd) => { log.push(`cmd:${cmd}`); };
+    pterodactyl.sendPowerAction = async (id, action) => { log.push(`power:${action}`); };
+    // Report offline immediately so the stop loop exits after one stop (no kill needed here).
+    pterodactyl.getStatus = async () => ({ attributes: { current_state: 'offline' } });
+    functions.sleep = async (ms) => { log.push(`sleep:${ms}`); };
+    rs.runtimeConfig = { playerAlerts: { preStopSaveWaitSeconds: 90 } };
+
+    try {
+        await rs.ensureServerStopped({ serverId: 'abc123', name: 'X' });
+    } finally {
+        Object.assign(pterodactyl, { sendCommand: orig.sendCommand, sendPowerAction: orig.sendPowerAction, getStatus: orig.getStatus });
+        functions.sleep = orig.sleep;
+        rs.runtimeConfig = orig.runtimeConfig;
+    }
+
+    const saveIdx = log.indexOf('cmd:save-all');
+    const waitIdx = log.indexOf('sleep:90000');
+    const stopIdx = log.indexOf('power:stop');
+    assert.ok(saveIdx !== -1, 'save-all must be issued');
+    assert.ok(waitIdx !== -1, 'must wait the full 90s flush window');
+    assert.ok(stopIdx !== -1, 'server must still be stopped');
+    assert.ok(saveIdx < waitIdx && waitIdx < stopIdx,
+        `order must be save-all -> wait -> stop, got: ${log.join(' , ')}`);
+    // No stop/kill power action may precede the flush wait.
+    assert.ok(!log.slice(0, waitIdx).some(e => e.startsWith('power:')),
+        'no stop/kill may happen before the flush wait');
+});
+
+/*
+ * Kill safety (2026-06-29): a Pterodactyl `kill` is a SIGKILL. If it lands while the JVM is mid-write
+ * (saving region/level data) it can corrupt the world even though we pre-saved. forceKillWhenIdle only
+ * kills once the server is CONFIRMED idle (CPU dropped) or a hard cap elapses, and treats getStatus()'s
+ * API-error default (state 'unknown', cpu 0) as "not idle" so a transient API blip can't trigger a kill.
+ */
+function stubPtero(overrides) {
+    const saved = {
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        getStatus: pterodactyl.getStatus,
+        sleep: functions.sleep,
+        runtimeConfig: rs.runtimeConfig,
+    };
+    Object.assign(pterodactyl, overrides.ptero || {});
+    if (overrides.sleep) functions.sleep = overrides.sleep;
+    rs.runtimeConfig = overrides.runtimeConfig || rs.runtimeConfig;
+    return () => {
+        Object.assign(pterodactyl, {
+            sendCommand: saved.sendCommand, sendPowerAction: saved.sendPowerAction, getStatus: saved.getStatus,
+        });
+        functions.sleep = saved.sleep;
+        rs.runtimeConfig = saved.runtimeConfig;
+    };
+}
+
+test('forceKillWhenIdle: waits out a busy (saving) server, kills only once CPU is idle', async () => {
+    const events = [];
+    const statuses = [
+        { attributes: { current_state: 'stopping', resources: { cpu_absolute: 150 } } }, // saving — high CPU
+        { attributes: { current_state: 'stopping', resources: { cpu_absolute: 70 } } },  // still saving
+        { attributes: { current_state: 'stopping', resources: { cpu_absolute: 5 } } },   // idle — safe to kill
+    ];
+    let i = 0;
+    const restore = stubPtero({
+        ptero: {
+            getStatus: async () => { const s = statuses[Math.min(i++, statuses.length - 1)]; events.push(`poll:${s.attributes.resources.cpu_absolute}`); return s; },
+            sendPowerAction: async (id, action) => { events.push(`power:${action}`); },
+        },
+        sleep: async () => { events.push('sleep'); },
+        runtimeConfig: { playerAlerts: { killIdleCpuPercent: 20, killIdleMaxWaitSeconds: 120 } },
+    });
+    let result;
+    try { result = await rs.forceKillWhenIdle({ serverId: 'x', name: 'X' }); }
+    finally { restore(); }
+
+    assert.strictEqual(result, false, 'a kill was needed (server never went offline on its own)');
+    const killIdx = events.indexOf('power:kill');
+    assert.strictEqual(events.filter(e => e === 'power:kill').length, 1, 'exactly one kill');
+    assert.ok(events.slice(0, killIdx).includes('poll:150') && events.slice(0, killIdx).includes('poll:70'),
+        `must wait out the high-CPU (saving) polls before killing; got: ${events.join(',')}`);
+    assert.strictEqual(events[killIdx - 1], 'poll:5', 'kill fires on the idle reading, not mid-save');
+});
+
+test('forceKillWhenIdle: API-error reading (state unknown, cpu 0) is NOT treated as idle', async () => {
+    const events = [];
+    // getStatus() returns this exact shape on an API error; a naive `cpu < idle` check would kill here.
+    const statuses = [
+        { attributes: { current_state: 'unknown', resources: { cpu_absolute: 0 } } },
+        { attributes: { current_state: 'unknown', resources: { cpu_absolute: 0 } } },
+        { attributes: { current_state: 'offline', resources: { cpu_absolute: 0 } } },
+    ];
+    let i = 0;
+    const restore = stubPtero({
+        ptero: {
+            getStatus: async () => statuses[Math.min(i++, statuses.length - 1)],
+            sendPowerAction: async (id, action) => { events.push(`power:${action}`); },
+        },
+        sleep: async () => {},
+        runtimeConfig: { playerAlerts: { killIdleCpuPercent: 20, killIdleMaxWaitSeconds: 120 } },
+    });
+    let result;
+    try { result = await rs.forceKillWhenIdle({ serverId: 'x', name: 'X' }); }
+    finally { restore(); }
+
+    assert.strictEqual(result, true, 'returns true — server reached offline on its own');
+    assert.strictEqual(events.filter(e => e === 'power:kill').length, 0,
+        'an unknown/cpu-0 API blip must never be read as idle and killed');
+});
+
+test('forceKillWhenIdle: hard cap force-kills a server wedged at high CPU', async () => {
+    const events = [];
+    const restore = stubPtero({
+        ptero: {
+            getStatus: async () => ({ attributes: { current_state: 'stopping', resources: { cpu_absolute: 200 } } }),
+            sendPowerAction: async (id, action) => { events.push(`power:${action}`); },
+        },
+        sleep: async () => { await new Promise(r => setTimeout(r, 8)); }, // advance the real clock toward the cap
+        runtimeConfig: { playerAlerts: { killIdleCpuPercent: 20, killIdleMaxWaitSeconds: 0.05 } }, // 50ms cap
+    });
+    let result;
+    try { result = await rs.forceKillWhenIdle({ serverId: 'x', name: 'X' }); }
+    finally { restore(); }
+
+    assert.strictEqual(result, false);
+    assert.strictEqual(events.filter(e => e === 'power:kill').length, 1,
+        'a server wedged at high CPU is force-killed once the cap elapses');
+});
+
+test('ensureServerStopped: preStopSaveWaitSeconds=0 disables the flush (no extra save/wait)', async () => {
+    reset();
+    const log = [];
+    const orig = {
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        getStatus: pterodactyl.getStatus,
+        sleep: functions.sleep,
+        runtimeConfig: rs.runtimeConfig,
+    };
+    pterodactyl.sendCommand = async (id, cmd) => { log.push(`cmd:${cmd}`); };
+    pterodactyl.sendPowerAction = async (id, action) => { log.push(`power:${action}`); };
+    pterodactyl.getStatus = async () => ({ attributes: { current_state: 'offline' } });
+    functions.sleep = async (ms) => { log.push(`sleep:${ms}`); };
+    rs.runtimeConfig = { playerAlerts: { preStopSaveWaitSeconds: 0 } };
+
+    try {
+        await rs.ensureServerStopped({ serverId: 'abc123', name: 'X' });
+    } finally {
+        Object.assign(pterodactyl, { sendCommand: orig.sendCommand, sendPowerAction: orig.sendPowerAction, getStatus: orig.getStatus });
+        functions.sleep = orig.sleep;
+        rs.runtimeConfig = orig.runtimeConfig;
+    }
+
+    assert.ok(!log.includes('cmd:save-all'), 'flush save-all suppressed when disabled');
+    assert.ok(!log.includes('sleep:0') && !log.some(e => e === 'sleep:90000'), 'no flush wait when disabled');
+    assert.strictEqual(log[0], 'power:stop', 'goes straight to stop');
 });
