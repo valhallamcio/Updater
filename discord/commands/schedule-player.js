@@ -229,17 +229,29 @@ module.exports = {
             .setTitle('Active Player Triggers')
             .setTimestamp();
         
-        for (let i = 0; i < Math.min(triggers.length, 10); i++) {
+        // Discord caps a field value at 1024 chars and the whole embed at 6000.
+        // NBT restore commands (shulker /give) routinely blow past 1024 on their own,
+        // which threw "Received one or more errors" and broke the entire list.
+        let used = 0, shown = 0;
+        for (let i = 0; i < triggers.length; i++) {
             const trigger = triggers[i];
-            embed.addFields({
-                name: `ID: ${trigger._id.toString().substring(0, 8)}... | Player: ${trigger.playerId}`,
-                value: `**Servers:** ${trigger.serverNames.join(', ')}\n**Commands:** ${trigger.commands.join('; ')}\n**One-time:** ${trigger.oneTime ? 'Yes' : 'No'}\n**On Join:** ${trigger.onJoin ? 'Yes' : 'No'}`,
-                inline: false
-            });
+            const cmds = trigger.commands || [];
+            const cmdJoined = cmds.join('; ');
+            const CMD_CAP = 500;
+            const cmdText = cmdJoined.length > CMD_CAP
+                ? `${cmdJoined.slice(0, CMD_CAP)}… (${cmds.length} cmd${cmds.length === 1 ? '' : 's'}, ${cmdJoined.length} chars)`
+                : cmdJoined;
+            const name = `ID: ${trigger._id.toString().substring(0, 8)}... | Player: ${trigger.playerId}`;
+            const value = `**Servers:** ${(trigger.serverNames || []).join(', ')}\n**Commands:** ${cmdText}\n**One-time:** ${trigger.oneTime ? 'Yes' : 'No'}\n**On Join:** ${trigger.onJoin ? 'Yes' : 'No'}`.slice(0, 1024);
+            // stop before the 6000-char embed limit (headroom for title/footer)
+            if (used + name.length + value.length > 5800) break;
+            embed.addFields({ name, value, inline: false });
+            used += name.length + value.length;
+            shown++;
         }
-        
-        if (triggers.length > 10) {
-            embed.setFooter({ text: `Showing 10 of ${triggers.length} triggers` });
+
+        if (shown < triggers.length) {
+            embed.setFooter({ text: `Showing ${shown} of ${triggers.length} triggers` });
         }
         
         await interaction.editReply({ embeds: [embed] });
