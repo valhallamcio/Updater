@@ -102,6 +102,17 @@ async function cancelOp(opId) {
     return response.data.data;
 }
 
+/**
+ * Player inventory: live (inspect_inventory op) when the server is linked, else the newest
+ * stored snapshot with stale:true. Response: { source: 'live'|'snapshot', stale, inventory|snapshot }.
+ */
+async function getPlayerInventory(server, player) {
+    const response = await client.get(`/biforesting/${server}/players/${encodeURIComponent(player)}/inventory`, {
+        timeout: 15000 // the live path long-polls up to ~8s
+    });
+    return response.data.data;
+}
+
 /** Live link session snapshot for a server, or null when it isn't linked right now. */
 async function getLinkSession(server) {
     try {
@@ -247,6 +258,7 @@ module.exports = {
     cancelOp,
     runOp,
     getLinkSession,
+    getPlayerInventory,
     connect,
     disconnect,
     isConnected,
