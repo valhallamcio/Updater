@@ -130,6 +130,18 @@ async function searchQuests(server, search, limit = 10) {
     return response.data.data;
 }
 
+/**
+ * Item registry search (v2 phase 8): exact-id hit, then `mod:` prefix, then text relevance, then
+ * substring. Feeds /give-item autocomplete. Response: { instanceKey, source, registryCount,
+ * dumpedAt, count, items:[{ id, num, mod, display, maxStack, variants }] }.
+ */
+async function searchItems(server, search, limit = 25) {
+    const response = await client.get(`/biforesting/${server}/items`, {
+        params: search ? { search, limit } : { limit }
+    });
+    return response.data.data;
+}
+
 /** Live link session snapshot for a server, or null when it isn't linked right now. */
 async function getLinkSession(server) {
     try {
@@ -278,6 +290,7 @@ module.exports = {
     getLinkSession,
     getPlayerInventory,
     searchQuests,
+    searchItems,
     connect,
     disconnect,
     isConnected,
