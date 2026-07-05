@@ -102,6 +102,12 @@ async function cancelOp(opId) {
     return response.data.data;
 }
 
+/** Resumes a FAILED compound op (account_reset) from its checkpoint (v2 phase 7). */
+async function resumeOp(opId) {
+    const response = await client.post(`/biforesting/ops/${opId}/resume`);
+    return response.data.data;
+}
+
 /**
  * Player inventory: live (inspect_inventory op) when the server is linked, else the newest
  * stored snapshot with stale:true. Response: { source: 'live'|'snapshot', stale, inventory|snapshot }.
@@ -267,6 +273,7 @@ module.exports = {
     getOp,
     listOps,
     cancelOp,
+    resumeOp,
     runOp,
     getLinkSession,
     getPlayerInventory,
