@@ -113,6 +113,17 @@ async function getPlayerInventory(server, player) {
     return response.data.data;
 }
 
+/**
+ * Quest registry search (v2 phase 6): exact-id hit, then text relevance, then substring.
+ * Response: { instanceKey, source: 'ftbq'|'bq', registryCount, dumpedAt, count, quests }.
+ */
+async function searchQuests(server, search, limit = 10) {
+    const response = await client.get(`/biforesting/${server}/quests`, {
+        params: search ? { search, limit } : { limit }
+    });
+    return response.data.data;
+}
+
 /** Live link session snapshot for a server, or null when it isn't linked right now. */
 async function getLinkSession(server) {
     try {
@@ -259,6 +270,7 @@ module.exports = {
     runOp,
     getLinkSession,
     getPlayerInventory,
+    searchQuests,
     connect,
     disconnect,
     isConnected,
