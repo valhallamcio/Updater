@@ -146,10 +146,31 @@ module.exports = {
                 
                 // Prepare initial message
                 let reply = `Sending \`${command}\` to **${server.name}**... 🚀`;
-                
+
                 try {
+                    // via-link path (biforesting v2): durable op with real captured output.
+                    // Falls back to the pterosocket console scrape when not linked / op fails.
+                    let response = null;
+                    try {
+                        const session = await yggdrasil.getLinkSession(server.serverId);
+                        if (session) {
+                            const doc = await yggdrasil.runOp(server.serverId, {
+                                type: 'run_command',
+                                params: { command }
+                            }, 15000);
+                            if (doc.state === 'completed' && doc.result && typeof doc.result.output === 'string') {
+                                response = doc.result.output;
+                                reply = `Sending \`${command}\` to **${server.name}** via link... 🔗`;
+                            } else {
+                                sessionLogger.warn('Execute', `Link op ${doc.state} on ${server.name}, falling back to console`);
+                            }
+                        }
+                    } catch (linkErr) {
+                        sessionLogger.warn('Execute', `Link path failed on ${server.name} (${linkErr.message}), falling back to console`);
+                    }
+
                     // Execute the command with a timeout
-                    const response = await Promise.race([
+                    if (response === null) response = await Promise.race([
                         sendAdvancedCommand(server.serverId, command),
                         new Promise((_, reject) =>
                             setTimeout(() => reject(new Error('Command execution timed out')), 15000)
