@@ -487,6 +487,19 @@ module.exports = {
             await pterodactyl.decompressFile(sid, zipFile);
             await sleep(1000);
             await pterodactyl.deleteFile(sid, [zipFile]);
+
+            // Re-apply per-server file snapshots if an update saved any (multi-instance
+            // packs like GTO keep their own difficulty/ports; the backup holds the primary's)
+            const perServerDir = `./vault/${pack.tag}/per-server/${sid}`;
+            if (fs.existsSync(perServerDir)) {
+                const collectFiles = (dir) => fs.readdirSync(dir, { withFileTypes: true })
+                    .flatMap(e => e.isDirectory() ? collectFiles(`${dir}/${e.name}`) : [`${dir}/${e.name}`]);
+                for (const file of collectFiles(perServerDir)) {
+                    const relPath = file.substring(perServerDir.length + 1);
+                    await pterodactyl.writeFile(sid, relPath, fs.readFileSync(file));
+                    sessionLogger.info('UpdateManager', `Restored per-server file ${relPath} on ${sid}`);
+                }
+            }
         }
 
         // DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
@@ -782,5 +795,306 @@ module.exports = {
         progressLog += ` Done!\n\n**Update completed successfully!** The server **${pack.name}** is now running GTNH version **${newestVersion}**.`;
         await interaction.edit(progressLog);
     },
-    //TODO gregtech updater sequence
+
+    /**
+     * Updates the server with a version of GregTech Odyssey from GitHub releases.
+     * Multi-instance aware: per-server files (difficulty, ports) are snapshotted from each
+     * instance before deploy and written back after, so instances keep their identity.
+     * @param {object} pack Object with the server data.
+     * @param {string} versionOverride Release tag to update to (latest release if omitted).
+     * @param {object} interaction Object with the interaction data (for Discord).
+     * @param {Array} serverIds Pterodactyl server ids of all instances sharing the tag.
+     */
+    updateGTO: async function (pack, versionOverride, interaction, serverIds = null) {
+        const allServerIds = serverIds && serverIds.length > 0 ? serverIds : [pack.serverId];
+        const gto = require('../modules/gregtechodyssey');
+        const path = require('path');
+
+        // Resolve the target release
+        let newRelease;
+        if (versionOverride) {
+            newRelease = await gto.resolveVersion(versionOverride);
+            if (!newRelease) {
+                const errorMsg = `Version ${versionOverride} not found in GTO releases (or it has no server pack asset)!`;
+                sessionLogger.error('UpdateManager', errorMsg);
+                await interaction.edit(errorMsg);
+                return;
+            }
+        } else {
+            newRelease = await gto.getLatestVersion();
+        }
+
+        // The old reference pack is mandatory: without it the three-way merge cannot
+        // separate admin changes from pack changes, so abort instead of guessing.
+        const oldRelease = await gto.resolveVersion(pack.modpackVersion);
+        if (!oldRelease) {
+            const errorMsg = `Current version ${pack.modpackVersion} not found in GTO releases! The old reference pack is required for a safe three-way merge. Aborting - nothing was touched.`;
+            sessionLogger.error('UpdateManager', errorMsg);
+            await interaction.edit(errorMsg);
+            return;
+        }
+
+        const currentVersion = oldRelease.tag;
+        const newestVersion = newRelease.tag;
+
+        if (currentVersion === newestVersion) {
+            const msg = `Server is already on the latest version (${currentVersion})!`;
+            sessionLogger.info('UpdateManager', msg);
+            await interaction.edit(msg);
+            return;
+        }
+
+        const alert = alertScheduledUpdate.replace("[NEWVERSION]", newestVersion);
+        let progressLog = `Update sequence started for **${pack.name}** (${currentVersion} -> ${newestVersion}).`;
+        await interaction.edit(progressLog);
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+        // Clear working directory
+        rmRecursive(`./${pack.tag}`);
+
+        // Download server packs
+        progressLog += `\n- Downloading new server pack (version ${newestVersion})...`;
+        await interaction.edit(progressLog);
+        await download(newRelease.url, `./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`);
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
+        progressLog += ` Done!\n- Downloading reference server pack (version ${currentVersion})...`;
+        await interaction.edit(progressLog);
+        await download(oldRelease.url, `./${pack.tag}/downloads/old/${pack.tag}_${currentVersion}.zip`);
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
+        // Extract packs (checkMods hoists the zip's top-level server/ directory)
+        progressLog += ` Done!\n- Decompressing new pack files...`;
+        await interaction.edit(progressLog);
+        await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`, `./${pack.tag}/compare/new`);
+        await checkMods(`./${pack.tag}/compare/new`);
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
+        progressLog += ` Done!\n- Decompressing reference pack files...`;
+        await interaction.edit(progressLog);
+        await decompress(`./${pack.tag}/downloads/old/${pack.tag}_${currentVersion}.zip`, `./${pack.tag}/compare/old`);
+        await checkMods(`./${pack.tag}/compare/old`);
+
+        // The zips nest everything under server/ - if hoisting failed the comparison
+        // would diff garbage and the merge would wreck the server, so verify mods/ landed.
+        if (!fs.existsSync(`./${pack.tag}/compare/new/mods`) || !fs.existsSync(`./${pack.tag}/compare/old/mods`)) {
+            const errorMsg = `Pack layout check failed: no mods folder after extraction. The GTO zip layout may have changed. Aborting - nothing was touched.`;
+            sessionLogger.error('UpdateManager', errorMsg);
+            await interaction.edit(progressLog + `\n\n**${errorMsg}**`);
+            return;
+        }
+
+        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
+        // Get current server files
+        let toCompressList = [];
+        await fs.readdirSync(`./${pack.tag}/compare/old`).forEach(file => {
+            toCompressList.push(file);
+        });
+
+        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
+        await interaction.edit(progressLog);
+        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+
+        // Snapshot per-server files from EVERY instance before anything destructive.
+        // The deploy pushes the primary's merged files to all instances, which would
+        // otherwise clobber per-server state (Expert difficulty, ports).
+        progressLog += ` Done!\n- Snapshotting per-server files (${gto.perServerFiles.join(', ')})...`;
+        await interaction.edit(progressLog);
+        const perServerSnapshots = {};
+        try {
+            for (const sid of allServerIds) {
+                perServerSnapshots[sid] = {};
+                for (const file of gto.perServerFiles) {
+                    const content = await pterodactyl.getFileContents(sid, file);
+                    if (content === null) continue;
+                    perServerSnapshots[sid][file] = content;
+                    const snapshotPath = `./vault/${pack.tag}/per-server/${sid}/${file}`;
+                    fs.mkdirSync(path.dirname(snapshotPath), {
+                        recursive: true
+                    });
+                    fs.writeFileSync(snapshotPath, content);
+                }
+            }
+        } catch (error) {
+            sessionLogger.error('UpdateManager', 'Per-server snapshot failed:', error.message);
+            progressLog += `\n\n**Aborting: failed to snapshot per-server files (${error.message}). Server files are untouched, starting instances back up.**`;
+            await interaction.edit(progressLog);
+            for (const sid of allServerIds) await pterodactyl.sendPowerAction(sid, "start");
+            return;
+        }
+
+        progressLog += ` Done!\n- Compressing and downloading current server files...`;
+        await interaction.edit(progressLog);
+        const primaryId = allServerIds[0];
+        const compress = await pterodactyl.compressFile(primaryId, toCompressList);
+
+        const downloadLink = await pterodactyl.getDownloadLink(primaryId, compress);
+        await download(downloadLink, `./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`);
+
+        await sleep(1000);
+        await pterodactyl.deleteFile(primaryId, [compress]);
+
+        progressLog += ` Done!\n- Unpacking current server files...`;
+        await interaction.edit(progressLog);
+        await unpack(`./vault/${pack.tag}/${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`, `./${pack.tag}/compare/main`);
+
+        progressLog += ` Done!\n- Comparing changes...`;
+        await interaction.edit(progressLog);
+        // Compare old reference pack with new reference pack
+        const changeList = await comparator.compare(`./${pack.tag}/compare/old`, `./${pack.tag}/compare/new`);
+        // Compare current server files with old reference pack to find customizations
+        const customChanges = await comparator.findCustomChanges(`./${pack.tag}/compare/main`, `./${pack.tag}/compare/old`);
+
+        progressLog += ` Done!\n- **Custom files**: ${customChanges.customFiles.length}, **Missing files**: ${customChanges.missingFiles.length}, **Edited files**: ${customChanges.editedFiles.length}`;
+        progressLog += `\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
+        // Identify standard files that would overwrite user edits (entries are "/path/file" strings)
+        const overWrites = customChanges.editedFiles.filter(file => changeList.additions.includes(file));
+
+        let printOverWrite = " ";
+        for (let f of overWrites) {
+            printOverWrite += `\n - ${f}`;
+        }
+
+        if (printOverWrite.length > 700) {
+            progressLog += `\n- **Potential Overwrites (Check Merge)**: ${overWrites.length} files: Too many to list.`;
+        } else {
+            progressLog += `\n- **Potential Overwrites (Check Merge)**: ${overWrites.length} files: ${printOverWrite}`;
+        }
+        await interaction.edit(progressLog);
+
+        // Helper function to get full relative path from various possible inputs
+        function getPathFromEntry(entry) {
+            if (typeof entry === 'string') {
+                return entry.startsWith('/') ? entry.substring(1) : entry;
+            } else if (typeof entry === 'object' && entry !== null) {
+                const objPath = entry.path;
+                const objName = entry.name || entry.name1 || entry.name2;
+
+                if (typeof objPath === 'string' && typeof objName === 'string') {
+                    let fullPath = objPath.endsWith('/') ? objPath + objName : objPath + '/' + objName;
+                    fullPath = fullPath.replace(/\/+/g, '/');
+                    return fullPath.startsWith('/') ? fullPath.substring(1) : fullPath;
+                } else if (typeof entry.relativePath === 'string') {
+                    return entry.relativePath.startsWith('/') ? entry.relativePath.substring(1) : entry.relativePath;
+                }
+            }
+            sessionLogger.warn('UpdateManager', 'Could not determine path from entry:', entry);
+            return null;
+        }
+
+        // Filter out excluded files/folders from the standard change list BEFORE merging
+        progressLog += `\n- Filtering excluded files from change list...`;
+        await interaction.edit(progressLog);
+
+        const originalDeletionCount = changeList.deletions.length;
+        const originalAdditionCount = changeList.additions.length;
+
+        const filteredDeletions = changeList.deletions.filter(entry => {
+            const path = getPathFromEntry(entry);
+            return typeof path === 'string' && !gto.isExcluded(path);
+        });
+
+        const filteredAdditions = changeList.additions.filter(entry => {
+            const path = getPathFromEntry(entry);
+            return typeof path === 'string' && !gto.isExcluded(path);
+        });
+
+        const filteredChangeList = {
+            deletions: filteredDeletions,
+            additions: filteredAdditions
+        };
+
+        progressLog += ` Done! Filtered ${originalDeletionCount - filteredDeletions.length} deletions and ${originalAdditionCount - filteredAdditions.length} additions.`;
+        await interaction.edit(progressLog);
+
+        progressLog += `\n- Merging non-excluded changes...`;
+        await interaction.edit(progressLog);
+        await merger.merge(`./${pack.tag}`, filteredChangeList);
+
+        progressLog += ` Done!\n- Compressing merged server pack (preserving excluded files)...`;
+        await interaction.edit(progressLog);
+        const zipName = `update_${pack.tag}_${newestVersion}.zip`;
+        const zipPath = `${pack.tag}/${zipName}`;
+        await compressDirectory(`${pack.tag}/compare/main`, zipPath);
+        progressLog += ` Done!\n- Uploading and deploying to ${allServerIds.length > 1 ? `${allServerIds.length} instances` : 'the server'}...`;
+        await interaction.edit(progressLog);
+
+        // DANGER ZONE - LINES BELOW MODIFY THE SERVER FILES ON LIVE BRANCH
+
+        const filteredDeleteList = toCompressList.filter(item => {
+            // Don't delete excluded folders or files
+            return !gto.isExcluded(item);
+        });
+
+        const failedRestores = [];
+        for (const sid of allServerIds) {
+            const uploadUrl = await pterodactyl.getUploadLink(sid);
+            await upload(zipPath, uploadUrl);
+            await pterodactyl.deleteFile(sid, filteredDeleteList);
+            await sleep(1000);
+            await pterodactyl.decompressFile(sid, zipName);
+            await sleep(1000);
+            await pterodactyl.deleteFile(sid, [zipName]);
+
+            // Write this instance's own per-server files back over the primary's copies
+            try {
+                for (const [file, content] of Object.entries(perServerSnapshots[sid])) {
+                    await pterodactyl.writeFile(sid, file, content);
+                }
+            } catch (error) {
+                sessionLogger.error('UpdateManager', `Per-server restore failed on ${sid}:`, error.message);
+                failedRestores.push(sid);
+            }
+        }
+
+        // DANGER ZONE - LINES ABOVE MODIFY THE SERVER FILES ON LIVE BRANCH
+
+        progressLog += ` Done!\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
+        await interaction.edit(progressLog);
+        // An instance that lost its per-server files must not boot with the primary's
+        // identity (wrong difficulty/port) - leave it stopped for manual fixup.
+        for (const sid of allServerIds) {
+            if (!failedRestores.includes(sid)) await pterodactyl.sendPowerAction(sid, "start");
+        }
+
+        if (failedRestores.length > 0) {
+            progressLog += `\n\n**WARNING: failed to write per-server files back on: ${failedRestores.join(', ')}. These instances were NOT started. Apply the snapshots from ./vault/${pack.tag}/per-server/ manually, then start them.**`;
+            await interaction.edit(progressLog);
+        }
+
+        progressLog += ` Done!\n- Update sequence completed. Cleaning up...`;
+        await interaction.edit(progressLog);
+        rmRecursive(`./${pack.tag}`); // Clean up temp directory
+
+        progressLog += ` Done!\n- Updating data and sending update message...`;
+        await interaction.edit(progressLog);
+        await yggdrasil.updateServer(pack.tag, {
+            modpack_version: newestVersion,
+            requiresUpdate: false
+        });
+
+        const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
+            .replace("[NEWVERSION]", newestVersion)
+            .replace("[OLDVERSION]", currentVersion)
+            .replace("[CHANGELOGURL]", newRelease.htmlUrl)
+            .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
+            .replace("[SUMMARY]", "Check the GitHub release for detailed changes.");
+
+        const updateWebhook = {
+            content: updateMessageContent,
+            username: `${pack.name} Updater`,
+            avatarURL: "",
+        };
+
+        if (active) {
+            await sendWebhook(announcementChannelId, updateWebhook);
+        }
+
+        progressLog += ` Done!\n\n**Update completed successfully!** The server **${pack.name}** is now running GTO version **${newestVersion}**.`;
+        await interaction.edit(progressLog);
+    },
 };

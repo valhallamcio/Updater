@@ -392,6 +392,61 @@ module.exports = {
     },
 
     /**
+     * Reads the raw contents of a file on the server.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @param {string} filePath Path to the file on the server.
+     * @returns {Buffer|null} File contents, or null if the file does not exist.
+     */
+    getFileContents: async function (serverID, filePath) {
+        apiCallTracker.track('files/contents', getCaller());
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/contents?file=${encodeURIComponent(filePath)}`, {
+                    headers: header,
+                    responseType: 'arraybuffer',
+                    timeout: 30000
+                });
+                return Buffer.from(response.data);
+            } catch (error) {
+                if (error.response && error.response.status === 404) {
+                    return null;
+                }
+                sessionLogger.error('Pterodactyl', `Failed to read ${filePath} on ${serverID} (attempt ${attempt}/${maxRetries}):`, error.response?.status || error.message);
+                if (attempt === maxRetries) throw error;
+                await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+            }
+        }
+    },
+
+    /**
+     * Writes raw contents to a file on the server, creating or overwriting it.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @param {string} filePath Path to the file on the server.
+     * @param {Buffer|string} content Contents to write.
+     */
+    writeFile: async function (serverID, filePath, content) {
+        apiCallTracker.track('files/write', getCaller());
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/write?file=${encodeURIComponent(filePath)}`, content, {
+                    headers: {
+                        ...header,
+                        "Content-Type": "text/plain"
+                    },
+                    timeout: 30000
+                });
+                return;
+            } catch (error) {
+                sessionLogger.error('Pterodactyl', `Failed to write ${filePath} on ${serverID} (attempt ${attempt}/${maxRetries}):`, error.response?.status || error.message);
+                if (attempt === maxRetries) throw error;
+                await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+            }
+        }
+    },
+
+    /**
      * Sends a request to rename the specified file on the server.
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {string} path Path to the file to rename on the server.

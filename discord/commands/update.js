@@ -30,23 +30,49 @@ module.exports = {
         .addStringOption(option =>
             option.setName('version')
                 .setDescription('Manual overwrite for the version number')
-                .setRequired(false)),
+                .setRequired(false)
+                .setAutocomplete(true)),
 
 	async autocomplete(interaction) {
-		const focusedValue = interaction.options.getFocused().toLowerCase();
+        const focused = interaction.options.getFocused(true);
         const serverList = await yggdrasil.getServers();
+
+        // GTO has no update polling, so offer its release tags for the version option
+        if (focused.name === 'version') {
+            const query = interaction.options.getString('server');
+            const server = serverList.find(s => s.name === query || s.tag === query?.toLowerCase());
+            if (!server || server.platform !== 'gregtechodyssey') {
+                await interaction.respond([]);
+                return;
+            }
+            try {
+                const gto = require('../../modules/gregtechodyssey');
+                const releases = await gto.getAllReleases();
+                const tags = releases.map(r => r.tag_name)
+                    .filter(t => t.toLowerCase().includes(focused.value.toLowerCase()))
+                    .slice(0, 25)
+                    .map(t => ({ name: t, value: t }));
+                await interaction.respond(tags);
+            } catch (error) {
+                await interaction.respond([]);
+            }
+            return;
+        }
+
+        const focusedValue = focused.value.toLowerCase();
 		const choices = [];
 		const seen = new Set();
 
         for (const server of serverList) {
-            if (server.requiresUpdate === true && !seen.has(server.tag)) {
+            // gregtechodyssey is never flagged by the update poller - always offer it
+            if ((server.requiresUpdate === true || server.platform === 'gregtechodyssey') && !seen.has(server.tag)) {
                 seen.add(server.tag);
                 choices.push({ name: `${server.tag.toUpperCase()} | ${server.name}`, value: server.tag });
             }
         }
 
 		const filtered = choices.filter(c => c.name.toLowerCase().includes(focusedValue) || c.value.includes(focusedValue));
-		await interaction.respond(filtered);
+		await interaction.respond(filtered.slice(0, 25));
 	},
 
     async execute(interaction) {
@@ -59,7 +85,8 @@ module.exports = {
         const message = await interaction.fetchReply();
 
         const server = serverList.find(s => s.name === query || s.tag === query.toLowerCase());
-        if (!server || server.requiresUpdate === false) {
+        // gregtechodyssey is never flagged by the update poller - updates are on-demand
+        if (!server || (server.requiresUpdate === false && server.platform !== 'gregtechodyssey')) {
             await message.edit(`Server **${query}** not found or doesn't need an update!`);
             return;
         }
@@ -81,6 +108,9 @@ module.exports = {
                 break;
             case "gregtechnewhorizons":
                 await updater.updateGTNH(server, versionOverride, message, serverIds);
+                break;
+            case "gregtechodyssey":
+                await updater.updateGTO(server, versionOverride, message, serverIds);
                 break;
             default:
                 await message.edit('Platform not supported!');

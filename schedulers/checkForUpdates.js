@@ -49,7 +49,7 @@ module.exports = {
         let numberOfUpdates = 0;
 
         for (let server of servers) {
-            if (server.platform === "github") continue;
+            if (server.platform === "github" || server.platform === "gregtechodyssey") continue;
 
             let newestUpdateId = 0;
             let updateRequired = false;
