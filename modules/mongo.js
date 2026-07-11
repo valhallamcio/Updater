@@ -23,6 +23,9 @@ const mongoClient = new MongoClient(process.env.MONGODB_URL);
 
 let mainClientConnected = false;
 
+// bifrost.logs starts here; anything older lives only in valhallamc.logs (the archive)
+const ARCHIVE_CUTOFF = new Date('2026-03-01T00:00:00Z');
+
 module.exports = {
 
     /**
@@ -544,6 +547,229 @@ module.exports = {
             .findOne({ uuid: binaryUuid });
 
         return player;
+    },
+
+    // =========================================================================
+    // INVESTIGATION FUNCTIONS (for /investigate — see docs/investigate-plan.md)
+    // =========================================================================
+
+    /**
+     * Gets a player's activity rows (chat/command/connect/disconnect/server_change)
+     * from bifrost.logs, plus valhallamc.logs (the pre-2026-03 archive) when the
+     * range reaches back that far. Merged and sorted ascending by timestamp.
+     * @param {string} username Exact username (autocomplete gives canonical casing).
+     * @param {Date} from Range start.
+     * @param {Date} to Range end.
+     * @param {object} [opts] { limit } max rows per store (default 20000).
+     * @returns {Promise<object[]>} Log rows, oldest first.
+     */
+    getPlayerActivity: async function (username, from, to, opts = {}) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const limit = opts.limit || 20000;
+        const rows = await mongoClient
+            .db('bifrost')
+            .collection('logs')
+            .find({ username: username, timestamp: { $gte: from, $lte: to } })
+            .sort({ timestamp: 1 })
+            .limit(limit)
+            .toArray();
+
+        // valhallamc.logs holds the only chat before bifrost.logs starts (2026-03-01).
+        // Cap the archive query at that cutoff so the March 2026 overlap isn't duplicated.
+        if (from < ARCHIVE_CUTOFF) {
+            const archiveTo = to < ARCHIVE_CUTOFF ? to : ARCHIVE_CUTOFF;
+            const archiveRows = await mongoClient
+                .db('valhallamc')
+                .collection('logs')
+                .find({ username: username, timestamp: { $gte: from, $lt: archiveTo } })
+                .sort({ timestamp: 1 })
+                .limit(limit)
+                .toArray();
+            rows.push(...archiveRows);
+            rows.sort((a, b) => a.timestamp - b.timestamp);
+        }
+
+        return rows;
+    },
+
+    /**
+     * Gets everyone's chat/command/server_change rows on a server in a window —
+     * the room context around a dispute. Keyed on server_name (the DISPLAY name,
+     * e.g. "GT New Horizons", not the tag). Same archive handling as
+     * getPlayerActivity. NOTE: needs the {server_name, timestamp} index or this
+     * collection-scans.
+     * @param {string} serverName Server display name as stored in logs.
+     * @param {Date} from Range start.
+     * @param {Date} to Range end.
+     * @param {object} [opts] { limit } max rows per store (default 5000).
+     * @returns {Promise<object[]>} Log rows, oldest first.
+     */
+    getRoomContext: async function (serverName, from, to, opts = {}) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const limit = opts.limit || 5000;
+        const rows = await mongoClient
+            .db('bifrost')
+            .collection('logs')
+            .find({ server_name: serverName, timestamp: { $gte: from, $lte: to } })
+            .sort({ timestamp: 1 })
+            .limit(limit)
+            .toArray();
+
+        if (from < ARCHIVE_CUTOFF) {
+            const archiveTo = to < ARCHIVE_CUTOFF ? to : ARCHIVE_CUTOFF;
+            const archiveRows = await mongoClient
+                .db('valhallamc')
+                .collection('logs')
+                .find({ server_name: serverName, timestamp: { $gte: from, $lt: archiveTo } })
+                .sort({ timestamp: 1 })
+                .limit(limit)
+                .toArray();
+            rows.push(...archiveRows);
+            rows.sort((a, b) => a.timestamp - b.timestamp);
+        }
+
+        return rows;
+    },
+
+    /**
+     * Gets a player's sessions (join/leave + IP + server tag) overlapping a window.
+     * Overlap test, not containment — a session spanning the whole window still counts.
+     * @param {string} username Exact username.
+     * @param {Date} from Range start.
+     * @param {Date} to Range end.
+     * @returns {Promise<object[]>} yggdrasil.player_sessions docs, oldest first.
+     */
+    getPlayerSessions: async function (username, from, to) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('yggdrasil')
+            .collection('player_sessions')
+            .find({
+                username: username,
+                joinedAt: { $lte: to },
+                $or: [{ leftAt: null }, { leftAt: { $gte: from } }]
+            })
+            .sort({ joinedAt: 1 })
+            .toArray();
+    },
+
+    /**
+     * Gets a player's punishments from both the live and old backends.
+     * @param {string} username Target name (case-insensitive).
+     * @returns {Promise<object[]>} Punishment docs, newest first.
+     */
+    getPlayerPunishments: async function (username) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const escaped = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const filter = { target_name: { $regex: `^${escaped}$`, $options: 'i' } };
+        const [live, old] = await Promise.all([
+            mongoClient.db('bifrost').collection('punishments').find(filter).toArray(),
+            mongoClient.db('valhallamc').collection('punishments').find(filter).toArray()
+        ]);
+        return [...live, ...old].sort((a, b) => (b.date || 0) - (a.date || 0));
+    },
+
+    /**
+     * Gets a player's identity doc from bifrost.players (the live, biggest store).
+     * @param {string} username Username (case-insensitive).
+     * @returns {Promise<object|null>} Player doc or null.
+     */
+    getPlayerIdentity: async function (username) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const escaped = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .findOne({ username: { $regex: `^${escaped}$`, $options: 'i' } });
+    },
+
+    /**
+     * Finds accounts sharing IPs with a player. Collects the player's IPs from
+     * player_sessions.ip and bifrost.logs.ip_address (stripping the leading '/'
+     * and ':port'), then reverse-looks-up other usernames on those IPs.
+     * The deep pass regex-scans bifrost.logs (no ip index) — slower, so it's
+     * opt-in; the fast pass only uses player_sessions.
+     * @param {string} username Exact username.
+     * @param {object} [opts] { deep } also reverse-search bifrost.logs (default false).
+     * @returns {Promise<{ips: string[], alts: object[]}>} IPs + accounts seen on them.
+     */
+    findAlts: async function (username, opts = {}) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const cleanIp = raw => {
+            if (!raw) return null;
+            const m = String(raw).match(/^\/?([0-9a-fA-F.:]+?)(?::\d+)?$/);
+            return m ? m[1] : null;
+        };
+
+        const [sessionIps, logIps] = await Promise.all([
+            mongoClient.db('yggdrasil').collection('player_sessions')
+                .distinct('ip', { username: username }),
+            mongoClient.db('bifrost').collection('logs')
+                .distinct('ip_address', { username: username, ip_address: { $exists: true, $ne: null } })
+        ]);
+
+        const ips = new Set();
+        for (const ip of sessionIps) if (ip) ips.add(ip);
+        for (const raw of logIps) { const ip = cleanIp(raw); if (ip) ips.add(ip); }
+        // cap so a heavy-roamer can't build a monster $or
+        const ipArr = [...ips].slice(0, 50);
+        if (ipArr.length === 0) return { ips: [], alts: [] };
+
+        const byUser = new Map();
+        const addHit = (name, ip, lastSeen) => {
+            if (!name || name === username) return;
+            let e = byUser.get(name);
+            if (!e) { e = { username: name, ips: new Set(), lastSeen: null }; byUser.set(name, e); }
+            if (ip) e.ips.add(ip);
+            if (lastSeen && (!e.lastSeen || lastSeen > e.lastSeen)) e.lastSeen = lastSeen;
+        };
+
+        const sessionHits = await mongoClient.db('yggdrasil').collection('player_sessions')
+            .aggregate([
+                { $match: { ip: { $in: ipArr }, username: { $ne: username } } },
+                { $group: { _id: '$username', ips: { $addToSet: '$ip' }, lastSeen: { $max: '$joinedAt' } } }
+            ]).toArray();
+        for (const h of sessionHits) for (const ip of h.ips) addHit(h._id, ip, h.lastSeen);
+
+        if (opts.deep) {
+            const escapeRegex = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const orClauses = ipArr.map(ip => ({ ip_address: { $regex: `^/${escapeRegex(ip)}:` } }));
+            const logHits = await mongoClient.db('bifrost').collection('logs')
+                .aggregate([
+                    { $match: { username: { $ne: username }, $or: orClauses } },
+                    { $group: { _id: '$username', rawIps: { $addToSet: '$ip_address' }, lastSeen: { $max: '$timestamp' } } }
+                ]).toArray();
+            for (const h of logHits) for (const raw of h.rawIps) addHit(h._id, cleanIp(raw), h.lastSeen);
+        }
+
+        const alts = [...byUser.values()]
+            .map(e => ({ username: e.username, ips: [...e.ips], lastSeen: e.lastSeen }))
+            .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+        return { ips: ipArr, alts: alts };
     },
 
     /**
