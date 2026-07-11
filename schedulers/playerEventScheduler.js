@@ -212,8 +212,9 @@ module.exports = {
             const { getClient } = require('../discord/bot');
             const client = await getClient();
             const channel = await client.channels.fetch(trigger.discord.channelId);
+            // field NAME caps at 256 chars — 200 leaves room for the backticks + status suffix
             const fields = results.slice(0, 25).map(r => ({
-                name: `\`${r.command.slice(0, 250)}\` — ${r.via === 'link' ? `🔗 ${r.state}` : '📟 sent (console)'}`,
+                name: `\`${r.command.slice(0, 200)}\` — ${r.via === 'link' ? `🔗 ${r.state}` : '📟 sent (console)'}`,
                 value: r.output ? `\`\`\`\n${r.output.slice(0, 1000)}\n\`\`\`` : '*no output*'
             }));
             await channel.send({
