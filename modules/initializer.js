@@ -80,6 +80,9 @@ function generateConfigFiles() {
             "mongoDBName": "",
             "mongoDBserversCollection": ""
         },
+        "yggdrasilOps": {
+            "useOpsApi": false
+        },
         "scheduler": {}
     };
 

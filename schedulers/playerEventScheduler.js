@@ -4,11 +4,27 @@ const pterodactyl = require("../modules/pterodactyl");
 const functions = require("../modules/functions");
 const sessionLogger = require("../modules/sessionLogger");
 
+// Triggers currently executing (30s tick vs multi-second awaited ops overlap — a slow
+// execution must not be fired twice by the next tick).
+const inFlight = new Set();
+
 module.exports = {
     name: 'playerEventScheduler',
     defaultConfig: {
         "active": true,
         "interval": 30 // Check every 30 seconds for responsive player events
+    },
+
+    /**
+     * Phase 9 feature flag (rollback lever = flip to false, no redeploy of anything else).
+     * Read lazily so tests can stub it; absent section = OFF (prod config predates it).
+     */
+    opsConfig: function () {
+        try {
+            return require("../config/config.json").yggdrasilOps ?? { useOpsApi: false };
+        } catch (err) {
+            return { useOpsApi: false };
+        }
     },
 
     /**
@@ -115,26 +131,101 @@ module.exports = {
      * @param {string} serverName Server where player was found
      */
     executePlayerTrigger: async function (trigger, serverName) {
+        const key = String(trigger._id);
+        if (inFlight.has(key)) return; // still executing from a previous tick
+        inFlight.add(key);
         try {
             const servers = await yggdrasil.getServers();
             const server = servers.find(s => s.tag === serverName || s.name.trim() === serverName.trim());
-            
+
             if (!server) return;
-            
-            // Execute each command
-            for (const command of trigger.commands) {
-                sessionLogger.info('PlayerEventScheduler', `Player trigger: '${command}' executed for ${trigger.playerId} on ${server.tag}`);
-                await pterodactyl.sendCommand(server.serverId, command);
-                await functions.sleep(1000); // 1 second delay between commands
-            }
-            
+
+            const results = await this.runCommands(trigger, server);
+            await this.reportResults(trigger, server, results);
+
             // Mark trigger as executed (if it's one-time)
             if (trigger.oneTime) {
                 await mongo.deactivateScheduleJob(trigger._id);
             }
-            
+
         } catch (error) {
             sessionLogger.error('PlayerEventScheduler', 'Error executing player trigger:', error.message);
+        } finally {
+            inFlight.delete(key);
+        }
+    },
+
+    /**
+     * Run the trigger's commands — via link ops (captured output, completion-gated ordering)
+     * when useOpsApi is on and the server is linked, else the classic Pterodactyl console path.
+     *
+     * Error split (double-execution hazard): an op that FAILED still RAN on the backend, so it
+     * is only reported, never re-run via ptero. Only transport-level trouble (no link session,
+     * createOp/timeout throw) falls back — and then the REMAINING commands all go via ptero.
+     */
+    runCommands: async function (trigger, server) {
+        const results = [];
+        let viaOps = false;
+        if (this.opsConfig().useOpsApi) {
+            try {
+                viaOps = !!(await yggdrasil.getLinkSession(server.tag));
+            } catch (err) {
+                viaOps = false;
+            }
+        }
+
+        for (let i = 0; i < trigger.commands.length; i++) {
+            const command = trigger.commands[i];
+            if (viaOps) {
+                try {
+                    const doc = await yggdrasil.runOp(server.tag, {
+                        type: 'run_command',
+                        params: { command }
+                    }, 15000);
+                    const output = doc.result?.data?.output ?? doc.result?.error ?? '';
+                    sessionLogger.info('PlayerEventScheduler', `Player trigger (op ${doc.state}): '${command}' for ${trigger.playerId} on ${server.tag}`);
+                    results.push({ command, via: 'link', state: doc.state, output: String(output) });
+                    continue; // op failed = command RAN and errored — report only, no ptero re-run
+                } catch (err) {
+                    // transport failure — this command did NOT run; fall back for it + the rest
+                    sessionLogger.warn('PlayerEventScheduler', `Ops path failed (${err.message}) — falling back to Pterodactyl for the remaining commands`);
+                    viaOps = false;
+                }
+            }
+            sessionLogger.info('PlayerEventScheduler', `Player trigger: '${command}' executed for ${trigger.playerId} on ${server.tag}`);
+            await pterodactyl.sendCommand(server.serverId, command);
+            await functions.sleep(1000); // 1 second delay between commands
+            results.push({ command, via: 'pterodactyl', state: 'sent', output: '' });
+        }
+        return results;
+    },
+
+    /**
+     * Post a result embed to the channel the trigger was created in (best-effort — jobs made
+     * before phase 9 have no discord context, and an embed failure must never block oneTime
+     * deactivation).
+     */
+    reportResults: async function (trigger, server, results) {
+        if (!trigger.discord?.channelId) return;
+        if (!results.some(r => r.via === 'link')) return; // classic path stays silent, as it always was
+        try {
+            const { getClient } = require('../discord/bot');
+            const client = await getClient();
+            const channel = await client.channels.fetch(trigger.discord.channelId);
+            const fields = results.slice(0, 25).map(r => ({
+                name: `\`${r.command.slice(0, 250)}\` — ${r.via === 'link' ? `🔗 ${r.state}` : '📟 sent (console)'}`,
+                value: r.output ? `\`\`\`\n${r.output.slice(0, 1000)}\n\`\`\`` : '*no output*'
+            }));
+            await channel.send({
+                embeds: [{
+                    title: `Player trigger fired: ${trigger.playerId} on ${server.tag}`,
+                    color: results.some(r => r.state === 'failed') ? 0xe67e22 : 0x2ecc71,
+                    fields,
+                    timestamp: new Date().toISOString()
+                }]
+            });
+        } catch (error) {
+            sessionLogger.warn('PlayerEventScheduler', 'Result report failed (non-fatal):', error.message);
         }
     }
 };

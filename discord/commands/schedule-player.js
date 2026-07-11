@@ -195,7 +195,13 @@ module.exports = {
             onJoin: onJoin,
             createdBy: interaction.user.id,
             active: true,
-            lastSeenServers: [] // Track where player was last seen for join detection
+            lastSeenServers: [], // Track where player was last seen for join detection
+            // Where to report results when the trigger fires via the ops link (phase 9).
+            // Old jobs without this still run — they just skip the report.
+            discord: {
+                channelId: interaction.channelId,
+                guildId: interaction.guildId
+            }
         };
         
         const result = await mongo.createScheduleJob(triggerData);
