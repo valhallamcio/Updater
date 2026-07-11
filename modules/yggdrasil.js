@@ -137,7 +137,10 @@ async function searchQuests(server, search, limit = 10) {
  */
 async function searchItems(server, search, limit = 25) {
     const response = await client.get(`/biforesting/${server}/items`, {
-        params: search ? { search, limit } : { limit }
+        params: search ? { search, limit } : { limit },
+        // Discord autocomplete must answer within 3s — the default 15s timeout meant a slow
+        // yggdrasil expired the interaction token and autocomplete died instead of degrading.
+        timeout: 2500
     });
     return response.data.data;
 }

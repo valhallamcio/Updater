@@ -39,6 +39,8 @@ function opOutcomeEmbed(title, doc) {
 async function runQuestOp(interaction, server, type, player, questId, timeoutMs = 20000) {
     const op = { type, target: { name: player }, params: {} };
     if (questId) op.params.questId = questId;
+    // dangerous tier needs the server-side confirm flag — the Discord button already confirmed
+    if (type === 'quest_reset') op.flags = { confirm: true };
     try {
         return await yggdrasil.runOp(server, op, timeoutMs);
     } catch (err) {

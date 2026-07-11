@@ -146,7 +146,9 @@ module.exports = {
             created = await yggdrasil.createOp(server, {
                 type: 'account_reset',
                 params,
-                target: { name: player }
+                target: { name: player },
+                // dangerous tier needs the server-side confirm flag — the type-the-name modal confirmed
+                flags: { confirm: true }
             });
         } catch (err) {
             sessionLogger.error('AccountReset', 'create failed:', err.message);

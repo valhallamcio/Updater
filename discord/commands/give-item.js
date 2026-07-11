@@ -93,8 +93,6 @@ module.exports = {
                         .setTitle(`Gave ${res?.given ?? '?'}× ${params.id} to ${res?.player ?? player}`)
                         .setDescription(res?.full ? '⚠️ Inventory filled up — gave a partial amount.' : null)]
                 });
-            } else if (doc.state === 'waiting_player') {
-                await interaction.editReply(`📬 **${player}** is offline — queued, delivers on their next login (op \`${doc._id}\`).`);
             } else {
                 await interaction.editReply(`Give ${doc.state}: ${doc.result?.error ?? 'see /ops'}`);
             }
