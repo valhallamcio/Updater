@@ -2,6 +2,31 @@
 
 Valhalla Updater is a comprehensive Minecraft server management platform built for the [ValhallaMC Network](https://dc.valhallamc.io/). What started as a simple modpack update tool has evolved into a full-featured automation suite handling everything from modpack updates and server reboots to player statistics and real-time monitoring — all managed through Discord.
 
+## 🚨 P0 TODO: preserve per-instance files during multi-instance updates
+
+**Do not update a multi-instance pack such as IL2 until this is fixed or its instance-specific files have been saved manually.**
+
+The CurseForge and FTB update paths build one merged archive from the primary instance, then deploy that same archive to every server sharing the pack tag. This overwrites settings that must remain different between instances. It previously gave both IL2 Public and IL2 Supporter the same AdvancedBackups destination, causing both JVMs to write into one manifest and incremental chain on the shared backup mount.
+
+Known IL2 files that must be preserved independently include:
+
+- `config/AdvancedBackups.properties` (backup path and schedule)
+- `server.properties` (ports, watchdog timeout, and other instance settings)
+- `ops.json`, `whitelist.json`, `banned-ips.json`, and `banned-players.json`
+
+Required fix:
+
+1. Maintain a per-pack allowlist of instance-specific files.
+2. After stopping every instance, snapshot each instance's own copies before any destructive deployment.
+3. Abort and restart the untouched instances if any required snapshot fails.
+4. Deploy the common merged pack.
+5. Restore each instance's own files before starting it.
+6. Leave an instance stopped and report loudly if its restore fails.
+7. Persist snapshots under `vault/<tag>/per-server/<serverId>/` so `/restore` also reapplies them.
+8. Add tests proving two instances retain different backup paths and ports after update and restore.
+
+GTO already implements most of this snapshot/restore pattern in `updateGTO()`. Generalize that mechanism for CurseForge and FTB rather than adding another IL2-only deployment path.
+
 ## Features
 
 ### Modpack Management
