@@ -14,8 +14,43 @@ const unpacker = require("unpacker-with-progress");
 const progress = require('progress');
 const path = require('path');
 const fs = require('fs');
+const zlib = require('zlib');
+const {
+    Writable
+} = require('stream');
+const {
+    pipeline
+} = require('stream/promises');
+const sessionLogger = require('./sessionLogger');
 
 module.exports = {
+
+    /**
+     * Reads a .tar.gz end to end to prove it is complete.
+     *
+     * Size checks cannot tell a truncated archive from a small one, and the only other
+     * thing that finds out is the unpack itself - by which point /restore has already
+     * wiped the instance. Costs a full read of the file and no disk.
+     * @param {string} archivePath Path to the archive.
+     * @returns {boolean} Whether the whole gzip stream decompresses.
+     */
+    verify: async function (archivePath) {
+        try {
+            await pipeline(
+                fs.createReadStream(archivePath),
+                zlib.createGunzip(),
+                new Writable({
+                    write(chunk, encoding, callback) {
+                        callback();
+                    }
+                })
+            );
+            return true;
+        } catch (error) {
+            sessionLogger.warn('Unpacker', `${archivePath} did not decompress cleanly: ${error.message}`);
+            return false;
+        }
+    },
 
     /**
      * Unpacks a tar.gz file into the specified destination path.

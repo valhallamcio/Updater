@@ -2,30 +2,46 @@
 
 Valhalla Updater is a comprehensive Minecraft server management platform built for the [ValhallaMC Network](https://dc.valhallamc.io/). What started as a simple modpack update tool has evolved into a full-featured automation suite handling everything from modpack updates and server reboots to player statistics and real-time monitoring — all managed through Discord.
 
-## 🚨 P0 TODO: preserve per-instance files during multi-instance updates
+## Multi-instance packs
 
-**Do not update a multi-instance pack such as IL2 until this is fixed or its instance-specific files have been saved manually.**
+Several packs are served by more than one Pterodactyl instance sharing a single mongo tag —
+`il2`, `pri`, `mg2` and `gto`. Those instances legitimately differ: ports, AdvancedBackups
+destination, prometheus metrics port, admin-added scripts.
 
-The CurseForge and FTB update paths build one merged archive from the primary instance, then deploy that same archive to every server sharing the pack tag. This overwrites settings that must remain different between instances. It previously gave both IL2 Public and IL2 Supporter the same AdvancedBackups destination, causing both JVMs to write into one manifest and incremental chain on the shared backup mount.
+Updates handle this by treating each instance as its own server. The reference packs are
+downloaded once, then **every instance is backed up, three-way merged and deployed from its
+own files** — one instance's files never enter another's merge, so instance-specific state
+survives without anyone having to enumerate it.
 
-Known IL2 files that must be preserved independently include:
+Update sequence for a multi-instance tag:
 
-- `config/AdvancedBackups.properties` (backup path and schedule)
-- `server.properties` (ports, watchdog timeout, and other instance settings)
-- `ops.json`, `whitelist.json`, `banned-ips.json`, and `banned-players.json`
+1. Download the old and new reference packs (once, shared by all instances).
+2. Stop every instance.
+3. **Phase A** — archive each instance to `vault/<tag>/instances/<serverId>/` and snapshot its
+   identity files to `vault/<tag>/per-server/<serverId>/`. If any of this fails the update
+   aborts and restarts every instance with their files untouched.
+4. **Phase B** — for each instance in turn: unpack its own archive, apply the pack's changes,
+   lay its identity files back over the result, then upload and deploy. The upload is verified
+   on the panel before anything is deleted.
+5. Start the instances that succeeded; leave any that failed stopped and report them.
+6. Only once every instance succeeded, update the database and send the announcement — so a
+   partial failure leaves `requiresUpdate` set and the whole tag can simply be re-run.
+7. Report a content-hashed diff of what still differs between instances.
 
-Required fix:
+On top of that, `modules/perInstanceFiles.js` force-protects the files that must never be taken
+from the pack itself even when the pack ships a new copy:
 
-1. Maintain a per-pack allowlist of instance-specific files.
-2. After stopping every instance, snapshot each instance's own copies before any destructive deployment.
-3. Abort and restart the untouched instances if any required snapshot fails.
-4. Deploy the common merged pack.
-5. Restore each instance's own files before starting it.
-6. Leave an instance stopped and report loudly if its restore fails.
-7. Persist snapshots under `vault/<tag>/per-server/<serverId>/` so `/restore` also reapplies them.
-8. Add tests proving two instances retain different backup paths and ports after update and restore.
+- `server.properties` (ports, watchdog timeout)
+- `config/AdvancedBackups.properties` (backup destination and schedule — a shared path corrupts
+  the incremental chain for every instance writing into it)
+- `config/prometheus_exporter-server.toml` (metrics `listen_port` — a shared port means one JVM
+  fails to bind)
 
-GTO already implements most of this snapshot/restore pattern in `updateGTO()`. Generalize that mechanism for CurseForge and FTB rather than adding another IL2-only deployment path.
+GTO adds `config/gtocore.yaml` for its Normal/Expert difficulty split. Per-tag additions can go
+under `multiInstance.protectedFiles` in `config/config.json`.
+
+`/restore` follows the same rule: each instance goes back to its own archive where one exists,
+falling back to a legacy shared archive with the per-server snapshot laid over the top.
 
 ## Features
 

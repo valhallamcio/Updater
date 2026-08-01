@@ -277,6 +277,25 @@ module.exports = {
     },
 
     /**
+     * Lists the contents of a directory on the server.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @param {string} directory Directory to list. Defaults to the root directory.
+     * @returns {Array} Entries as {name, size, is_file, ...}, or an empty array on failure.
+     */
+    listFiles: async function (serverID, directory = "/") {
+        apiCallTracker.track('files/list', getCaller());
+        try {
+            let response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/list?directory=${encodeURIComponent(directory)}`, {
+                headers: header
+            });
+            return response.data.data.map(entry => entry.attributes);
+        } catch (error) {
+            sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
+            return [];
+        }
+    },
+
+    /**
      * Gets the one-time upload link of a file.
      * @param {string} serverID Id of the server on Pterodactyl.
      * @returns URL of the upload link.
@@ -346,25 +365,28 @@ module.exports = {
     },
 
     /**
-     * Sends a request to decompress a file on the server.
+     * Sends a request to decompress a file on the server. The panel extracts synchronously,
+     * so a resolved call means the archive is unpacked.
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {string} fileName Name of the file to decompress.
      * @param {string} filePath Path to the folder containing the file to decompress. Defaults to the root directory.
-     * @returns 
+     * @returns {boolean} Whether the panel accepted and performed the extraction. A success
+     * response body is empty, so the caller cannot tell success from failure by its content -
+     * and updateManager deletes the archive on the strength of this answer.
      */
     decompressFile: async function (serverID, fileName, filePath = "/") {
         apiCallTracker.track('files/decompress', getCaller());
         try {
-            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/decompress`, {
+            await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/decompress`, {
                 root: filePath,
                 file: fileName,
             }, {
                 headers: header
             });
-            //console.log(response);
-            return response.data;
+            return true;
         } catch (error) {
             sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
+            return false;
         }
     },
 
@@ -373,21 +395,23 @@ module.exports = {
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {Array} fileList List of files to delete.
      * @param {string} listPath Path to the folder containing the files to delete. Defaults to the root directory.
-     * @returns 
+     * @returns {boolean} Whether the panel accepted the deletion. Same reason as above: the
+     * success body is empty, and updateManager treats a failed wipe as a reason to abort
+     * before it unpacks anything on top of files that are still there.
      */
     deleteFile: async function (serverID, fileList, filePath = "/") {
         apiCallTracker.track('files/delete', getCaller());
         try {
-            let response = await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/delete`, {
+            await axios.post(`${pterodactylHostName}api/client/servers/${serverID}/files/delete`, {
                 root: filePath,
                 files: fileList,
             }, {
                 headers: header
             });
-            //console.log(response);
-            return response.data;
+            return true;
         } catch (error) {
             sessionLogger.error('Pterodactyl', 'API request failed', error.response?.data || error.message);
+            return false;
         }
     },
 

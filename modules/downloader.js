@@ -58,10 +58,38 @@ module.exports = {
 
         data.pipe(writer);
 
-        await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+        // A half-written file is worse than none: it satisfies every exists/non-zero check
+        // downstream, and for a vault archive that means a truncated backup being kept as
+        // the rollback point while the good copy is diverted to scratch and later deleted.
+        const discardPartial = () => {
+            try {
+                fs.rmSync(destinationPath, {
+                    force: true
+                });
+            } catch (error) {
+                sessionLogger.warn('Downloader', `Could not remove partial ${fileName}: ${error.message}`);
+            }
+        };
+
+        try {
+            await new Promise((resolve, reject) => {
+                writer.on('finish', resolve);
+                writer.on('error', reject);
+                data.on('error', reject);
+            });
+        } catch (error) {
+            discardPartial();
+            throw error;
+        }
+
+        // A connection reset mid-transfer ends the stream cleanly, so 'finish' alone proves
+        // nothing. Skipped when the length is unknown (chunked) or when the body was encoded
+        // in transit, where the declared length is not what lands on disk.
+        const written = fs.statSync(destinationPath).size;
+        if (Number.isFinite(totalLength) && !headers['content-encoding'] && written !== totalLength) {
+            discardPartial();
+            throw new Error(`${fileName} is incomplete: got ${written} of ${totalLength} bytes`);
+        }
 
         sessionLogger.info('Downloader', `${fileName} downloaded successfully`);
     },

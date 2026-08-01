@@ -129,6 +129,13 @@ module.exports = {
                 reject(err);
             });
 
+            // Without this the promise never settles when the destination is unwritable
+            // (missing parent directory, disk full) and the whole update hangs silently
+            output.on('error', function (err) {
+                sessionLogger.error('Compressor', `Failed writing ${outPath}:`, err.message);
+                reject(err);
+            });
+
             archive.on('progress', function (progress) {
                 bar.tick(progress.fs.processedBytes - bar.curr);
             });

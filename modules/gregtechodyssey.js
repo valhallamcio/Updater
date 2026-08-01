@@ -9,6 +9,7 @@
 
 const axios = require('axios');
 const sessionLogger = require('./sessionLogger');
+const perInstanceFiles = require('./perInstanceFiles');
 
 const REPO = 'GregTech-Odyssey/GregTech-Odyssey';
 const SERVER_ASSET = 'GregTech-Odyssey-server.zip';
@@ -33,13 +34,10 @@ function toVersion(release) {
 
 module.exports = {
     /**
-     * Files that legitimately differ between GTO instances (Normal vs Expert difficulty,
-     * ports) and must be snapshotted/restored per server during a multi-instance deploy.
+     * Files that legitimately differ between GTO instances. The network-wide list
+     * (ports, backup destination, metrics port) plus GTO's own difficulty setting.
      */
-    perServerFiles: [
-        'config/gtocore.yaml',
-        'server.properties'
-    ],
+    perServerFiles: perInstanceFiles.forTag('gto', ['config/gtocore.yaml']),
 
     /**
      * Gets all GTO releases from GitHub, newest first. The rolling "nightly" tag is
