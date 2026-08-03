@@ -230,3 +230,36 @@ test('ensureServerStopped: preStopSaveWaitSeconds=0 disables the flush (no extra
     assert.ok(!log.includes('sleep:0') && !log.some(e => e === 'sleep:90000'), 'no flush wait when disabled');
     assert.strictEqual(log[0], 'power:stop', 'goes straight to stop');
 });
+
+/*
+ * Regression (2026-08-03): the updater crashed mid-reboot; wings' crash handler restarted the
+ * process, recoverFromInterruptedReboot marked the run completed in MONGO but never synced the
+ * flag back into this.state.todayStats, so mainLoop re-fired the whole daily batch ~1h later
+ * (a second "Automated Reboot Sequence Started" — 6 servers at 10:04 vs 29 at 09:03). Assert the
+ * recovered stats land in the in-memory state so the !todayStats.rebootCompleted guard blocks the
+ * re-trigger.
+ */
+const mongo = require('../modules/mongo');
+
+test('recoverFromInterruptedReboot arms the in-memory guard after a mid-run restart', async () => {
+    reset();
+    // Simulate initializeTodayStats() having loaded a stale copy into state earlier in start().
+    const stale = { date: '2026-08-03', rebootTriggered: true, rebootCompleted: false, successfulReboots: 15 };
+    rs.state.todayStats = { ...stale };
+
+    const origGet = mongo.getRebootHistory;
+    const origUpd = mongo.updateRebootHistory;
+    let saved = null;
+    mongo.getRebootHistory = async () => ({ ...stale });
+    mongo.updateRebootHistory = async (date, stats) => { saved = stats; };
+
+    try {
+        await rs.recoverFromInterruptedReboot();
+    } finally {
+        Object.assign(mongo, { getRebootHistory: origGet, updateRebootHistory: origUpd });
+    }
+
+    assert.strictEqual(rs.state.todayStats.rebootCompleted, true,
+        'recovered flag must be written back into in-memory state, not just mongo');
+    assert.ok(saved && saved.rebootCompleted === true, 'mongo must receive the recovered completed doc');
+});

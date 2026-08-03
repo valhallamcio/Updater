@@ -356,6 +356,18 @@ module.exports = {
         this.state.todayStats.triggerReason = reason;
         this.state.todayStats.triggerPlayerCount = currentPlayerCount;
         
+        // Fresh per-sequence stats — a re-trigger must not inherit leftovers from an earlier
+        // interrupted run (2026-08-03: stale successfulReboots + recovered note lingered in mongo).
+        // null (not delete) so mongo $set actually overwrites them. rebootCompleted resets so an
+        // interrupted re-trigger is still recognized as incomplete by recovery.
+        this.state.todayStats.rebootCompleted = false;
+        this.state.todayStats.successfulReboots = 0;
+        this.state.todayStats.failedReboots = 0;
+        this.state.todayStats.retryAttempts = {};
+        this.state.todayStats.rebootEndTime = null;
+        this.state.todayStats.totalDuration = null;
+        this.state.todayStats.notes = null;
+        
         // Get all servers that need rebooting
         const servers = await yggdrasil.getServers();
         
@@ -1474,6 +1486,13 @@ module.exports = {
                 todayStats.rebootCompleted = true;
                 todayStats.rebootEndTime = new Date().toISOString();
                 todayStats.notes = 'Recovered from interrupted process on scheduler restart';
+                
+                // ALSO arm the in-memory guard: initializeTodayStats() loads a SEPARATE copy into
+                // this.state.todayStats, so without this a restart mid-run re-fires the whole daily
+                // batch (observed 2026-08-03: 29 servers at 09:03, crash 09:58, re-trigger of 6
+                // servers at 10:04 after "State recovery completed"). Before the save so a failed
+                // mongo write still can't re-fire within this process.
+                this.state.todayStats = todayStats;
                 
                 // Save recovery state
                 await mongo.updateRebootHistory(today, todayStats);

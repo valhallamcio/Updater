@@ -23,7 +23,7 @@
   "main": "server.js",
   "scripts": {
     "test": "node --test --test-force-exit test/*.test.js",
-    "start": "node server.js"
+    "start": "node --report-on-fatalerror --report-directory=crash-logs --report-exclude-env server.js"
   },
   "author": "",
   "license": "MIT"
