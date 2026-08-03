@@ -14,11 +14,23 @@ const fs = require('fs');
 const path = require('path');
 
 // Ensure crash-logs exists up front so both the JS handler and V8's fatal-error report (which
-// runs outside JS and may not create the dir) have somewhere to write.
+// runs outside JS and does NOT create the dir itself) have somewhere to write.
 try {
     fs.mkdirSync(path.join(process.cwd(), 'crash-logs'), { recursive: true });
 } catch (err) {
     console.warn('Could not create crash-logs directory:', err.message);
+}
+
+// V8 diagnostic reports configured from inside the app, so the live box needs no egg or
+// NODE_OPTIONS change. reportOnFatalError catches heap OOM — the crash class that killed the
+// 2026-08-03 run with zero trace. excludeEnv: the report would otherwise embed API tokens/PATs.
+try {
+    process.report.directory = path.join(process.cwd(), 'crash-logs');
+    process.report.reportOnFatalError = true;
+    process.report.reportOnUncaughtException = false; // writeCrashReport covers JS-level errors
+    if ('excludeEnv' in process.report) process.report.excludeEnv = true;
+} catch (err) {
+    console.warn('Could not configure process.report:', err.message);
 }
 
 // Initialize session logger for full session tracking
