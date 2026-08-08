@@ -259,8 +259,10 @@ module.exports = {
             return serverList;
         }
 
-        buildButtons();
-        setInterval(buildButtons, options.interval * 60 * 1000);
+        const safeBuildButtons = () => buildButtons().catch(error =>
+            sessionLogger.error('RoleAssigner', 'Failed to build role buttons (will retry next interval):', error.message));
+        safeBuildButtons();
+        setInterval(safeBuildButtons, options.interval * 60 * 1000);
     }
 
 };
