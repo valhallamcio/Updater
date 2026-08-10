@@ -95,8 +95,14 @@ module.exports = {
                 .then(r => ({ s, r }))
                 .catch(e => ({ s, r: { success: false, reason: e.message } }))
         ));
-        // Let each server be scheduled again later (clears completed/failed bookkeeping).
-        for (const { s } of results) rebootScheduler.resetSingleServerState(s.serverId);
+        // Let each server be scheduled again later (clears completed/failed bookkeeping) — but ONLY
+        // when this job actually owned the reboot. 'duplicate'/'state_conflict' means another reboot
+        // (e.g. the daily batch, which now holds the lock from its uptime checks through start) owns
+        // the activeReboots entry; wiping it here would delete THAT lock and allow a concurrent reboot.
+        for (const { s, r } of results) {
+            if (r && (r.reason === 'duplicate' || r.reason === 'state_conflict')) continue;
+            rebootScheduler.resetSingleServerState(s.serverId);
+        }
 
         // Record outcome alongside the batch reboots.
         try {

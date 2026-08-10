@@ -60,6 +60,164 @@ test('executeFullServerReboot: scheduled reboot still returns duplicate when one
 });
 
 /*
+ * Regression (2026-08-10, aero double-reboot): filterServersByUptime snapshots uptime ONCE when the
+ * batch queue is built (06:01), but a server late in the batch reboots ~1h later. A /voterestart or
+ * crash in between leaves it freshly started, yet the stale snapshot still let the batch reboot it
+ * (aero: vote @06:13 completed 06:21, batch re-rebooted it @06:51 on a 30-min-old server).
+ * executeFullServerReboot now re-checks LIVE uptime on the batch path (!opts.scheduled) right before
+ * stopping, via getConfirmedUptimeHours — ONE getStatus call so state and uptime come from the same
+ * panel snapshot (getServerUptime swallows API errors as 0 and can't be trusted). Null (unconfirmed)
+ * proceeds; only a confirmed 'running' server below the minimum is skipped.
+ */
+test('executeFullServerReboot: batch path skips a confirmed-running server with fresh uptime', async () => {
+    reset();
+    const origGetStatus = pterodactyl.getStatus;
+    const origStats = rs.state.todayStats;
+    pterodactyl.getStatus = async () => ({ attributes: { current_state: 'running', resources: { uptime: 30 * 60000 } } }); // 30min
+    rs.runtimeConfig = { minimumUptimeHours: 6 };
+    rs.state.todayStats = { totalServers: 5 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X' }, 'node');
+    } finally {
+        pterodactyl.getStatus = origGetStatus;
+    }
+    assert.deepStrictEqual(r, { success: true, reason: 'recently_restarted', skipped: true });
+    assert.strictEqual(rs.state.completedServers.has('abc123'), true,
+        'a skip counts as completed, not failed');
+    assert.strictEqual(rs.state.activeReboots.has('abc123'), false, 'must not hold an active-reboot lock after skipping');
+    assert.strictEqual(rs.state.todayStats.skippedReboots, 1, 'skip is tracked separately');
+    assert.strictEqual(rs.state.todayStats.totalServers, 4, 'denominator drops so success/total stays balanced');
+    rs.state.todayStats = origStats;
+    reset();
+});
+
+test('executeFullServerReboot: unconfirmed uptime (API blip -> unknown state) does NOT skip', async () => {
+    reset();
+    const origGetStatus = pterodactyl.getStatus;
+    const origWarn = rs.executeRebootWarningsEnhanced;
+    // getStatus's error default: state 'unknown', uptime 0 — getConfirmedUptimeHours must return null.
+    pterodactyl.getStatus = async () => ({ attributes: { current_state: 'unknown', resources: { cpu_absolute: 0, uptime: 0 } } });
+    // If the gate proceeds, the reboot path starts with the warning window; cancel it immediately.
+    rs.executeRebootWarningsEnhanced = async () => false;
+    rs.runtimeConfig = { minimumUptimeHours: 6 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X' }, 'node');
+    } finally {
+        pterodactyl.getStatus = origGetStatus;
+        rs.executeRebootWarningsEnhanced = origWarn;
+    }
+    assert.deepStrictEqual(r, { success: false, reason: 'cancelled' },
+        'an unconfirmed reading must fall through to the normal reboot path');
+    reset();
+});
+
+test('executeFullServerReboot: scheduled path never calls the uptime recheck (player request wins)', async () => {
+    reset();
+    const origGetStatus = pterodactyl.getStatus;
+    const origWarn = rs.executeRebootWarningsEnhanced;
+    let statusCalled = false;
+    pterodactyl.getStatus = async () => { statusCalled = true; return { attributes: { current_state: 'running', resources: { uptime: 0 } } }; };
+    // No in-flight reboot this time: the run passes the duplicate gate and would reach the recheck.
+    // Cancel at the warning window so nothing else runs.
+    rs.executeRebootWarningsEnhanced = async () => false;
+    rs.runtimeConfig = { minimumUptimeHours: 6 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X' }, 'node', { scheduled: true });
+    } finally {
+        pterodactyl.getStatus = origGetStatus;
+        rs.executeRebootWarningsEnhanced = origWarn;
+    }
+    assert.strictEqual(statusCalled, false, 'scheduled/vote reboots skip the uptime recheck entirely');
+    assert.deepStrictEqual(r, { success: false, reason: 'cancelled' });
+    reset();
+});
+
+test('executeFullServerReboot: a crash DURING the warning window aborts the stop (late checkpoint)', async () => {
+    reset();
+    const origGetStatus = pterodactyl.getStatus;
+    const origWarn = rs.executeRebootWarningsEnhanced;
+    const origStop = rs.ensureServerStopped;
+    const origCmd = pterodactyl.sendCommand;
+    const origStats = rs.state.todayStats;
+    // Early checkpoint: 12h uptime, fine. After the warning window: 5min — the server bounced mid-countdown.
+    const readings = [
+        { attributes: { current_state: 'running', resources: { uptime: 12 * 3600 * 1000 } } },
+        { attributes: { current_state: 'running', resources: { uptime: 5 * 60 * 1000 } } },
+    ];
+    let i = 0;
+    pterodactyl.getStatus = async () => readings[Math.min(i++, readings.length - 1)];
+    rs.executeRebootWarningsEnhanced = async () => true; // countdown ran to completion
+    let stopCalled = false;
+    rs.ensureServerStopped = async () => { stopCalled = true; };
+    let cancelNotice = null;
+    pterodactyl.sendCommand = async (id, cmd) => { cancelNotice = cmd; };
+    rs.runtimeConfig = { minimumUptimeHours: 6 };
+    rs.state.todayStats = { totalServers: 5 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X', serverVersion: '1.21.1' }, 'node');
+    } finally {
+        pterodactyl.getStatus = origGetStatus;
+        rs.executeRebootWarningsEnhanced = origWarn;
+        rs.ensureServerStopped = origStop;
+        pterodactyl.sendCommand = origCmd;
+    }
+    assert.deepStrictEqual(r, { success: true, reason: 'recently_restarted', skipped: true });
+    assert.strictEqual(stopCalled, false, 'must NOT stop a server that restarted during the warning window');
+    assert.ok(cancelNotice && cancelNotice.includes('tellraw'), 'players who saw the countdown get a cancel notice');
+    assert.strictEqual(rs.state.todayStats.skippedReboots, 1);
+    assert.strictEqual(rs.state.todayStats.totalServers, 4);
+    rs.state.todayStats = origStats;
+    reset();
+});
+
+test('executeFullServerReboot: a crash DURING the save flush aborts before the stop power action', async () => {
+    reset();
+    const orig = {
+        getStatus: pterodactyl.getStatus,
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        sleep: functions.sleep,
+        warn: rs.executeRebootWarningsEnhanced,
+        stats: rs.state.todayStats,
+    };
+    // Early + post-warning checkpoints: 12h, fine. Post-flush checkpoint: 2min — bounced mid-flush.
+    const readings = [
+        { attributes: { current_state: 'running', resources: { uptime: 12 * 3600 * 1000 } } },
+        { attributes: { current_state: 'running', resources: { uptime: 12 * 3600 * 1000 } } },
+        { attributes: { current_state: 'running', resources: { uptime: 2 * 60 * 1000 } } },
+    ];
+    let i = 0;
+    pterodactyl.getStatus = async () => readings[Math.min(i++, readings.length - 1)];
+    rs.executeRebootWarningsEnhanced = async () => true;
+    const cmds = [], powers = [];
+    pterodactyl.sendCommand = async (id, cmd) => { cmds.push(cmd); };
+    pterodactyl.sendPowerAction = async (id, a) => { powers.push(a); };
+    functions.sleep = async () => {};
+    rs.runtimeConfig = { minimumUptimeHours: 6, playerAlerts: { preStopSaveWaitSeconds: 90 } };
+    rs.state.todayStats = { totalServers: 5 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X', serverVersion: '1.21.1' }, 'node');
+    } finally {
+        Object.assign(pterodactyl, { getStatus: orig.getStatus, sendCommand: orig.sendCommand, sendPowerAction: orig.sendPowerAction });
+        functions.sleep = orig.sleep;
+        rs.executeRebootWarningsEnhanced = orig.warn;
+    }
+    assert.deepStrictEqual(r, { success: true, reason: 'recently_restarted', skipped: true });
+    assert.strictEqual(powers.length, 0, `no stop/kill may be sent to a server that bounced mid-flush; got: ${powers.join(',')}`);
+    assert.ok(cmds.includes('save-all'), 'the flush still ran (harmless on a fresh server)');
+    assert.ok(cmds.some(c => c.includes('tellraw')), 'players get the cancel notice');
+    assert.strictEqual(rs.state.todayStats.skippedReboots, 1);
+    assert.strictEqual(rs.state.todayStats.totalServers, 4);
+    rs.state.todayStats = orig.stats;
+    reset();
+});
+
+/*
  * Pre-stop world flush (requested 2026-06-29): EVERY reboot path must `save-all` then idle the full
  * window BEFORE any stop/kill, so a slow modded save (PRI-class worlds) reaches disk and the 60s
  * force-kill in ensureServerStopped can't truncate it. The wait — not the command — is the guarantee

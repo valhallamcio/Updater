@@ -290,6 +290,61 @@ module.exports = {
     },
 
     /**
+     * Live uptime in whole hours from a SINGLE getStatus response, or null when the reading can't be
+     * trusted (server not 'running', uptime field missing, or an API error — getStatus's error default
+     * is state 'unknown'). getServerUptime can't serve here: it swallows API errors and returns 0,
+     * which reads exactly like a freshly restarted server. One call, so the state and the uptime are
+     * always from the same panel snapshot.
+     */
+    getConfirmedUptimeHours: async function (serverId) {
+        const st = await pterodactyl.getStatus(serverId);
+        const state = st && st.attributes && st.attributes.current_state;
+        if (state !== 'running') return null;
+        const ms = st.attributes.resources && st.attributes.resources.uptime;
+        if (typeof ms !== 'number') return null;
+        return Math.floor(ms / (1000 * 3600));
+    },
+
+    /**
+     * Tell players a batch reboot was abandoned because their server was already restarted recently.
+     * Used when a skip happens AFTER the warning countdown ran (players would otherwise wait for a
+     * restart that never comes). Best-effort: a failed send never blocks the skip.
+     */
+    sendFreshRestartCancelNotice: async function (server) {
+        const ver = server.serverVersion || server.minecraftVersion || server.version;
+        if (!rebootAlerts.caps(ver).known) return;
+        await pterodactyl.sendCommand(server.serverId,
+            `tellraw @a ${JSON.stringify({ text: '[!] Restart cancelled — server was already restarted recently.', color: 'green' })}`)
+            .catch(() => {});
+    },
+
+    /**
+     * Batch-path guard against double-rebooting a freshly restarted server (see executeFullServerReboot).
+     * Returns true when the caller must abandon the reboot: a CONFIRMED running server whose uptime is
+     * below the minimum. An unconfirmed reading (null) returns false — fail-safe, the reboot proceeds.
+     * Caller MUST hold the activeReboots lock; markServerCompleted releases it here.
+     */
+    maybeSkipRecentlyRestarted: async function (server) {
+        const minUptime = this.runtimeConfig?.minimumUptimeHours != null
+            ? this.runtimeConfig.minimumUptimeHours : 6;
+        let uptimeHours = null;
+        try {
+            uptimeHours = await this.getConfirmedUptimeHours(server.serverId);
+        } catch (e) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Uptime re-check failed (${e.message}) — proceeding (fail-safe)`);
+        }
+        if (uptimeHours === null || uptimeHours >= minUptime) return false;
+
+        sessionLogger.info('RebootScheduler',
+            `[${server.name}] Skipping: uptime ${uptimeHours}h < ${minUptime}h, confirmed running (recently restarted since batch start)`);
+        this.stateOperations.markServerCompleted(server.serverId); // not failed; counts as done for the day
+        this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + 1;
+        if (this.state.todayStats.totalServers > 0) this.state.todayStats.totalServers--; // keep success/total balanced
+        return true;
+    },
+
+    /**
      * Filter servers based on uptime requirement (minimum 6 hours)
      * @param {Array} servers Array of server objects
      * @param {number} minimumUptimeHours Minimum uptime in hours (default: 6)
@@ -363,6 +418,7 @@ module.exports = {
         this.state.todayStats.rebootCompleted = false;
         this.state.todayStats.successfulReboots = 0;
         this.state.todayStats.failedReboots = 0;
+        this.state.todayStats.skippedReboots = 0;
         this.state.todayStats.retryAttempts = {};
         this.state.todayStats.rebootEndTime = null;
         this.state.todayStats.totalDuration = null;
@@ -773,6 +829,22 @@ module.exports = {
             return { success: false, reason: 'state_conflict' };
         }
 
+        // Re-validate uptime before rebooting (batch path only). filterServersByUptime snapshots
+        // uptime ONCE at queue build, but a server near the end of the batch reboots up to ~1h later —
+        // meanwhile a /voterestart, crash, or staff action may have bounced it. Rebooting that fresh
+        // server again is the aero 2026-08-10 double-reboot (vote @06:13, batch re-reboot @06:51).
+        // The batch opts.scheduled is falsy, so this only guards the automated batch; a deliberate
+        // player/staff reboot is never vetoed.
+        //
+        // The lock is taken BEFORE the check on purpose: any scheduled reboot arriving while we await
+        // sees us as in-flight, so markServerCompleted below can only release OUR entry.
+        // Two checkpoints: here (avoid a pointless 15min warning when the server was bounced long
+        // before its slot) and again right before the stop (a crash/bounce DURING the warning window
+        // leaves the first reading stale). maybeSkipRecentlyRestarted does the stats bookkeeping.
+        if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
+            return { success: true, reason: 'recently_restarted', skipped: true };
+        }
+
         const maxRetries = this.runtimeConfig?.rebootRetryLimit || 3;
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -786,7 +858,19 @@ module.exports = {
                     this.stateOperations.removeActiveReboot(server.serverId);
                     return { success: false, reason: 'cancelled' };
                 }
-                await this.ensureServerStopped(server);
+                // Final uptime checkpoint AFTER the warning window: a crash or external restart
+                // during the countdown means the server is fresh again — don't stop it a second
+                // time. Players just saw the countdown, so tell them it's cancelled.
+                if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
+                    await this.sendFreshRestartCancelNotice(server);
+                    return { success: true, reason: 'recently_restarted', skipped: true };
+                }
+                const stoppedResult = await this.ensureServerStopped(server, { checkFreshUptime: !opts.scheduled });
+                if (stoppedResult === 'skipped') {
+                    // Server bounced during the save flush — same handling as the post-warning checkpoint.
+                    await this.sendFreshRestartCancelNotice(server);
+                    return { success: true, reason: 'recently_restarted', skipped: true };
+                }
                 await this.startServerWithMonitoring(server);
 
                 // Safety net: clear any reboot bossbar that survived into the fresh world
@@ -1006,9 +1090,13 @@ module.exports = {
     },
 
     /**
-     * Ensure server is properly stopped with verification
+     * Ensure server is properly stopped with verification.
+     * opts.checkFreshUptime (batch path): re-check uptime after the save flush, right before the
+     * first stop — a crash/auto-restart during the flush wait would otherwise get stopped again
+     * seconds after coming back. Returns 'skipped' instead of true when that guard fires
+     * (maybeSkipRecentlyRestarted already did the stats/lock bookkeeping).
      */
-    ensureServerStopped: async function (server) {
+    ensureServerStopped: async function (server, opts = {}) {
         const ac = this.getAlertConfig();
 
         // Hard guarantee for EVERY reboot path (daily batch, scheduled, vote): flush the world and
@@ -1024,6 +1112,10 @@ module.exports = {
             sessionLogger.info('RebootScheduler',
                 `[${server.name}] save-all issued; waiting ${saveWaitMs / 1000}s for world flush before stop`);
             await functions.sleep(saveWaitMs);
+        }
+
+        if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
+            return 'skipped';
         }
 
         const stopGraceMs = (ac.stopGraceSeconds != null ? ac.stopGraceSeconds : 120) * 1000;
