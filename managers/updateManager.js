@@ -302,7 +302,16 @@ async function backupAllInstances(pack, allServerIds, toCompressList, vaultFileN
 
         // Plain copies of the identity files so /restore can reapply them on their own
         for (const file of protectedFiles) {
-            const content = await pterodactyl.getFileContents(sid, file);
+            let content;
+            try {
+                content = await pterodactyl.getFileContents(sid, file);
+            } catch (error) {
+                // Packs that never shipped a protected file must not fail the backup.
+                // The panel answers a missing path with a 500, so getFileContents
+                // exhausts its retries and throws instead of returning null.
+                sessionLogger.warn('UpdateManager', `Could not snapshot ${file} on ${sid} (${error.message}) - skipping it`);
+                continue;
+            }
             if (content === null) continue;
             const dest = `./vault/${pack.tag}/per-server/${sid}/${file}`;
             fs.mkdirSync(path.dirname(dest), {
