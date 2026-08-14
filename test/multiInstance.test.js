@@ -530,6 +530,75 @@ test('a Discord outage cannot abort a run that already deployed', async () => {
     await _internals.editProgress(message, 'short');
 });
 
+/**
+ * Boot watch: verifyBooted decides whether a started instance actually came up.
+ * States cycle as arrays so each poll reads the next flap. Sleep is instant and
+ * the clock virtual, so the deadline cases exhaust immediately in test time.
+ */
+function bootWatchFixture(states) {
+    let t = 0;
+    let poll = 0;
+    return {
+        deps: {
+            getStatus: async () => ({
+                attributes: { current_state: states[Math.min(poll++, states.length - 1)] }
+            }),
+            sleep: async (ms) => { t += ms; },
+            now: () => t
+        },
+        polls: () => poll,
+        time: () => t
+    };
+}
+
+test('boot watch passes an instance that comes up', async () => {
+    const { _internals } = require('../managers/updateManager');
+    const fix = bootWatchFixture(['starting', 'starting', 'running']);
+
+    const failure = await _internals.verifyBooted('srv-ok', fix.deps);
+
+    assert.strictEqual(failure, null);
+});
+
+test('boot watch catches a crash-looper after the flap budget and fails fast', async () => {
+    const { _internals } = require('../managers/updateManager');
+    // E2E 2026-08-14: starting -> offline over and over, wings crash-recovery retrying
+    const fix = bootWatchFixture(['starting', 'offline', 'starting', 'offline', 'starting']);
+
+    const failure = await _internals.verifyBooted('srv-loop', fix.deps);
+
+    assert.strictEqual(failure, 'crash-looping');
+    assert.ok(fix.polls() <= 4, 'must bail out around the flap budget, not the full timeout');
+});
+
+test('boot watch does not flap-circle a server that simply stays offline', async () => {
+    const { _internals } = require('../managers/updateManager');
+    const fix = bootWatchFixture(['offline', 'offline', 'offline', 'offline', 'offline']);
+
+    const failure = await _internals.verifyBooted('srv-dead', fix.deps, 120000);
+
+    assert.strictEqual(failure, 'stuck', 'zero flap - wings is not retrying, so it is stuck rather than looping');
+    assert.ok(fix.time() >= 120000, 'must wait out the deadline');
+});
+
+test('boot watch tolerates unknown states from the api', async () => {
+    const { _internals } = require('../managers/updateManager');
+    const fix = bootWatchFixture(['unknown', 'starting', 'running']);
+
+    const failure = await _internals.verifyBooted('srv-flaky', fix.deps);
+
+    assert.strictEqual(failure, null);
+});
+
+test('boot watch reports a boot that never finishes within the deadline', async () => {
+    const { _internals } = require('../managers/updateManager');
+    const fix = bootWatchFixture(['starting']);
+
+    const failure = await _internals.verifyBooted('srv-slow', fix.deps, 120000);
+
+    assert.strictEqual(failure, 'stuck');
+});
+
 test.after(() => {
     if (tmpRoot) fs.rmSync(tmpRoot, { recursive: true, force: true });
 });

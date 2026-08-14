@@ -162,26 +162,82 @@ async function awaitDecompressed(client, serverId, expected, attempts = 5) {
     return missing;
 }
 
+/** How long the boot watch waits before calling an instance stuck. Big 1.7.10 packs can take 10+ minutes from container start to "running". */
+const BOOT_WATCH_TIMEOUT_MS = 20 * 60 * 1000;
+/** Panel state poll cadence during the boot watch. */
+const BOOT_WATCH_POLL_MS = 15 * 1000;
+/** Online->offline flaps (wings crash-recovery cycles) before the instance is declared crash-looping. E2E 2026-08-14 cycled four times in four minutes. */
+const BOOT_WATCH_MAX_FLAPS = 2;
+
+/**
+ * Watches one started instance until the panel reports it running, crash-looping, or the
+ * deadline passes. A server whose JVM dies during mod loading flaps starting->offline as
+ * wings crash-recovery retries it; flap-counting fails that fast, so a broken deploy is
+ * reported in minutes instead of the full timeout.
+ * @param {Object} deps Injectable for tests - getStatus returns {attributes:{current_state}}.
+ * @returns {string|null} The failure reason, or null when the instance came up.
+ */
+async function verifyBooted(serverId, deps = {}, deadline = BOOT_WATCH_TIMEOUT_MS) {
+    const getStatus = deps.getStatus || ((sid) => pterodactyl.getStatus(sid));
+    const sleepFn = deps.sleep || sleep;
+    const now = deps.now || Date.now;
+    const startedAt = now();
+    let flaps = 0;
+    let lastState = null;
+    while (now() - startedAt < deadline) {
+        let state = 'unknown';
+        try {
+            state = (await getStatus(serverId)).attributes.current_state || 'unknown';
+        } catch (error) {
+            sessionLogger.warn('UpdateManager', `Boot watch could not read ${serverId}: ${error.message}`);
+        }
+        if (state === 'running') return null;
+        if (state === 'offline' && lastState && lastState !== 'offline') {
+            flaps++;
+            if (flaps >= BOOT_WATCH_MAX_FLAPS) {
+                sessionLogger.error('UpdateManager', `${serverId} crash-loops after the deploy (${flaps} offline flaps)`);
+                return 'crash-looping';
+            }
+        }
+        lastState = state;
+        await sleepFn(BOOT_WATCH_POLL_MS);
+    }
+    sessionLogger.error('UpdateManager', `${serverId} never reported "running" within ${Math.round(deadline / 60000)}m of the deploy (state: ${lastState || 'unknown'})`);
+    return 'stuck';
+}
+
 /**
  * Starts the instances that are safe to boot, without being able to abort the run.
  *
  * sendPowerAction rethrows once its retries are exhausted, and every caller sits between
  * the last deploy and the tag-wide database write - so a panel hiccup starting the second
  * of three instances used to leave every instance updated on disk and mongo still claiming
- * the old version. An instance that will not start is a thing to report, not to roll back.
- * @returns {Array} Ids that could not be started.
+ * the old version. Sending "start" also proves nothing about the boot itself: E2E 2026-08-14
+ * crash-looped on a wings unpack-permission bug for 30+ minutes while the run reported
+ * success, because the signal had gone through. Ids that never reach "running" (or flap)
+ * go into the report exactly like ids the panel refused, so the files-updated warning stays
+ * accurate. An instance that will not start is a thing to report, not to roll back.
+ * @returns {Array} Ids that did not come up (send failed, crash-looped, or timed out).
  */
 async function startInstances(allServerIds, skip = []) {
     const notStarted = [];
+    const started = [];
     for (const sid of allServerIds) {
         if (skip.includes(sid)) continue;
         try {
             await pterodactyl.sendPowerAction(sid, "start");
+            started.push(sid);
         } catch (error) {
             sessionLogger.error('UpdateManager', `Could not start ${sid}:`, error.message);
             notStarted.push(sid);
         }
     }
+    // All running instances share the same clock - watching them in parallel means one slow
+    // boot does not push a fast neighbour's crash detection past the wing's retry cadence.
+    const failures = await Promise.all(started.map(sid => verifyBooted(sid)));
+    started.forEach((sid, i) => {
+        if (failures[i]) notStarted.push(sid);
+    });
     return notStarted;
 }
 
@@ -433,6 +489,11 @@ module.exports = {
         editProgress,
         findRemoteFile,
         awaitDecompressed,
+        verifyBooted,
+        startInstances,
+        BOOT_WATCH_TIMEOUT_MS,
+        BOOT_WATCH_POLL_MS,
+        BOOT_WATCH_MAX_FLAPS,
         DISCORD_MESSAGE_LIMIT
     },
 
