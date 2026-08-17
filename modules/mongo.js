@@ -975,7 +975,8 @@ module.exports = {
     },
 
     /**
-     * Prefix-searches notice ids for autocomplete.
+     * Prefix-searches notice ids for autocomplete, falling back to a contains search
+     * when nothing starts with what was typed.
      * @param {string} prefix Id prefix the user is typing.
      * @param {number} limit Max results.
      * @returns {Promise<string[]>} Matching ids.
@@ -986,15 +987,27 @@ module.exports = {
             mainClientConnected = true;
         }
 
+        const notices = mongoClient.db('bifrost').collection('notices');
+        const projection = { projection: { id: 1, _id: 0 } };
         const escaped = String(prefix || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const filter = escaped ? { id: { $regex: escaped, $options: 'i' } } : {};
-        const docs = await mongoClient
-            .db('bifrost')
-            .collection('notices')
-            .find(filter, { projection: { id: 1, _id: 0 } })
+        if (!escaped) {
+            const all = await notices.find({}, projection).limit(limit).toArray();
+            return all.map(d => d.id).filter(Boolean);
+        }
+
+        const anchored = await notices
+            .find({ id: { $regex: `^${escaped}`, $options: 'i' } }, projection)
             .limit(limit)
             .toArray();
-        return docs.map(d => d.id).filter(Boolean);
+        // Ids read `<type>.<slug>`, so a prefix is what staff type - but they also type the
+        // slug alone ("nether lag"), which no prefix can match. Fall back to contains then.
+        if (anchored.length) return anchored.map(d => d.id).filter(Boolean);
+
+        const contains = await notices
+            .find({ id: { $regex: escaped, $options: 'i' } }, projection)
+            .limit(limit)
+            .toArray();
+        return contains.map(d => d.id).filter(Boolean);
     },
 
     /**

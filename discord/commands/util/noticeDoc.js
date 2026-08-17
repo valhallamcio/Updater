@@ -26,6 +26,29 @@ const TYPE_PREFIX = {
     tip: 'tip'
 };
 
+/**
+ * The guide cards a `tip` doc can override, one per cardText() call site in Bifrost's
+ * src/plugins/guide/index.ts (the notice id is the nudge id, prefixed `tip.` when it isn't
+ * already). A tip id the proxy never looks up is a doc nobody ever sees, so /notice warns
+ * about an id that isn't here - it does not refuse it, because the guide gains cards faster
+ * than this list does.
+ */
+const KNOWN_TIP_IDS = [
+    'tip.welcome.help',
+    'tip.onboard.welcome',
+    'tip.onboard.chat',
+    'tip.onboard.stuck',
+    'tip.crash.rejoin',
+    'tip.translate.offer',
+    'tip.translate.why',
+    'tip.channel_churn',
+    'tip.reply',
+    'tip.pm_offline'
+];
+
+/** `closure.map.<tag>` is one card per closed pack, so those ids are a prefix, not a list. */
+const KNOWN_TIP_PREFIXES = ['tip.closure.map.'];
+
 /** Bifrost's `NOTICE_ID_RE` / `MAX_ID_LEN` / `NOTICE_TEXT_CAPS`. */
 const NOTICE_ID_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const MAX_ID_LEN = 128;
@@ -54,6 +77,17 @@ const VERSION_PROTOCOLS = {
  */
 function hasForbiddenTags(text) {
     return /<\s*(click|hover)\s*:/i.test(String(text || ''));
+}
+
+/**
+ * Is this an id the guide actually looks a card override up under?
+ * @param {string} id Notice id.
+ * @returns {boolean} True for a known card, or a `closure.map.<tag>` one.
+ */
+function isKnownTipId(id) {
+    const key = String(id || '');
+    return KNOWN_TIP_IDS.includes(key)
+        || KNOWN_TIP_PREFIXES.some(prefix => key.startsWith(prefix) && key.length > prefix.length);
 }
 
 /**
@@ -147,8 +181,23 @@ function buildNoticeDoc(input) {
         if (!NOTICE_ID_RE.test(id) || id.length > MAX_ID_LEN) {
             return { ok: false, error: `\`${id}\` is not a valid id — lower-case letters, digits, \`.\`, \`_\`, \`-\`, max ${MAX_ID_LEN}.` };
         }
+    } else if (type === 'tip') {
+        // A tip is an override of ONE guide card, looked up by that card's fixed id — a
+        // generated `tip.<slug>-<ts>` matches nothing and would silently never be shown.
+        return {
+            ok: false,
+            error: 'A `tip` overrides one guide card, so it needs that card\'s `id` (starting with `tip.`).\n'
+                + `Known ids: ${KNOWN_TIP_IDS.join(', ')}, tip.closure.map.<tag>.`
+        };
     } else {
         id = defaultNoticeId(type, title || body, now.getTime());
+    }
+    if (type === 'tip' && !id.startsWith('tip.')) {
+        return {
+            ok: false,
+            error: `A \`tip\` id must start with \`tip.\` — the guide looks its card up under that id.\n`
+                + `Known ids: ${KNOWN_TIP_IDS.join(', ')}, tip.closure.map.<tag>.`
+        };
     }
 
     const targets = {};
@@ -193,12 +242,20 @@ function buildNoticeDoc(input) {
     doc.updatedAt = now;
     doc.updatedBy = input.updatedBy || 'discord';
     doc.note = input.note || 'created via /notice';
-    return { ok: true, doc: doc };
+
+    const result = { ok: true, doc: doc };
+    if (type === 'tip' && !isKnownTipId(id)) {
+        result.warning = `No guide card is known under \`${id}\` — check the id, or this text is never shown.`;
+    }
+    return result;
 }
 
 module.exports = {
     NOTICE_TYPES,
     TITLE_REQUIRED,
+    KNOWN_TIP_IDS,
+    KNOWN_TIP_PREFIXES,
+    isKnownTipId,
     TYPE_PREFIX,
     NOTICE_ID_RE,
     MAX_ID_LEN,

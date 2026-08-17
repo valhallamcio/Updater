@@ -136,6 +136,14 @@ both with change streams, so a write reaches players in about a second. Nothing 
 `expiresAt` (90 days), `meta: { via: 'discord', discordId }`. The proxy delivers an unread doc
 inline when the player is online, otherwise it waits in their in-game inbox (`/mail`).
 
+A **`tip`** doc overrides the text of ONE guide card, and the guide looks that card up by its
+fixed id — so `/notice create type:tip` **requires** an `id`, and it must start with `tip.`.
+A generated id would match no card and the text would never be shown. Known ids:
+`tip.welcome.help`, `tip.onboard.welcome`, `tip.onboard.chat`, `tip.onboard.stuck`,
+`tip.crash.rejoin`, `tip.translate.offer`, `tip.translate.why`, `tip.channel_churn`,
+`tip.reply`, `tip.pm_offline`, and `tip.closure.map.<tag>` (one per closed pack). An id outside
+that list is a warning, not a refusal — the guide gains cards faster than the list does.
+
 A finished pack update also posts an in-game `event` card automatically
 (`modules/notices.js` → `event.update.<tag>.<yyyymmdd>`, targeted at that tag, visible 3 days),
 telling players to restart their launcher. Gate it with `notices.packUpdateEvents: false` in

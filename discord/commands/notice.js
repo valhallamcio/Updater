@@ -43,11 +43,14 @@ function targetSummary(doc) {
     return parts.length ? parts.join(', ') : 'everyone';
 }
 
+/** startsAt/expiresAt (endsAt for an event) — the proxy honours both, so both are listed. */
 function whenSummary(doc) {
-    const at = doc.endsAt || doc.expiresAt;
-    if (!at) return 'no expiry';
-    const unix = Math.floor(new Date(at).getTime() / 1000);
-    return `ends <t:${unix}:R>`;
+    const stamp = at => `<t:${Math.floor(new Date(at).getTime() / 1000)}:R>`;
+    const parts = [];
+    if (doc.startsAt) parts.push(`starts ${stamp(doc.startsAt)}`);
+    const ends = doc.endsAt || doc.expiresAt;
+    if (ends) parts.push(`ends ${stamp(ends)}`);
+    return parts.length ? parts.join(' · ') : 'no expiry';
 }
 
 module.exports = {
@@ -75,7 +78,7 @@ module.exports = {
                         .setRequired(false))
                 .addStringOption(option =>
                     option.setName('id')
-                        .setDescription('Notice id (default: generated from the type and title)')
+                        .setDescription('Notice id (default: generated; a tip REQUIRES the guide card id, e.g. tip.reply)')
                         .setRequired(false))
                 .addStringOption(option =>
                     option.setName('tags')
@@ -215,7 +218,8 @@ module.exports = {
         await mongo.upsertNotice(built.doc);
         await interaction.editReply(
             `✅ \`${built.doc.id}\` (**${built.doc.type}**) — ${TYPE_BLURB[built.doc.type]}.\n` +
-            `Targets: ${targetSummary(built.doc)}. Players see it within ~1 s.`);
+            `Targets: ${targetSummary(built.doc)}. Players see it within ~1 s.` +
+            (built.warning ? `\n⚠️ ${built.warning}` : ''));
     },
 
     async broadcast(interaction) {

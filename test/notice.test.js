@@ -94,6 +94,36 @@ test('tip doc stores its text under card (the shape guide validates), never body
     assert.deepStrictEqual(built.doc.card, { en: '<gray>Try /ch global.</gray>' });
     assert.strictEqual(built.doc.body, undefined);
     assert.strictEqual(built.doc.id, 'tip.channel_churn');
+    assert.strictEqual(built.warning, undefined, 'a known card id is not warned about');
+});
+
+/*
+ * A tip overrides ONE guide card and the guide looks that card up by its fixed id
+ * (guide/index.ts noticeIdFor: the nudge id, `tip.`-prefixed). A generated
+ * `tip.<slug>-<base36 ts>` matches no card, so the text would be stored and never shown.
+ */
+test('a tip needs the guide card id — generated and non-tip ids are refused', () => {
+    const generated = util.buildNoticeDoc({ type: 'tip', body: 'Try /ch global.', now: NOW });
+    assert.strictEqual(generated.ok, false);
+    assert.match(generated.error, /needs that card's `id`/);
+    assert.match(generated.error, /tip\.channel_churn/, 'the refusal lists the ids that do work');
+
+    const wrongPrefix = util.buildNoticeDoc({ type: 'tip', id: 'channel_churn', body: 'x', now: NOW });
+    assert.strictEqual(wrongPrefix.ok, false);
+    assert.match(wrongPrefix.error, /must start with `tip\.`/);
+});
+
+test('an unknown tip id is warned about, not refused (the guide gains cards first)', () => {
+    const unknown = util.buildNoticeDoc({ type: 'tip', id: 'tip.not_a_card', body: 'x', now: NOW });
+    assert.strictEqual(unknown.ok, true, 'staff can still author a card the list does not know yet');
+    assert.match(unknown.warning, /No guide card is known under `tip\.not_a_card`/);
+
+    // closure.map.<tag> is one card per closed pack — a prefix, not a listed id.
+    const closure = util.buildNoticeDoc({ type: 'tip', id: 'tip.closure.map.atm9', body: 'x', now: NOW });
+    assert.strictEqual(closure.ok, true);
+    assert.strictEqual(closure.warning, undefined);
+    assert.strictEqual(util.isKnownTipId('tip.closure.map.'), false, 'the bare prefix is not an id');
+    for (const id of util.KNOWN_TIP_IDS) assert.ok(util.isKnownTipId(id), `${id} must be known`);
 });
 
 test('event needs an end: expires -> endsAt, starts -> startsAt, missing expires is refused', () => {
@@ -177,6 +207,38 @@ test('/notice broadcast carries createdAt (the proxy drops a broadcast without o
     assert.ok(upserted[0].createdAt instanceof Date, 'createdAt is required for broadcasts');
     assert.deepStrictEqual(upserted[0].body, { en: 'Restarting in 5.' });
     assert.deepStrictEqual(upserted[0].targets, { tags: ['pri'] });
+});
+
+test('/notice create surfaces the unknown-tip-id warning next to the write', async () => {
+    const it = interaction('create', { type: 'tip', id: 'tip.not_a_card', body: 'Try /ch global.' });
+    await command.execute(it);
+
+    assert.strictEqual(upserted.length, 1, 'a warning does not stop the write');
+    assert.match(it.replies[0], /⚠️ No guide card is known/);
+});
+
+test('/notice create refuses a tip with no id before it reaches Mongo', async () => {
+    const it = interaction('create', { type: 'tip', body: 'Try /ch global.' });
+    await command.execute(it);
+    assert.strictEqual(upserted.length, 0);
+    assert.match(it.replies[0], /needs that card's `id`/);
+});
+
+test('/notice list shows starts AND expires — the proxy honours both', async () => {
+    mongo.listNotices = async () => ([
+        { id: 'pinned.move', type: 'pinned', enabled: true, title: 'Move', startsAt: new Date('2026-08-18T00:00:00Z'), updatedBy: 'staff#0001' },
+        { id: 'announcement.vote', type: 'announcement', enabled: true, expiresAt: new Date('2026-08-19T00:00:00Z'), updatedBy: 'staff#0001' },
+        { id: 'event.contest', type: 'event', enabled: true, title: 'Contest', endsAt: new Date('2026-08-20T00:00:00Z'), updatedBy: 'staff#0001' },
+        { id: 'tip.reply', type: 'tip', enabled: true, updatedBy: 'staff#0001' },
+    ]);
+    const it = interaction('list', {});
+    await command.execute(it);
+
+    const values = it.replies[0].embeds[0].data.fields.map(f => f.value);
+    assert.match(values[0], /starts <t:1787011200:R>/, 'a pinned notice lists its startsAt');
+    assert.match(values[1], /ends <t:1787097600:R>/, 'an announcement lists its expiresAt');
+    assert.match(values[2], /ends <t:1787184000:R>/, 'an event lists its endsAt');
+    assert.match(values[3], /no expiry/);
 });
 
 test('/notice create refuses a bad doc before it reaches Mongo', async () => {
