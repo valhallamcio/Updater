@@ -86,6 +86,11 @@ function generateConfigFiles() {
         "notices": {
             "packUpdateEvents": true
         },
+        "discordLink": {
+            // a role id string turns the Verified role on; false leaves roles alone
+            // (checkConfig below treats null and "" as unfilled and stops the bot)
+            "verifiedRoleId": false
+        },
         "scheduler": {}
     };
 
