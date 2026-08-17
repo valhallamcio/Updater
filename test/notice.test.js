@@ -210,3 +210,34 @@ test('/notice translate takes a language code and refuses junk or a click tag', 
     assert.strictEqual(langCalls.length, 0);
     assert.match(clicky.replies[0], /click/);
 });
+
+/* --------------------------------------------------- automatic pack-update event */
+
+test('pack update event: one id per tag per day, title capped, 3-day window, tag-targeted', () => {
+    const notices = require('../modules/notices');
+    const now = new Date('2026-08-17T09:30:00Z');
+    const doc = notices.packUpdateEventDoc({ tag: 'ATM10', name: 'All The Mods 10', version: '1.2.3', now });
+
+    assert.strictEqual(doc.id, 'event.update.atm10.20260817');
+    assert.match(doc.id, util.NOTICE_ID_RE);
+    assert.strictEqual(doc.type, 'event');
+    assert.strictEqual(doc.enabled, true);
+    assert.strictEqual(doc.title, 'All The Mods 10 updated to 1.2.3');
+    assert.deepStrictEqual(doc.targets, { tags: ['atm10'] });
+    assert.deepStrictEqual(doc.startsAt, now);
+    assert.deepStrictEqual(doc.endsAt, new Date('2026-08-20T09:30:00Z'));
+    assert.strictEqual(doc.updatedBy, 'updateManager');
+
+    const long = notices.packUpdateEventDoc({ tag: 'gtnh', name: 'GregTech New Horizons Deluxe Edition', version: '2.7.4-beta', now });
+    assert.ok(long.title.length <= util.TITLE_CAP, `title was ${long.title.length} chars`);
+    assert.ok(long.title.endsWith('...'));
+
+    assert.strictEqual(notices.packUpdateEventDoc({ tag: '', name: 'x', version: '1', now }), null, 'no tag = nothing to target');
+});
+
+test('pack update event never throws out of the update path', async () => {
+    const notices = require('../modules/notices');
+    mongo.upsertNotice = async () => { throw new Error('mongo is down'); };
+    assert.strictEqual(await notices.postPackUpdateEvent({ tag: 'atm10', name: 'ATM10', version: '1' }), false);
+    assert.strictEqual(await notices.postPackUpdateEvent(null), false);
+});

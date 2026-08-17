@@ -83,6 +83,9 @@ function generateConfigFiles() {
         "yggdrasilOps": {
             "useOpsApi": false
         },
+        "notices": {
+            "packUpdateEvents": true
+        },
         "scheduler": {}
     };
 
