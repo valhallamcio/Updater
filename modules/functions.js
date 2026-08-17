@@ -203,6 +203,8 @@ module.exports = {    /**
 
         const versionRegex = /(\bv\d+[a-zA-Z]*\b|v\d+[a-zA-Z]*|\d+\.\d+\.\d+([a-zA-Z_]\w*)?|\d+\.\d+([a-zA-Z_]\w*)?)($|\s|\.zip)/g;
 
+        if (typeof versionString !== 'string') return null;
+
         let version = versionString.match(versionRegex);
         return version ? version[0].trim().replace(/\.zip$|v/g, '') : null;
     },

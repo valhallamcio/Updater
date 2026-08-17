@@ -51,66 +51,90 @@ module.exports = {
         for (let server of servers) {
             if (server.platform === "github" || server.platform === "gregtechodyssey") continue;
 
-            let newestUpdateId = 0;
-            let updateRequired = false;
-            let packManifest = {};
-            let packData = {};
-            let packURL = "";
-            let packLogo = "";
-
-            if (server.platform === "curseforge" || server.platform === "gregtechnewhorizons") {
-                newestUpdateId = await curseforge.getLatestVersionId(server.modpackID);
-                packManifest = await modpacksch.getCFPackManifest(server.modpackID, newestUpdateId);
-                packData = await curseforge.getPackData(server.modpackID);
-                packLogo = packData.logo.url;
-                packURL = `https://www.curseforge.com/minecraft/modpacks/${packData.slug}/files/${newestUpdateId}`;
+            if (!SUPPORTED_PLATFORMS.has(server.platform)) {
+                sessionLogger.warn('CheckForUpdates', `Skipping ${server.name} (${server.tag}): unsupported platform '${server.platform || ''}' - fix the server doc in Bifrost.`);
+                continue;
             }
 
-            if (server.platform === "feedthebeast") {
-                newestUpdateId = await modpacksch.getLatestFTBVersionId(server.modpackID);
-                packManifest = await modpacksch.getFTBPackManifest(server.modpackID, newestUpdateId);
-                packData = await modpacksch.getFTBPackData(server.modpackID);
-                packLogo = packData.art[0].url;
-                packURL = `https://www.feed-the-beast.com/modpacks/${server.modpackID}?tab=versions`;
+            try {
+                numberOfUpdates += await checkServer(server);
+            } catch (error) {
+                sessionLogger.error('CheckForUpdates', `Failed to check ${server.name} (${server.tag}): ${error.message}`);
             }
-
-            if (server.fileID === newestUpdateId) {
-                sessionLogger.info('CheckForUpdates', `No updates found for ${server.name}.`);
-            } else {
-                const newVersionNumber = functions.getVersion(packManifest.name) || 'unknown';
-
-                sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
-                updateRequired = true;
-                numberOfUpdates++;
-
-                if (active && server.newestFileID != newestUpdateId) {
-                    const embed = new EmbedBuilder()
-                        .setAuthor({
-                            name: server.name,
-                            iconURL: packLogo,
-                        })
-                        .setTitle("<a:Update:1242446803345866883><a:U_:1242446802083385426><a:pd:1242446800586280960><a:ate:1242446799093104650>")
-                        .setDescription(`An update was detected for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})\n\nLearn more here: [Changelog](${packURL})`)
-                        .setColor("#00f597")
-                        .setFooter({
-                            text: "To run automated update use /update",
-                        })
-                        .setTimestamp();
-                    const updateWebhook = {
-                        embeds: [embed],
-                    };
-
-                    await sendWebhook(staffChannelId, updateWebhook);
-                }
-            }
-
-            await yggdrasil.updateServer(server.tag, {
-                newestFileID: newestUpdateId,
-                requiresUpdate: updateRequired
-            });
-            //console.log(newestUpdateId);
         }
 
         return numberOfUpdates;
     }
 };
+
+const SUPPORTED_PLATFORMS = new Set(["curseforge", "gregtechnewhorizons", "feedthebeast"]);
+
+/**
+ * Checks a single server for updates and syncs newestFileID/requiresUpdate to Yggdrasil.
+ * @param {object} server Server doc from Yggdrasil.
+ * @returns {Promise<number>} 1 if an update is available, 0 otherwise.
+ */
+async function checkServer(server) {
+    let newestUpdateId = 0;
+    let updateRequired = false;
+    let packManifest = {};
+    let packData = {};
+    let packURL = "";
+    let packLogo = "";
+
+    if (server.platform === "curseforge" || server.platform === "gregtechnewhorizons") {
+        newestUpdateId = await curseforge.getLatestVersionId(server.modpackID);
+        packManifest = await modpacksch.getCFPackManifest(server.modpackID, newestUpdateId);
+        packData = await curseforge.getPackData(server.modpackID);
+        packLogo = packData.logo.url;
+        packURL = `https://www.curseforge.com/minecraft/modpacks/${packData.slug}/files/${newestUpdateId}`;
+    }
+
+    if (server.platform === "feedthebeast") {
+        newestUpdateId = await modpacksch.getLatestFTBVersionId(server.modpackID);
+        packManifest = await modpacksch.getFTBPackManifest(server.modpackID, newestUpdateId);
+        packData = await modpacksch.getFTBPackData(server.modpackID);
+        packLogo = packData.art[0].url;
+        packURL = `https://www.feed-the-beast.com/modpacks/${server.modpackID}?tab=versions`;
+    }
+
+    if (!newestUpdateId) {
+        throw new Error(`could not resolve latest version id for modpack ${server.modpackID} on ${server.platform}`);
+    }
+
+    if (server.fileID === newestUpdateId) {
+        sessionLogger.info('CheckForUpdates', `No updates found for ${server.name}.`);
+    } else {
+        const newVersionNumber = functions.getVersion(packManifest && packManifest.name) || 'unknown';
+
+        sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
+        updateRequired = true;
+
+        if (active && server.newestFileID != newestUpdateId) {
+            const embed = new EmbedBuilder()
+                .setAuthor({
+                    name: server.name,
+                    iconURL: packLogo,
+                })
+                .setTitle("<a:Update:1242446803345866883><a:U_:1242446802083385426><a:pd:1242446800586280960><a:ate:1242446799093104650>")
+                .setDescription(`An update was detected for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})\n\nLearn more here: [Changelog](${packURL})`)
+                .setColor("#00f597")
+                .setFooter({
+                    text: "To run automated update use /update",
+                })
+                .setTimestamp();
+            const updateWebhook = {
+                embeds: [embed],
+            };
+
+            await sendWebhook(staffChannelId, updateWebhook);
+        }
+    }
+
+    await yggdrasil.updateServer(server.tag, {
+        newestFileID: newestUpdateId,
+        requiresUpdate: updateRequired
+    });
+
+    return updateRequired ? 1 : 0;
+}

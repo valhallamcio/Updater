@@ -26,7 +26,13 @@ module.exports = {
         await interaction.deferReply();
         await interaction.editReply('Checking for updates...');
 
-        const updates = await updateCheck();
+        let updates;
+        try {
+            updates = await updateCheck();
+        } catch (error) {
+            await interaction.editReply(`Checking for updates... Failed: ${error.message}`);
+            throw error;
+        }
 
         await interaction.editReply(`Checking for updates... Done! Found **${updates}** updates! 🎉`);
     },
