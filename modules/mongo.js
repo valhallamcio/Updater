@@ -772,6 +772,174 @@ module.exports = {
         return { ips: ipArr, alts: alts };
     },
 
+    // Bifrost notices + mail (the `bifrost` DB, same cluster). The proxy watches
+    // bifrost.notices with a change stream, so a write here reaches players in ~1s.
+    /**
+     * Gets the Bifrost database handle (notices, mail, players, logs).
+     * @returns {Promise<import('mongodb').Db>} The `bifrost` database.
+     */
+    getBifrostDb: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+        return mongoClient.db('bifrost');
+    },
+
+    /**
+     * Creates or replaces a notice by its id. The proxy validates the doc shape,
+     * so callers must build it with discord/commands/util/noticeDoc.js.
+     * @param {object} doc Notice doc (must carry `id` and `type`).
+     * @returns {Promise<object>} The updateOne result.
+     */
+    upsertNotice: async function (doc) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const { id, ...rest } = doc;
+        return mongoClient
+            .db('bifrost')
+            .collection('notices')
+            .updateOne({ id: id }, { $set: { id: id, ...rest } }, { upsert: true });
+    },
+
+    /**
+     * Lists notices, newest first.
+     * @param {string} [type] Restrict to one type (help, tip, announcement, ...).
+     * @param {number} limit Max docs (Discord embeds cap at 25 fields).
+     * @returns {Promise<object[]>} Notice docs.
+     */
+    listNotices: async function (type, limit = 25) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const filter = type ? { type: type } : {};
+        return mongoClient
+            .db('bifrost')
+            .collection('notices')
+            .find(filter)
+            .sort({ updatedAt: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * Gets one notice by id.
+     * @param {string} id Notice id.
+     * @returns {Promise<object|null>} The doc or null.
+     */
+    getNotice: async function (id) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('notices')
+            .findOne({ id: id });
+    },
+
+    /**
+     * Enables or retires a notice. Staff never delete from Discord - a retired
+     * doc keeps its history and can be switched back on.
+     * @param {string} id Notice id.
+     * @param {boolean} enabled New enabled state.
+     * @param {string} updatedBy Who did it.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    setNoticeEnabled: async function (id, enabled, updatedBy) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('notices')
+            .updateOne({ id: id }, {
+                $set: {
+                    enabled: enabled,
+                    updatedBy: updatedBy,
+                    updatedAt: new Date()
+                }
+            });
+    },
+
+    /**
+     * Adds or replaces one language of a notice's text. `tip` docs keep their text
+     * under `card`, every other type under `body` - the proxy validates both shapes.
+     * @param {string} id Notice id.
+     * @param {string} lang Language code (en, es, de, ...).
+     * @param {string} text Text for that language.
+     * @param {string} updatedBy Who did it.
+     * @returns {Promise<object|null>} The updateOne result, or null when the id is unknown.
+     */
+    setNoticeBodyLang: async function (id, lang, text, updatedBy) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const notices = mongoClient.db('bifrost').collection('notices');
+        const existing = await notices.findOne({ id: id }, { projection: { type: 1 } });
+        if (!existing) return null;
+
+        const field = existing.type === 'tip' ? 'card' : 'body';
+        return notices.updateOne({ id: id }, {
+            $set: {
+                [`${field}.${lang}`]: text,
+                updatedBy: updatedBy,
+                updatedAt: new Date()
+            }
+        });
+    },
+
+    /**
+     * Prefix-searches notice ids for autocomplete.
+     * @param {string} prefix Id prefix the user is typing.
+     * @param {number} limit Max results.
+     * @returns {Promise<string[]>} Matching ids.
+     */
+    searchNoticeIds: async function (prefix, limit = 25) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const escaped = String(prefix || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const filter = escaped ? { id: { $regex: escaped, $options: 'i' } } : {};
+        const docs = await mongoClient
+            .db('bifrost')
+            .collection('notices')
+            .find(filter, { projection: { id: 1, _id: 0 } })
+            .limit(limit)
+            .toArray();
+        return docs.map(d => d.id).filter(Boolean);
+    },
+
+    /**
+     * Inserts one mail doc. The proxy's change stream delivers it inline when the
+     * recipient is online, otherwise it waits in their inbox.
+     * @param {object} doc Mail doc (build it with discord/commands/util/mailDoc.js).
+     * @returns {Promise<object>} The insertOne result.
+     */
+    insertMail: async function (doc) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('mail')
+            .insertOne(doc);
+    },
+
     /**
      * Gets the main MongoDB client (for advanced queries).
      * @returns {MongoClient} The main MongoDB client
