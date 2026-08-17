@@ -66,6 +66,10 @@ module.exports = {
         }
         for (const id of instanceIds) {
             if (rebootScheduler.cancelServerReboot(id)) abortedRunning++;
+            // Belt and braces: the proxy shows a countdown for any open reboot_events doc, and one
+            // can outlive this process' warning window (a VU restart mid-countdown). Stamp it even
+            // when nothing is running here.
+            mongo.cancelRebootEvents(id).catch(() => {});
         }
 
         if (!cancelledPending && abortedRunning === 0) {

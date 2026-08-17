@@ -91,7 +91,14 @@ module.exports = {
         const results = await Promise.all(instances.map(s =>
             // scheduled:true => don't treat a server the daily batch already rebooted today as a
             // "duplicate" (completedServers lingers until the GMT+3 day rollover). See rebootScheduler.isServerActive.
-            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', { warnWindowMinutes: job.warnWindow, scheduled: true })
+            // requestedBy/reason ride along so the countdown doc in valhallamc.reboot_events says
+            // who asked (a "Player vote (4/6)" job is the vote-restart source, staff otherwise).
+            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', {
+                warnWindowMinutes: job.warnWindow,
+                scheduled: true,
+                requestedBy: job.requestedBy,
+                reason: job.reason,
+            })
                 .then(r => ({ s, r }))
                 .catch(e => ({ s, r: { success: false, reason: e.message } }))
         ));

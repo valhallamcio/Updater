@@ -367,6 +367,81 @@ module.exports = {
         return jobs;
     },
 
+    // Reboot countdowns (valhallamc.reboot_events). Bifrost renders the countdown itself
+    // (boss bar / action bar per client era) and keeps a planned restart from being relayed
+    // as a crash; this collection is its only source, so EVERY countdown writes one doc.
+    /**
+     * Records the start of a reboot countdown.
+     * @param {object} doc Countdown doc (built in schedulers/rebootScheduler.js).
+     * @returns {Promise<object|null>} The inserted _id.
+     */
+    insertRebootEvent: async function (doc) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const result = await mongoClient
+            .db(mongoDBName)
+            .collection('reboot_events')
+            .insertOne(doc);
+        return result.insertedId;
+    },
+
+    /**
+     * Stamps every still-open countdown of a server as cancelled, so the proxy takes the
+     * bar down instead of counting to a restart that is no longer coming.
+     * @param {string} serverId Pterodactyl server id.
+     * @returns {Promise<object>} The updateMany result.
+     */
+    cancelRebootEvents: async function (serverId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('reboot_events')
+            .updateMany(
+                { serverId: serverId, cancelledAt: null, fireAt: { $gt: new Date() } },
+                { $set: { cancelledAt: new Date() } }
+            );
+    },
+
+    /**
+     * Stamps a countdown as reached (the server is being stopped now).
+     * @param {*} id The _id insertRebootEvent returned.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    completeRebootEvent: async function (id) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('reboot_events')
+            .updateOne({ _id: id }, { $set: { completedAt: new Date() } });
+    },
+
+    /**
+     * Creates the reboot_events indexes: a 2-day TTL (the docs are only interesting while
+     * the countdown runs) and the lookup the proxy polls with.
+     * @returns {Promise<void>}
+     */
+    ensureRebootEventIndexes: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const collection = mongoClient.db(mongoDBName).collection('reboot_events');
+        await collection.createIndex({ createdAt: 1 }, { expireAfterSeconds: 172800, name: 'reboot_events_ttl' });
+        await collection.createIndex({ serverId: 1, startedAt: -1 }, { name: 'reboot_events_server' });
+    },
+
     /**
      * Stores a reboot request for tracking
      * @param {object} requestData Reboot request data

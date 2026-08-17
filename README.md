@@ -141,6 +141,26 @@ A finished pack update also posts an in-game `event` card automatically
 telling players to restart their launcher. Gate it with `notices.packUpdateEvents: false` in
 `config/config.json` — the call is fire-and-forget and can never fail or delay an update.
 
+**`valhallamc.reboot_events`** (one doc per reboot countdown, written by the reboot scheduler):
+the proxy renders reboot countdowns itself — boss bar / action bar per client era — and keeps a
+planned restart from being relayed to players as a crash. This collection is its only source, so
+a doc is written at the start of **every** countdown, at the one choke point all paths share
+(`executeRebootWarningsEnhanced`): the daily batch, a staff `/reboot` and a player vote alike.
+
+| Field | Notes |
+| --- | --- |
+| `type` | always `countdown` |
+| `tag`, `serverId`, `serverName` | which server is going down (`serverId` is the Pterodactyl id) |
+| `source` | `daily` (automated batch) · `scheduled` (a `schedule_jobs` job, i.e. staff `/reboot`) · `vote` (that job's `requestedBy` starts with `Player vote`) · `manual` / `unknown` for a caller passing its own |
+| `startedAt`, `warnSeconds`, `fireAt` | the window actually used: `fireAt = startedAt + warnSeconds` |
+| `requestedBy`, `reason` | only when the job carried them |
+| `cancelledAt` | set by `/reboot-cancel` (and any other abort) on every still-open doc of that server |
+| `completedAt` | set when the countdown reaches the stop step |
+| `createdAt` | 2-day TTL index |
+
+Writes are fire-and-forget and wrapped: a Mongo outage can never fail or delay a reboot. Turn the
+relay off with `scheduler.rebootScheduler.rebootEvents: false` in `config/config.json`.
+
 ## Schedulers
 
 | Scheduler | Description |
