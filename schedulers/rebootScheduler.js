@@ -21,8 +21,13 @@ module.exports = {
         "apiRetryDelay": 2000, // NEW: Delay between API retries
         "apiMaxRetries": 3, // NEW: Max API call retries
         "nodeRebootDelay": 5000, // NEW: Delay between nodes
-        "serverRebootDelay": 3000 // NEW: Delay between servers
+        "serverRebootDelay": 3000, // NEW: Delay between servers
+        "rebootEvents": true // Write every countdown into valhallamc.reboot_events (the proxy renders it)
     },
+
+    // Open countdown docs (serverId -> { startedAt, id: Promise<insertedId|null> }), so the
+    // stop step can stamp the doc it started and a retry inside the same minute can't double-write.
+    rebootEventState: new Map(),
 
     // Enhanced state tracking with thread-safe operations
     state: {
@@ -98,6 +103,12 @@ module.exports = {
         
         // Store runtime config for use throughout the module
         this.runtimeConfig = options;
+
+        // Best effort: the countdown relay works without its indexes, just slower.
+        if (this.rebootEventsEnabled()) {
+            mongo.ensureRebootEventIndexes().catch(error =>
+                sessionLogger.warn('RebootScheduler', `reboot_events indexes not ensured: ${error.message}`));
+        }
         
         // Initialize today's stats
         try {
@@ -862,9 +873,14 @@ module.exports = {
                 // during the countdown means the server is fresh again — don't stop it a second
                 // time. Players just saw the countdown, so tell them it's cancelled.
                 if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
+                    // Close the countdown doc as reached before walking away: the window did run to
+                    // its end, and a cancel stamp only matches a doc whose fireAt is still ahead —
+                    // this one's isn't, so left alone it stays open and the proxy keeps the bar up.
+                    this.finishRebootEvent(server.serverId);
                     await this.sendFreshRestartCancelNotice(server);
                     return { success: true, reason: 'recently_restarted', skipped: true };
                 }
+                this.finishRebootEvent(server.serverId);
                 const stoppedResult = await this.ensureServerStopped(server, { checkFreshUptime: !opts.scheduled });
                 if (stoppedResult === 'skipped') {
                     // Server bounced during the save flush — same handling as the post-warning checkpoint.
@@ -887,6 +903,11 @@ module.exports = {
 
             } catch (error) {
                 sessionLogger.error('RebootScheduler', `[${server.name}] Attempt ${attempt} failed: ${error.message}`);
+                // This attempt's countdown doc dies with the attempt. recordRebootEvent runs at every
+                // entry into the warning window and its 60s dedupe cannot cover a window that threw at
+                // minute 10, so without the stamp the retry inserts a SECOND still-open doc and the
+                // proxy renders two bars for one server.
+                if (this.rebootEventState.has(server.serverId)) this.markRebootEventsCancelled(server.serverId);
                 if (attempt < maxRetries) {
                     const delay = 10000 * attempt;
                     sessionLogger.info('RebootScheduler', `[${server.name}] Waiting ${delay/1000}s before retry...`);
@@ -901,6 +922,101 @@ module.exports = {
         this.state.todayStats.failedReboots++;
         await this.alertStaffServerFailure(server, `Failed after ${maxRetries} attempts`);
         return { success: false, reason: `Failed after ${maxRetries} attempts` };
+    },
+
+    /** Countdown relay to the proxy: on unless config.json turns it off. */
+    rebootEventsEnabled: function () {
+        return !this.runtimeConfig || this.runtimeConfig.rebootEvents !== false;
+    },
+
+    /**
+     * Where a countdown came from, from what the caller actually knows: no opts = the daily
+     * batch; opts.scheduled = a schedule_jobs job, which is a player vote when vote-restart
+     * wrote it ("Player vote (4/6)") and staff otherwise. A caller with better information
+     * (a path that is neither) passes its own opts.source.
+     */
+    rebootEventSource: function (opts = {}) {
+        const given = String(opts.source || '');
+        if (['daily', 'scheduled', 'manual', 'vote', 'unknown'].includes(given)) return given;
+        if (!opts.scheduled) return 'daily';
+        return /^player vote/i.test(String(opts.requestedBy || '')) ? 'vote' : 'scheduled';
+    },
+
+    /**
+     * Records a starting countdown in valhallamc.reboot_events. Bifrost reads ONLY this
+     * collection to render the countdown in game and to keep the restart from being relayed
+     * as a crash, so every path lands here — daily batch, staff schedule and player vote alike.
+     * Fire-and-forget by design: a Mongo outage must never fail or delay a reboot.
+     * @param {object} server Server being rebooted.
+     * @param {object} opts executeFullServerReboot opts (scheduled, requestedBy, reason).
+     * @param {number} warnSeconds The warning window actually used.
+     */
+    recordRebootEvent: function (server, opts = {}, warnSeconds = 0) {
+        if (!this.rebootEventsEnabled()) return;
+
+        const startedAt = new Date();
+        // One doc per countdown: a second path reaching the same server (or a retry attempt
+        // in the same minute) must not write a second bar for the players to see.
+        const open = this.rebootEventState.get(server.serverId);
+        if (open && startedAt.getTime() - open.startedAt < 60000) return;
+
+        const doc = {
+            type: 'countdown',
+            tag: server.tag || null,
+            serverId: server.serverId,
+            serverName: server.name || server.tag || null,
+            source: this.rebootEventSource(opts),
+            startedAt: startedAt,
+            warnSeconds: warnSeconds,
+            fireAt: new Date(startedAt.getTime() + warnSeconds * 1000),
+            cancelledAt: null,
+            completedAt: null,
+            createdAt: startedAt,
+        };
+        if (opts.requestedBy) doc.requestedBy = opts.requestedBy;
+        if (opts.reason) doc.reason = opts.reason;
+
+        let id = Promise.resolve(null);
+        try {
+            id = Promise.resolve(mongo.insertRebootEvent(doc)).catch(error => {
+                sessionLogger.warn('RebootScheduler', `[${server.name}] reboot_events insert failed: ${error.message}`);
+                return null;
+            });
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `[${server.name}] reboot_events insert failed: ${error.message}`);
+        }
+        this.rebootEventState.set(server.serverId, { startedAt: startedAt.getTime(), id: id });
+    },
+
+    /**
+     * Stamps this server's countdown doc as reached (the stop step is running now).
+     * @param {string} serverId Pterodactyl server id.
+     */
+    finishRebootEvent: function (serverId) {
+        const open = this.rebootEventState.get(serverId);
+        if (!open) return;
+        this.rebootEventState.delete(serverId);
+        try {
+            Promise.resolve(open.id)
+                .then(id => (id ? mongo.completeRebootEvent(id) : null))
+                .catch(() => {});
+        } catch (_) { /* best effort */ }
+    },
+
+    /**
+     * Stamps every open countdown doc of a server as cancelled, so the proxy drops the bar
+     * instead of counting down to a restart that is no longer coming.
+     * @param {string} serverId Pterodactyl server id.
+     */
+    markRebootEventsCancelled: function (serverId) {
+        this.rebootEventState.delete(serverId);
+        try {
+            Promise.resolve(mongo.cancelRebootEvents(serverId)).catch(error => {
+                sessionLogger.warn('RebootScheduler', `reboot_events cancel failed for ${serverId}: ${error.message}`);
+            });
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `reboot_events cancel failed for ${serverId}: ${error.message}`);
+        }
     },
 
     /**
@@ -958,6 +1074,9 @@ module.exports = {
     cancelServerReboot: function (serverId) {
         const active = this.state.activeReboots.has(serverId);
         this.state.cancelRequested.add(serverId);
+        // Stamp the countdown doc regardless: the abort below only reaches a warning window
+        // this process is running, while the proxy is showing a bar for any open doc.
+        this.markRebootEventsCancelled(serverId);
         return active;
     },
 
@@ -1013,6 +1132,9 @@ module.exports = {
             `${dryRun ? ' (DRY RUN)' : ''}`);
 
         this.state.cancelRequested.delete(server.serverId);
+        // The countdown starts here for every path (batch, staff schedule, player vote), so this
+        // is where the proxy's copy of it is written.
+        this.recordRebootEvent(server, opts, warnSeconds);
 
         const rebootAt = Date.now() + warnSeconds * 1000;
         const doneMilestones = new Set();

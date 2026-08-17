@@ -104,8 +104,70 @@ falling back to a legacy shared archive with the per-server snapshot laid over t
 | `/tickets <user>` | Show a user's solved ticket count |
 | `/cake [amount]` | Drop cakes to online players |
 | `/banall <players> <reason>` | Ban a list of players across servers |
+| `/notice` | Author the in-game notices players see (create, broadcast, list, expire, enable, translate, show) |
+| `/reply <player> <text>` | Send a player an in-game message from staff |
 | `/ping` | Health check |
 | `/reloadCommands` | Reload all bot commands |
+
+## In-game notices and mail (Bifrost contract)
+
+`/notice` and `/reply` write straight into the Bifrost proxy's collections; the proxy watches
+both with change streams, so a write reaches players in about a second. Nothing here deletes:
+`/notice expire` flips `enabled:false` and keeps the doc. Both commands refuse a text carrying
+`<click:` or `<hover:` — staff don't author clickable MiniMessage from Discord.
+
+**`bifrost.notices`** (one doc per notice, keyed by `id`, upserted by `/notice`):
+
+| Field | Notes |
+| --- | --- |
+| `id` | `[a-z0-9][a-z0-9._-]*`, max 128. Default `<prefix>.<slug>-<base36 ts>` (prefixes: `announcement`, `broadcast`, `pinned`, `issue`, `event`, `tip`) |
+| `type` | `announcement` (rotation) · `broadcast` (one-shot to everyone online) · `pinned` / `known_issue` / `event` (join card + board) · `tip` (guide card override) |
+| `enabled` | `false` retires it |
+| `title` | max 48 chars; required for `pinned`, `known_issue`, `event` |
+| `body` | `{ en: "..." }`, max 400 chars — **except `tip`, which stores its text under `card`** |
+| `targets` | `{ tags: [...], newPlayersOnly, minProto, maxProto, langs }` — versions map to protocol numbers (1.7.10=5, 1.12.2=340, 1.20.1=763, 1.21.1=767, ...) |
+| `buttons` | always written as `[]` from Discord |
+| `startsAt` / `expiresAt` | `Nh` / `Nd` from now; an `event` uses `endsAt` instead and **requires** it |
+| `createdAt` | always set — a `broadcast` without it is dropped by the proxy |
+| `updatedAt`, `updatedBy`, `note` | authorship; `updatedBy` is the Discord tag |
+
+**`bifrost.mail`** (one doc per message, inserted by `/reply`): `to` (uuid), `toName`,
+`from: { uuid: null, name }`, `kind: 'admin'`, `body` (max 500), `sentAt`, `readAt: null`,
+`expiresAt` (90 days), `meta: { via: 'discord', discordId }`. The proxy delivers an unread doc
+inline when the player is online, otherwise it waits in their in-game inbox (`/mail`).
+
+A **`tip`** doc overrides the text of ONE guide card, and the guide looks that card up by its
+fixed id — so `/notice create type:tip` **requires** an `id`, and it must start with `tip.`.
+A generated id would match no card and the text would never be shown. Known ids:
+`tip.welcome.help`, `tip.onboard.welcome`, `tip.onboard.chat`, `tip.onboard.stuck`,
+`tip.crash.rejoin`, `tip.translate.offer`, `tip.translate.why`, `tip.channel_churn`,
+`tip.reply`, `tip.pm_offline`, and `tip.closure.map.<tag>` (one per closed pack). An id outside
+that list is a warning, not a refusal — the guide gains cards faster than the list does.
+
+A finished pack update also posts an in-game `event` card automatically
+(`modules/notices.js` → `event.update.<tag>.<yyyymmdd>`, targeted at that tag, visible 3 days),
+telling players to restart their launcher. Gate it with `notices.packUpdateEvents: false` in
+`config/config.json` — the call is fire-and-forget and can never fail or delay an update.
+
+**`valhallamc.reboot_events`** (one doc per reboot countdown, written by the reboot scheduler):
+the proxy renders reboot countdowns itself — boss bar / action bar per client era — and keeps a
+planned restart from being relayed to players as a crash. This collection is its only source, so
+a doc is written at the start of **every** countdown, at the one choke point all paths share
+(`executeRebootWarningsEnhanced`): the daily batch, a staff `/reboot` and a player vote alike.
+
+| Field | Notes |
+| --- | --- |
+| `type` | always `countdown` |
+| `tag`, `serverId`, `serverName` | which server is going down (`serverId` is the Pterodactyl id) |
+| `source` | `daily` (automated batch) · `scheduled` (a `schedule_jobs` job, i.e. staff `/reboot`) · `vote` (that job's `requestedBy` starts with `Player vote`) · `manual` / `unknown` for a caller passing its own |
+| `startedAt`, `warnSeconds`, `fireAt` | the window actually used: `fireAt = startedAt + warnSeconds` |
+| `requestedBy`, `reason` | only when the job carried them |
+| `cancelledAt` | set by `/reboot-cancel` (and any other abort) on every still-open doc of that server |
+| `completedAt` | set when the countdown reaches the stop step |
+| `createdAt` | 2-day TTL index |
+
+Writes are fire-and-forget and wrapped: a Mongo outage can never fail or delay a reboot. Turn the
+relay off with `scheduler.rebootScheduler.rebootEvents: false` in `config/config.json`.
 
 ## Schedulers
 

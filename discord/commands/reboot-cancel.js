@@ -60,15 +60,23 @@ module.exports = {
 
         let cancelledPending = false;
         let abortedRunning = 0;
+        let stampedDocs = 0;
         if (job) {
             await mongo.deactivateScheduleJob(job._id);
             cancelledPending = true;
         }
         for (const id of instanceIds) {
+            // Belt and braces: the proxy shows a countdown for any open reboot_events doc, and one
+            // can outlive this process' warning window (a VU restart mid-countdown). Stamp it even
+            // when nothing is running here — and stamp it BEFORE cancelServerReboot, which fires the
+            // same updateMany without awaiting it and would leave this count at 0 for a doc it won.
+            stampedDocs += await mongo.cancelRebootEvents(id)
+                .then(r => (r && r.modifiedCount) || 0)
+                .catch(() => 0);
             if (rebootScheduler.cancelServerReboot(id)) abortedRunning++;
         }
 
-        if (!cancelledPending && abortedRunning === 0) {
+        if (!cancelledPending && abortedRunning === 0 && stampedDocs === 0) {
             await interaction.editReply(`No pending or in-progress reboot found for \`${tag}\`.`);
             return;
         }
@@ -76,6 +84,9 @@ module.exports = {
         const parts = [];
         if (cancelledPending) parts.push('pending schedule removed');
         if (abortedRunning > 0) parts.push(`${abortedRunning} in-progress countdown(s) aborted`);
+        // Nothing in this process' memory, but the proxy was rendering a bar for the doc we just
+        // stamped — telling staff "nothing found" while cancelling it is the report that lies.
+        if (abortedRunning === 0 && stampedDocs > 0) parts.push(`${stampedDocs} proxy countdown(s) cancelled`);
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)

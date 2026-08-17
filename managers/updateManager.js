@@ -45,6 +45,7 @@ const {
 } = require('../discord/webhook');
 const manifest = require('../modules/manifest');
 const perInstanceFiles = require('../modules/perInstanceFiles');
+const notices = require('../modules/notices');
 const sessionLogger = require('../modules/sessionLogger');
 const {
     active,
@@ -703,10 +704,11 @@ module.exports = {
 
         //TODO ai summary ???
         const packData = await curseforge.getPackData(pack.modpackID);
+        const changelogUrl = `https://www.curseforge.com/minecraft/modpacks/${packData.slug}/files/${pack.newestFileID}`;
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newVersionNumber)
             .replace("[OLDVERSION]", pack.modpackVersion)
-            .replace("[CHANGELOGURL]", `https://www.curseforge.com/minecraft/modpacks/${packData.slug}/files/${pack.newestFileID}`)
+            .replace("[CHANGELOGURL]", changelogUrl)
             .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "");
 
@@ -717,6 +719,15 @@ module.exports = {
         };
 
         await sendWebhook(announcementChannelId, updateWebhook);
+
+        // In-game "pack updated" card for players who join on the old client version.
+        // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
+        notices.postPackUpdateEvent({
+            tag: pack.tag,
+            name: pack.name,
+            version: newVersionNumber,
+            changelogUrl: changelogUrl
+        });
 
     },
 
@@ -875,10 +886,11 @@ module.exports = {
 
         //TODO ai summary ???
         const packData = await modpacksch.getFTBPackData(pack.modpackID);
+        const changelogUrl = `https://www.feed-the-beast.com/modpacks/${pack.modpackID}?tab=versions`;
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newVersionNumber)
             .replace("[OLDVERSION]", pack.modpackVersion)
-            .replace("[CHANGELOGURL]", `https://www.feed-the-beast.com/modpacks/${pack.modpackID}?tab=versions`)
+            .replace("[CHANGELOGURL]", changelogUrl)
             .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "");
 
@@ -889,6 +901,15 @@ module.exports = {
         };
 
         await sendWebhook(announcementChannelId, updateWebhook);
+
+        // In-game "pack updated" card for players who join on the old client version.
+        // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
+        notices.postPackUpdateEvent({
+            tag: pack.tag,
+            name: pack.name,
+            version: newVersionNumber,
+            changelogUrl: changelogUrl
+        });
     },
 
     /**
@@ -1273,10 +1294,11 @@ module.exports = {
 
         // Use consistent webhook structure
         // Note: GTNH doesn't have a specific pack data endpoint like CF/FTB for logo/summary
+        const changelogUrl = `https://wiki.gtnewhorizons.com/wiki/Upcoming_Features`; // Standard GTNH changelog link
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newestVersion)
             .replace("[OLDVERSION]", currentVersion) // Use the extracted currentVersion
-            .replace("[CHANGELOGURL]", `https://wiki.gtnewhorizons.com/wiki/Upcoming_Features`) // Standard GTNH changelog link
+            .replace("[CHANGELOGURL]", changelogUrl)
             .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "Check the GTNH wiki for detailed changes."); // Placeholder summary
 
@@ -1289,6 +1311,15 @@ module.exports = {
         if (active) {
             await sendWebhook(announcementChannelId, updateWebhook);
         }
+
+        // In-game "pack updated" card for players who join on the old client version.
+        // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
+        notices.postPackUpdateEvent({
+            tag: pack.tag,
+            name: pack.name,
+            version: newestVersion,
+            changelogUrl: changelogUrl
+        });
 
         progressLog += ` Done!\n\n**Update completed successfully!** The server **${pack.name}** is now running GTNH version **${newestVersion}**.`;
         await editProgress(interaction, progressLog);
@@ -1544,10 +1575,11 @@ module.exports = {
             requiresUpdate: false
         });
 
+        const changelogUrl = newRelease.htmlUrl;
         const updateMessageContent = updateMessage.replace("[PACKNAME]", pack.name)
             .replace("[NEWVERSION]", newestVersion)
             .replace("[OLDVERSION]", currentVersion)
-            .replace("[CHANGELOGURL]", newRelease.htmlUrl)
+            .replace("[CHANGELOGURL]", changelogUrl)
             .replace("[PINGROLE]", `<@&${pack.discordRoleId}>`)
             .replace("[SUMMARY]", "Check the GitHub release for detailed changes.");
 
@@ -1560,6 +1592,15 @@ module.exports = {
         if (active) {
             await sendWebhook(announcementChannelId, updateWebhook);
         }
+
+        // In-game "pack updated" card for players who join on the old client version.
+        // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
+        notices.postPackUpdateEvent({
+            tag: pack.tag,
+            name: pack.name,
+            version: newestVersion,
+            changelogUrl: changelogUrl
+        });
 
         progressLog += ` Done!\n\n**Update completed successfully!** The server **${pack.name}** is now running GTO version **${newestVersion}**.`;
         await editProgress(interaction, progressLog);
