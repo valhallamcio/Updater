@@ -15,6 +15,8 @@ const rs = require('../schedulers/rebootScheduler');
 const mongo = require('../modules/mongo');
 const pterodactyl = require('../modules/pterodactyl');
 const functions = require('../modules/functions');
+const yggdrasil = require('../modules/yggdrasil');
+const rebootCancel = require('../discord/commands/reboot-cancel');
 
 const orig = {
     insertRebootEvent: mongo.insertRebootEvent,
@@ -27,18 +29,20 @@ const orig = {
 let inserted;
 let cancelled;
 let completed;
+let events; // insert/cancel/complete in the order they were issued
 
 beforeEach(() => {
     inserted = [];
     cancelled = [];
     completed = [];
+    events = [];
     rs.rebootEventState.clear();
     rs.state.activeReboots.clear();
     rs.state.completedServers.clear();
     rs.state.cancelRequested.clear();
-    mongo.insertRebootEvent = async (doc) => { inserted.push(doc); return `id-${inserted.length}`; };
-    mongo.cancelRebootEvents = async (serverId) => { cancelled.push(serverId); return { modifiedCount: 1 }; };
-    mongo.completeRebootEvent = async (id) => { completed.push(id); return { modifiedCount: 1 }; };
+    mongo.insertRebootEvent = async (doc) => { inserted.push(doc); events.push('insert'); return `id-${inserted.length}`; };
+    mongo.cancelRebootEvents = async (serverId) => { cancelled.push(serverId); events.push('cancel'); return { modifiedCount: 1 }; };
+    mongo.completeRebootEvent = async (id) => { completed.push(id); events.push('complete'); return { modifiedCount: 1 }; };
     // A one-second window: the countdown loop runs for real, just briefly.
     rs.runtimeConfig = {
         rebootEvents: true,
@@ -156,4 +160,93 @@ test('the stop step stamps the countdown it started as completed', async () => {
     await new Promise(resolve => setImmediate(resolve)); // the stamp is fire-and-forget
     assert.deepStrictEqual(completed, ['id-1'], 'the doc started by this countdown is the one stamped');
     assert.strictEqual(rs.rebootEventState.size, 0, 'the countdown is no longer open');
+});
+
+test('a warning window that throws closes its doc before the retry opens a second one', async () => {
+    const stubbed = {
+        warn: rs.executeRebootWarningsEnhanced,
+        stop: rs.ensureServerStopped,
+        start: rs.startServerWithMonitoring,
+    };
+    let attempt = 0;
+    rs.executeRebootWarningsEnhanced = async (server, opts) => {
+        attempt++;
+        rs.recordRebootEvent(server, opts, 900);
+        if (attempt === 1) {
+            // Ten minutes into the window the panel dies. The clock matters: the 60s dedupe in
+            // recordRebootEvent does NOT cover a retry this far from the first insert.
+            const open = rs.rebootEventState.get(server.serverId);
+            open.startedAt -= 10 * 60 * 1000;
+            throw new Error('panel 502 at minute 10');
+        }
+        return true;
+    };
+    rs.ensureServerStopped = async () => true;
+    rs.startServerWithMonitoring = async () => {};
+    let result;
+    try {
+        result = await rs.executeFullServerReboot(SERVER, 'node', { scheduled: true });
+    } finally {
+        Object.assign(rs, stubbed);
+        restore();
+    }
+
+    assert.deepStrictEqual(result, { success: true });
+    assert.strictEqual(attempt, 2, 'the failed attempt was retried');
+    assert.deepStrictEqual(events.slice(0, 3), ['insert', 'cancel', 'insert'],
+        'the dead countdown is stamped BEFORE the retry writes its own — never two open docs, never two bars');
+    assert.deepStrictEqual(cancelled, ['abc123']);
+    await new Promise(resolve => setImmediate(resolve)); // the stamp is fire-and-forget
+    assert.deepStrictEqual(completed, ['id-2'], 'only the countdown that reached the stop step is completed');
+});
+
+test('a countdown abandoned at the post-window freshness check does not stay open', async () => {
+    const stubbed = {
+        warn: rs.executeRebootWarningsEnhanced,
+        skip: rs.maybeSkipRecentlyRestarted,
+        notice: rs.sendFreshRestartCancelNotice,
+    };
+    let checks = 0;
+    rs.executeRebootWarningsEnhanced = async (server, opts) => { rs.recordRebootEvent(server, opts, 900); return true; };
+    // Fresh only at the second checkpoint: the server bounced DURING the warning window.
+    rs.maybeSkipRecentlyRestarted = async () => (++checks === 2);
+    rs.sendFreshRestartCancelNotice = async () => {};
+    let result;
+    try {
+        result = await rs.executeFullServerReboot(SERVER, 'node', {});
+    } finally {
+        Object.assign(rs, stubbed);
+        restore();
+    }
+
+    assert.deepStrictEqual(result, { success: true, reason: 'recently_restarted', skipped: true });
+    assert.strictEqual(inserted.length, 1);
+    await new Promise(resolve => setImmediate(resolve)); // the stamp is fire-and-forget
+    assert.deepStrictEqual(completed, ['id-1'], 'the countdown ran its window, so its doc is closed as reached');
+    assert.strictEqual(rs.rebootEventState.size, 0, 'no countdown left open for the next reboot to trip over');
+});
+
+test('/reboot-cancel reports the proxy countdown it stamped when nothing runs in this process', async () => {
+    const origServers = yggdrasil.getServers;
+    const origJobs = mongo.getActiveScheduleJobs;
+    yggdrasil.getServers = async () => [SERVER];
+    mongo.getActiveScheduleJobs = async () => [];
+    const replies = [];
+    const interaction = {
+        user: { username: 'staff' },
+        options: { getString: () => 'atm10' },
+        deferReply: async () => {},
+        editReply: async (payload) => { replies.push(payload); return payload; },
+    };
+    try {
+        await rebootCancel.execute(interaction);
+    } finally {
+        yggdrasil.getServers = origServers;
+        mongo.getActiveScheduleJobs = origJobs;
+        restore();
+    }
+
+    assert.strictEqual(replies.length, 1);
+    assert.ok(replies[0].embeds, 'a stamped doc is a cancellation, not "no pending or in-progress reboot found"');
+    assert.match(replies[0].embeds[0].data.description, /proxy countdown/i);
 });

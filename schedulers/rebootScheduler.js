@@ -873,6 +873,10 @@ module.exports = {
                 // during the countdown means the server is fresh again — don't stop it a second
                 // time. Players just saw the countdown, so tell them it's cancelled.
                 if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
+                    // Close the countdown doc as reached before walking away: the window did run to
+                    // its end, and a cancel stamp only matches a doc whose fireAt is still ahead —
+                    // this one's isn't, so left alone it stays open and the proxy keeps the bar up.
+                    this.finishRebootEvent(server.serverId);
                     await this.sendFreshRestartCancelNotice(server);
                     return { success: true, reason: 'recently_restarted', skipped: true };
                 }
@@ -899,6 +903,11 @@ module.exports = {
 
             } catch (error) {
                 sessionLogger.error('RebootScheduler', `[${server.name}] Attempt ${attempt} failed: ${error.message}`);
+                // This attempt's countdown doc dies with the attempt. recordRebootEvent runs at every
+                // entry into the warning window and its 60s dedupe cannot cover a window that threw at
+                // minute 10, so without the stamp the retry inserts a SECOND still-open doc and the
+                // proxy renders two bars for one server.
+                if (this.rebootEventState.has(server.serverId)) this.markRebootEventsCancelled(server.serverId);
                 if (attempt < maxRetries) {
                     const delay = 10000 * attempt;
                     sessionLogger.info('RebootScheduler', `[${server.name}] Waiting ${delay/1000}s before retry...`);
