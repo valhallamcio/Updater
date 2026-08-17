@@ -106,6 +106,9 @@ falling back to a legacy shared archive with the per-server snapshot laid over t
 | `/banall <players> <reason>` | Ban a list of players across servers |
 | `/notice` | Author the in-game notices players see (create, broadcast, list, expire, enable, translate, show) |
 | `/reply <player> <text>` | Send a player an in-game message from staff |
+| `/link <code>` | Link your Discord to your Minecraft account (code comes from `/link` in game) |
+| `/unlink [player]` | Unlink a Minecraft account from your Discord |
+| `/linked` | List the Minecraft accounts linked to your Discord |
 | `/ping` | Health check |
 | `/reloadCommands` | Reload all bot commands |
 
@@ -168,6 +171,52 @@ a doc is written at the start of **every** countdown, at the one choke point all
 
 Writes are fire-and-forget and wrapped: a Mongo outage can never fail or delay a reboot. Turn the
 relay off with `scheduler.rebootScheduler.rebootEvents: false` in `config/config.json`.
+
+## Discord ↔ Minecraft linking (Bifrost contract)
+
+The proxy mints a 6-character code in game (`/link`), the player brings it here with
+`/link code:<code>`, and the link is written onto their `bifrost.players` doc. The proxy watches
+that collection, so the in-game confirmation card lands about a second later.
+
+**One Discord ↔ many Minecraft accounts, one Minecraft account ↔ one Discord.** A second Discord
+claiming an already-linked account is refused — that account has to run `/unlink` in game (or here)
+first.
+
+**The code is claimed, not read.** `/link` burns it with the lookup (one `findOneAndUpdate` on
+`usedAt: null`) and only then writes the player, with that update filtered on the account still
+being free. Two Discords racing one code therefore make exactly one link, and an in-game link
+landing mid-flow wins instead of being overwritten. A refusal still spends the code — the reply
+says so, and the player just runs `/link` in game again for a fresh one.
+
+**`bifrost.players`** (the three fields this writes):
+
+| Field | Notes |
+| --- | --- |
+| `discord_id` | the snowflake **as a string** — a snowflake does not survive a JS number |
+| `discord_name` | the Discord username at link time |
+| `discord_linked_at` | `Date` |
+
+**`bifrost.discord_link_codes`** (minted in game, burnt here): `code` (6 Crockford base32 chars, no
+I/L/O/U), `uuid`, `username`, `createdAt`, `expiresAt` (10 min), `usedAt`, `usedBy` (Discord id).
+A typed code is folded before the lookup: upper-cased, spaces, dashes and underscores stripped,
+`O`→`0`, `I`/`L`→`1` (`discord/commands/util/linkCode.js`, the same rules as the proxy's
+`codes.ts`). The indexes are created here under the proxy's exact names and options (`link_code`
+unique, `link_uuid`, `link_ttl` on `expiresAt`), so whichever side gets there first the other finds
+them already right.
+
+**`bifrost.discord_link_audit`** (history, nothing reads it in flight): `uuid`, `discordId`,
+`action` (`link` / `unlink`), `by: 'discord'`, `discordName`, `at`, plus `actor` when staff undid
+someone else's link.
+
+`/unlink [player]` removes a link: players only their own accounts (the `player` option
+autocompletes over them, and is only needed with more than one linked), a member with **Manage
+Guild** anyone's. `/linked` lists what this Discord holds.
+
+**Optional Verified role:** set `discordLink.verifiedRoleId` in `config/config.json` to a role id
+string and `/link` grants it, `/unlink` takes it back once that Discord has no linked accounts
+left. `false` (the default) leaves roles alone — don't use `null` or `""`, the config check treats
+an empty value as unfilled and stops the bot. The bot needs **Manage Roles** and its own top role
+**above** the Verified role; a role failure is logged and never fails the link itself.
 
 ## Schedulers
 
