@@ -8,6 +8,10 @@
  * can only link once, and an audit row. A Minecraft account already linked to another
  * Discord is never overwritten, and the optional Verified role can fail all it likes -
  * the link is in Mongo and stays there.
+ *
+ * The two races are covered here because neither shows up in a single-caller test: the
+ * code is claimed atomically (two Discords, one code, one link) and the player write is
+ * filtered on the account still being free (an in-game link landing mid-flow wins).
  */
 
 const { test, beforeEach } = require('node:test');
@@ -18,15 +22,17 @@ const link = require('../discord/commands/link');
 const unlink = require('../discord/commands/unlink');
 const linked = require('../discord/commands/linked');
 const mongo = require('../modules/mongo');
+// captured before beforeEach stubs it out - the index test drives the real one
+const ensureDiscordLinkIndexes = mongo.ensureDiscordLinkIndexes;
 
 const NOW = new Date('2026-08-17T12:00:00Z');
 
-let codeDocs;     // code -> doc returned by findLinkCode
+let codeDocs;     // code -> doc in bifrost.discord_link_codes
 let players;      // uuid -> bifrost.players doc
 let identities;   // lowercased username -> doc for getPlayerIdentity
 let sets;         // setBifrostDiscordLink calls
 let unsets;       // unsetBifrostDiscordLink calls
-let used;         // markLinkCodeUsed calls
+let claims;       // claimLinkCode calls
 let audits;       // insertLinkAudit docs
 let roleCalls;    // {action, userId, roleId} from the fake guild
 let roleFetchThrows;
@@ -43,22 +49,35 @@ beforeEach(() => {
     identities = {};
     sets = [];
     unsets = [];
-    used = [];
+    claims = [];
     audits = [];
     roleCalls = [];
     roleFetchThrows = false;
     configuredRole = null;
 
-    mongo.findLinkCode = async (code) => codeDocs[code] || null;
+    // the real one is ONE findOneAndUpdate: the read and the burn cannot interleave, so
+    // this fake must not await before it mutates either
+    mongo.claimLinkCode = async (code, discordId) => {
+        const doc = codeDocs[code];
+        if (!doc || doc.usedAt) return null;
+        doc.usedAt = NOW;
+        doc.usedBy = String(discordId);
+        claims.push({ code, discordId });
+        return doc;
+    };
     mongo.getBifrostPlayerByUuid = async (uuid) => players[uuid] || null;
     mongo.getPlayerIdentity = async (name) => identities[String(name).toLowerCase()] || null;
     mongo.findBifrostPlayersByDiscordId = async (discordId) =>
         Object.values(players).filter(p => p.discord_id === String(discordId));
     mongo.setBifrostDiscordLink = async (uuid, linkFields) => {
+        // the real filter is {uuid, discord_id: {$in: [null]}} - an account that is already
+        // linked matches nothing, and that is what stops an overwrite
+        const player = players[uuid];
+        if (!player || player.discord_id != null) return { matchedCount: 0, modifiedCount: 0 };
         sets.push({ uuid, ...linkFields });
         // exactly what modules/mongo.js $sets - the field shape is the proxy's contract
-        players[uuid] = { ...players[uuid], ...codes.buildLinkFields(linkFields) };
-        return { modifiedCount: 1 };
+        players[uuid] = { ...player, ...codes.buildLinkFields(linkFields) };
+        return { matchedCount: 1, modifiedCount: 1 };
     };
     mongo.unsetBifrostDiscordLink = async (uuid) => {
         unsets.push(uuid);
@@ -67,11 +86,6 @@ beforeEach(() => {
             delete players[uuid].discord_name;
             delete players[uuid].discord_linked_at;
         }
-        return { modifiedCount: 1 };
-    };
-    mongo.markLinkCodeUsed = async (code, discordId) => {
-        used.push({ code, discordId });
-        if (codeDocs[code]) delete codeDocs[code]; // burnt: a second lookup finds nothing
         return { modifiedCount: 1 };
     };
     mongo.insertLinkAudit = async (doc) => { audits.push(doc); return { insertedId: 'a' }; };
@@ -111,12 +125,21 @@ function interaction(options, opts = {}) {
     };
 }
 
-test('link code normalisation: case, spaces, dashes and the O/I/L lookalikes', () => {
-    assert.strictEqual(codes.normalizeCode(' abc-2 34 '), 'ABC234');
-    assert.strictEqual(codes.normalizeCode('abc234'), 'ABC234');
-    assert.strictEqual(codes.normalizeCode('oil234'), '011234');
-    assert.strictEqual(codes.normalizeCode('ABC—234'), 'ABC234', 'an em dash is a dash too');
-    assert.strictEqual(codes.normalizeCode(null), '');
+test('link code normalisation: case, spaces, dashes, underscores and the O/I/L lookalikes', () => {
+    const table = [
+        ['abc-234', 'ABC234'],
+        ['ABC 234', 'ABC234'],
+        ['abc_234', 'ABC234', 'the proxy strips _ as well - a copied code often carries one'],
+        ['ABC\u2010234', 'ABC234', 'U+2010, what a phone keyboard makes of a hyphen'],
+        ['ABC\u2015234', 'ABC234', 'U+2015 is the top of the dash range'],
+        [' abc-2 34 ', 'ABC234'],
+        ['abc234', 'ABC234'],
+        ['oil234', '011234'],
+        [null, '']
+    ];
+    for (const [input, want, why] of table) {
+        assert.strictEqual(codes.normalizeCode(input), want, why || JSON.stringify(input));
+    }
 });
 
 test('link code validity: 6 Crockford chars, no I L O U', () => {
@@ -172,7 +195,7 @@ test('/link writes discord_id as a STRING, burns the code and audits it', async 
     assert.strictEqual(players['uuid-alp'].discord_name, 'alpdiscord');
     assert.ok(players['uuid-alp'].discord_linked_at instanceof Date);
 
-    assert.deepStrictEqual(used, [{ code: 'ABC234', discordId: '4242' }]);
+    assert.deepStrictEqual(claims, [{ code: 'ABC234', discordId: '4242' }]);
     assert.strictEqual(audits.length, 1);
     assert.strictEqual(audits[0].uuid, 'uuid-alp');
     assert.strictEqual(audits[0].discordId, '4242');
@@ -185,7 +208,7 @@ test('/link writes discord_id as a STRING, burns the code and audits it', async 
 
 test('/link refuses a malformed code before it reaches Mongo', async () => {
     let looked = 0;
-    mongo.findLinkCode = async () => { looked++; return null; };
+    mongo.claimLinkCode = async () => { looked++; return null; };
     const it = interaction({ code: 'nope' });
     await link.execute(it);
 
@@ -194,13 +217,13 @@ test('/link refuses a malformed code before it reaches Mongo', async () => {
     assert.match(it.replies[0], /not valid or has expired/);
 });
 
-test('/link refuses an expired or already-used code (the lookup filters both)', async () => {
-    codeDocs = {}; // findLinkCode only returns usedAt:null and expiresAt in the future
+test('/link refuses an expired or already-used code (the claim filters both)', async () => {
+    codeDocs = {}; // the claim only matches usedAt:null and expiresAt in the future
     const it = interaction({ code: 'ABC234' });
     await link.execute(it);
 
     assert.strictEqual(sets.length, 0);
-    assert.strictEqual(used.length, 0);
+    assert.strictEqual(claims.length, 0);
     assert.strictEqual(audits.length, 0);
     assert.match(it.replies[0], /not valid or has expired/);
 });
@@ -211,11 +234,52 @@ test('/link refuses a Minecraft account already linked to another Discord', asyn
     await link.execute(it);
 
     assert.strictEqual(sets.length, 0, 'never overwrite someone else`s link');
-    assert.strictEqual(used.length, 0, 'and never burn the code doing it');
     assert.strictEqual(audits.length, 0);
     assert.strictEqual(players['uuid-taken'].discord_id, '999');
+    assert.strictEqual(claims.length, 1, 'the claim came first, so the code is spent');
     assert.match(it.replies[0], /another Discord account/);
     assert.match(it.replies[0], /unlink/);
+    assert.match(it.replies[0], /`\/link` again/, 'the code is burnt - say how to get another');
+});
+
+test('two Discords redeeming the same code: exactly one link and one role', async () => {
+    configuredRole = 'role-1';
+    const first = interaction({ code: 'ABC234' }, { userId: '4242', username: 'alpdiscord' });
+    const second = interaction({ code: 'ABC234' }, { userId: '5555', username: 'someoneelse' });
+
+    // reading the code and burning it afterwards let both of these through the check
+    await Promise.all([link.execute(first), link.execute(second)]);
+
+    assert.strictEqual(claims.length, 1, 'the claim is the atomic step - one of them wins it');
+    assert.strictEqual(sets.length, 1);
+    assert.strictEqual(audits.length, 1);
+    assert.strictEqual(roleCalls.length, 1, 'the loser is not verified either');
+    const winner = sets[0].discordId;
+    assert.strictEqual(players['uuid-alp'].discord_id, winner);
+    assert.deepStrictEqual(roleCalls, [{ action: 'add', userId: winner, roleId: 'role-1' }]);
+    const loser = winner === '4242' ? second : first;
+    assert.match(loser.replies[0], /not valid or has expired/);
+});
+
+test('a link landing between the claim and the write is refused, never overwritten', async () => {
+    configuredRole = 'role-1';
+    let reads = 0;
+    mongo.getBifrostPlayerByUuid = async (uuid) => {
+        const snapshot = players[uuid] ? { ...players[uuid] } : null;
+        // in game /link (or the legacy import) lands right after this read
+        if (++reads === 1) players[uuid] = { ...players[uuid], discord_id: '999', discord_name: 'someone' };
+        return snapshot;
+    };
+
+    const it = interaction({ code: 'ABC234' });
+    await link.execute(it);
+
+    assert.strictEqual(sets.length, 0, 'the filtered write loses the race instead of winning it');
+    assert.strictEqual(players['uuid-alp'].discord_id, '999');
+    assert.strictEqual(players['uuid-alp'].discord_name, 'someone');
+    assert.strictEqual(audits.length, 0);
+    assert.deepStrictEqual(roleCalls, []);
+    assert.match(it.replies[0], /another Discord account/);
 });
 
 test('/link twice from the same Discord is idempotent — one write, one audit', async () => {
@@ -227,7 +291,7 @@ test('/link twice from the same Discord is idempotent — one write, one audit',
 
     assert.strictEqual(sets.length, 1);
     assert.strictEqual(audits.length, 1);
-    assert.strictEqual(used.length, 2, 'the second code is still burnt');
+    assert.strictEqual(claims.length, 2, 'the second code is still burnt');
     assert.match(second.replies[0], /already linked/);
 });
 
@@ -347,4 +411,39 @@ test('/linked lists the caller`s accounts, and says so when there are none', asy
     await linked.execute(it);
     assert.match(it.replies[0], /\*\*Alp\*\*/);
     assert.match(it.replies[0], /<t:\d+:R>/);
+});
+
+test('the discord-link indexes are the proxy`s specs, and one failure is retried', async () => {
+    const calls = [];
+    let failFirst = true;
+    const db = {
+        collection: (name) => ({
+            createIndex: async (keys, options) => {
+                calls.push({ collection: name, keys, options });
+                if (failFirst && calls.length === 1) throw new Error('no primary');
+                return name;
+            }
+        })
+    };
+
+    await ensureDiscordLinkIndexes(db);
+    assert.deepStrictEqual(calls, [
+        { collection: 'players', keys: { discord_id: 1 }, options: { sparse: true } },
+        { collection: 'discord_link_codes', keys: { code: 1 }, options: { name: 'link_code', unique: true } },
+        { collection: 'discord_link_codes', keys: { uuid: 1 }, options: { name: 'link_uuid' } },
+        {
+            collection: 'discord_link_codes',
+            keys: { expiresAt: 1 },
+            options: { name: 'link_ttl', expireAfterSeconds: 0 }
+        }
+    ], 'same names and options as src/plugins/discord-link, and a throw skips no later spec');
+
+    failFirst = false;
+    calls.length = 0;
+    await ensureDiscordLinkIndexes(db);
+    assert.strictEqual(calls.length, 4, 'nothing was marked ensured while one spec was missing');
+
+    calls.length = 0;
+    await ensureDiscordLinkIndexes(db);
+    assert.deepStrictEqual(calls, [], 'all four landed - once per process is enough');
 });

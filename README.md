@@ -182,6 +182,12 @@ that collection, so the in-game confirmation card lands about a second later.
 claiming an already-linked account is refused — that account has to run `/unlink` in game (or here)
 first.
 
+**The code is claimed, not read.** `/link` burns it with the lookup (one `findOneAndUpdate` on
+`usedAt: null`) and only then writes the player, with that update filtered on the account still
+being free. Two Discords racing one code therefore make exactly one link, and an in-game link
+landing mid-flow wins instead of being overwritten. A refusal still spends the code — the reply
+says so, and the player just runs `/link` in game again for a fresh one.
+
 **`bifrost.players`** (the three fields this writes):
 
 | Field | Notes |
@@ -192,8 +198,11 @@ first.
 
 **`bifrost.discord_link_codes`** (minted in game, burnt here): `code` (6 Crockford base32 chars, no
 I/L/O/U), `uuid`, `username`, `createdAt`, `expiresAt` (10 min), `usedAt`, `usedBy` (Discord id).
-A typed code is folded before the lookup: upper-cased, spaces and dashes stripped, `O`→`0`,
-`I`/`L`→`1` (`discord/commands/util/linkCode.js`, the same rules as the proxy's `codes.ts`).
+A typed code is folded before the lookup: upper-cased, spaces, dashes and underscores stripped,
+`O`→`0`, `I`/`L`→`1` (`discord/commands/util/linkCode.js`, the same rules as the proxy's
+`codes.ts`). The indexes are created here under the proxy's exact names and options (`link_code`
+unique, `link_uuid`, `link_ttl` on `expiresAt`), so whichever side gets there first the other finds
+them already right.
 
 **`bifrost.discord_link_audit`** (history, nothing reads it in flight): `uuid`, `discordId`,
 `action` (`link` / `unlink`), `by: 'discord'`, `discordName`, `at`, plus `actor` when staff undid

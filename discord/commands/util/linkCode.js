@@ -7,8 +7,9 @@
  * base32 chars - the alphabet drops I, L, O and U so a player reading one off a chat
  * card can't turn it into a different code by mistyping.
  *
- * Normalisation forgives what people actually type: lower case, spaces and dashes, and
- * the three lookalikes (O for zero, I and L for one). Anything else is simply not a code.
+ * Normalisation forgives what people actually type: lower case, spaces, dashes (including
+ * the ones a phone keyboard autocorrects into U+2010-U+2015), underscores, and the three
+ * lookalikes (O for zero, I and L for one). Anything else is simply not a code.
  * (The commands/ loader only picks up top-level files, so this util is never a command.)
  */
 
@@ -24,7 +25,7 @@ const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{6}$/;
 function normalizeCode(input) {
     return String(input == null ? '' : input)
         .toUpperCase()
-        .replace(/[\s\-‐-―]+/g, '')
+        .replace(/[\s\-_‐-―]+/g, '')
         .replace(/O/g, '0')
         .replace(/[IL]/g, '1');
 }

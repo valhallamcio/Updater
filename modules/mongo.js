@@ -25,7 +25,15 @@ const {
 const mongoClient = new MongoClient(process.env.MONGODB_URL);
 
 let mainClientConnected = false;
-// The discord-link indexes are created once per process, on the first code lookup.
+// The discord-link indexes are created once per process, on the first code claim. The
+// three code indexes are the proxy's specs verbatim (src/plugins/discord-link/index.ts) -
+// same names, same options, so whichever side gets there first the other finds them right.
+const DISCORD_LINK_INDEXES = [
+    { collection: 'players', keys: { discord_id: 1 }, options: { sparse: true } },
+    { collection: 'discord_link_codes', keys: { code: 1 }, options: { name: 'link_code', unique: true } },
+    { collection: 'discord_link_codes', keys: { uuid: 1 }, options: { name: 'link_uuid' } },
+    { collection: 'discord_link_codes', keys: { expiresAt: 1 }, options: { name: 'link_ttl', expireAfterSeconds: 0 } }
+];
 let discordLinkIndexesEnsured = false;
 
 // bifrost.logs starts here; anything older lives only in valhallamc.logs (the archive)
@@ -1038,48 +1046,35 @@ module.exports = {
     // bifrost.players, so the confirmation card follows the write here in about a second.
     // `discord_id` is ALWAYS a string: a snowflake does not survive a JS number.
     /**
-     * Finds an unused, unexpired link code.
+     * Claims a code: the lookup and the burn are ONE write, so two Discords racing the
+     * same code can never both walk away holding it. Reading first and burning after is
+     * how the same code linked twice.
      * @param {string} code Normalised code (discord/commands/util/linkCode.js).
-     * @returns {Promise<object|null>} The code doc or null.
+     * @param {string} discordId Who is claiming it.
+     * @returns {Promise<object|null>} The claimed doc, or null when the code was already
+     *     used, has expired, or never existed.
      */
-    findLinkCode: async function (code) {
+    claimLinkCode: async function (code, discordId) {
         if (!mainClientConnected) {
             await mongoClient.connect();
             mainClientConnected = true;
         }
 
         await module.exports.ensureDiscordLinkIndexes();
+        // driver 6 hands back the document itself, not a {value} wrapper
         return mongoClient
             .db('bifrost')
             .collection('discord_link_codes')
-            .findOne({
+            .findOneAndUpdate({
                 code: String(code),
                 usedAt: null,
                 expiresAt: { $gt: new Date() }
-            });
-    },
-
-    /**
-     * Burns a code so it can only ever link once.
-     * @param {string} code Normalised code.
-     * @param {string} discordId Who used it.
-     * @returns {Promise<object>} The updateOne result.
-     */
-    markLinkCodeUsed: async function (code, discordId) {
-        if (!mainClientConnected) {
-            await mongoClient.connect();
-            mainClientConnected = true;
-        }
-
-        return mongoClient
-            .db('bifrost')
-            .collection('discord_link_codes')
-            .updateOne({ code: String(code), usedAt: null }, {
+            }, {
                 $set: {
                     usedAt: new Date(),
                     usedBy: String(discordId)
                 }
-            });
+            }, { returnDocument: 'after' });
     },
 
     /**
@@ -1128,10 +1123,13 @@ module.exports = {
     },
 
     /**
-     * Writes the link onto the player doc. The proxy reads these three fields.
+     * Writes the link onto the player doc, but only while that account is still free.
+     * The filter is what makes a race lose instead of overwrite - an in-game link landing
+     * between the claim and this write used to be silently replaced.
      * @param {string} uuid Dashed uuid of the Minecraft account.
      * @param {object} link `{discordId, discordName}`.
-     * @returns {Promise<object>} The updateOne result.
+     * @returns {Promise<object>} The updateOne result - `matchedCount` 0 means somebody
+     *     else got there first and the caller must refuse.
      */
     setBifrostDiscordLink: async function (uuid, link) {
         if (!mainClientConnected) {
@@ -1139,10 +1137,12 @@ module.exports = {
             mainClientConnected = true;
         }
 
+        // $in:[null] is 'missing or null' - a doc from before the field existed matches too
         return mongoClient
             .db('bifrost')
             .collection('players')
-            .updateOne({ uuid: String(uuid) }, { $set: buildLinkFields(link) });
+            .updateOne({ uuid: String(uuid), discord_id: { $in: [null] } },
+                { $set: buildLinkFields(link) });
     },
 
     /**
@@ -1186,27 +1186,42 @@ module.exports = {
     },
 
     /**
-     * Creates the indexes the link flow needs, once per process. The proxy creates the
-     * same ones, so the specs are kept identical (default names, same options) and a
-     * conflict is logged rather than thrown - an index is not worth a failed link.
+     * Creates the indexes the link flow needs, once per process. Each spec is attempted
+     * on its own (one failure used to skip every later one for the life of the process)
+     * and the ensured flag is only set once they all landed, so the next lookup retries.
+     * @param {object} [db] Bifrost db handle - only tests pass one.
      * @returns {Promise<void>} Resolves when the attempt is done.
      */
-    ensureDiscordLinkIndexes: async function () {
+    ensureDiscordLinkIndexes: async function (db) {
         if (discordLinkIndexesEnsured) return;
-        discordLinkIndexesEnsured = true;
 
-        if (!mainClientConnected) {
-            await mongoClient.connect();
-            mainClientConnected = true;
+        if (!db) {
+            if (!mainClientConnected) {
+                await mongoClient.connect();
+                mainClientConnected = true;
+            }
+            db = mongoClient.db('bifrost');
         }
 
-        try {
-            const db = mongoClient.db('bifrost');
-            await db.collection('players').createIndex({ discord_id: 1 }, { sparse: true });
-            await db.collection('discord_link_codes').createIndex({ code: 1 }, { unique: true });
-        } catch (error) {
-            sessionLogger.warn('Mongo', 'Could not ensure the discord-link indexes', error.message);
+        let allOk = true;
+        for (const spec of DISCORD_LINK_INDEXES) {
+            try {
+                await db.collection(spec.collection).createIndex(spec.keys, spec.options);
+            } catch (error) {
+                // 85/86: the same keys already exist under another name or options. A retry
+                // can never fix that, so stop asking - a human has to drop the old index.
+                if (error && (error.code === 85 || error.code === 86)) {
+                    sessionLogger.warn('Mongo',
+                        `The ${spec.collection} link index already exists differently (code ${error.code})`,
+                        error.message);
+                    continue;
+                }
+                allOk = false;
+                sessionLogger.warn('Mongo',
+                    `Could not ensure a ${spec.collection} discord-link index`, error.message);
+            }
         }
+        discordLinkIndexesEnsured = allOk;
     },
 
     /**

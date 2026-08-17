@@ -9,6 +9,12 @@
  * One Discord may hold several Minecraft accounts; one Minecraft account holds at most
  * one Discord (a second Discord has to wait for an in-game /unlink). Any member can run
  * it, replies are ephemeral, and the optional Verified role never fails a link.
+ *
+ * The code is CLAIMED before anything else: reading it first and burning it after let two
+ * Discords redeeming the same code both pass the check and both write the player. The
+ * write is guarded the same way, so an in-game link landing in between loses the race
+ * rather than getting overwritten - a refusal spends the code, and the player just runs
+ * /link in game again.
  */
 
 const { SlashCommandBuilder } = require('discord.js');
@@ -38,7 +44,8 @@ module.exports = {
             return;
         }
 
-        const codeDoc = await mongo.findLinkCode(code);
+        // Claim first - one atomic write decides who holds this code.
+        const codeDoc = await mongo.claimLinkCode(code, interaction.user.id);
         if (!codeDoc || !codeDoc.uuid) {
             await interaction.editReply(BAD_CODE);
             return;
@@ -52,25 +59,25 @@ module.exports = {
         }
 
         const username = player.username || codeDoc.username || 'your account';
-        const linkedTo = player.discord_id == null ? null : String(player.discord_id);
 
-        if (linkedTo === interaction.user.id) {
-            // Already theirs: burn the code so it can't be reused, change nothing else.
-            await mongo.markLinkCodeUsed(code, interaction.user.id);
-            await interaction.editReply(`✅ **${username}** is already linked to this Discord account.`);
-            return;
-        }
-        if (linkedTo) {
-            await interaction.editReply(
-                `❌ **${username}** is linked to another Discord account — run \`/unlink\` in game first, then use a fresh code.`);
-            return;
-        }
-
-        await mongo.setBifrostDiscordLink(codeDoc.uuid, {
+        const result = await mongo.setBifrostDiscordLink(codeDoc.uuid, {
             discordId: interaction.user.id,
             discordName: interaction.user.username
         });
-        await mongo.markLinkCodeUsed(code, interaction.user.id);
+
+        if (result && result.matchedCount === 0) {
+            // The account was linked between the claim and the write. Never overwrite it -
+            // the code is spent either way, so say what to do about it.
+            const current = await mongo.getBifrostPlayerByUuid(codeDoc.uuid);
+            const linkedTo = !current || current.discord_id == null ? null : String(current.discord_id);
+            if (linkedTo === interaction.user.id) {
+                await interaction.editReply(`✅ **${username}** is already linked to this Discord account.`);
+                return;
+            }
+            await interaction.editReply(
+                `❌ **${username}** is linked to another Discord account — run \`/unlink\` in game first, then \`/link\` again for a fresh code.`);
+            return;
+        }
 
         try {
             await mongo.insertLinkAudit(buildLinkAudit({
