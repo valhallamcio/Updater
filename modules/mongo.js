@@ -1185,6 +1185,105 @@ module.exports = {
             .insertOne(doc);
     },
 
+    // Role sync (schedulers/roleSync.js): the linked accounts, and Bifrost's permission
+    // shapes. Group membership is an entry on the player doc - `{key: 'group.<name>',
+    // value: true}` in `permissions` - and the group itself is a permission_groups doc.
+    // The writes below are targeted operators on purpose: permission-api rewrites the
+    // whole array, so a read-modify-write from here would race a staff /perms edit.
+    /**
+     * Every account with a Discord link, with what the sync needs to decide.
+     * @returns {Promise<object[]>} `{uuid, username, discord_id, permissions, playtime}` docs.
+     */
+    findLinkedBifrostPlayers: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .find({ discord_id: { $exists: true, $ne: null } }, {
+                projection: {
+                    _id: 0,
+                    uuid: 1,
+                    username: 1,
+                    discord_id: 1,
+                    permissions: 1,
+                    playtime: 1
+                }
+            })
+            .toArray();
+    },
+
+    /**
+     * Reads a permission group. A membership entry pointing at a group that does not
+     * exist grants nothing, so the sync checks before it writes any.
+     * @param {string} name Group name (the doc's _id).
+     * @returns {Promise<object|null>} The group doc or null.
+     */
+    getPermissionGroup: async function (name) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('permission_groups')
+            .findOne({ _id: String(name) });
+    },
+
+    /**
+     * Adds a group membership entry, but only while the account has none for that group.
+     * The filter is the idempotency: a second run writes nothing, and a manual grant or
+     * an explicit `value: false` denial is never duplicated or overwritten.
+     * @param {string} uuid Dashed uuid.
+     * @param {object} entry `{key: 'group.<name>', value: true, context?}`.
+     * @returns {Promise<object>} The updateOne result (`modifiedCount` 0 = already there).
+     */
+    addPlayerGroupEntry: async function (uuid, entry) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .updateOne({
+                uuid: String(uuid),
+                permissions: { $not: { $elemMatch: { key: entry.key } } }
+            }, { $push: { permissions: entry } });
+    },
+
+    /**
+     * Takes back a group membership entry the sync itself wrote - matched on the source
+     * context, so a hand-made grant of the same group stays put.
+     * @param {string} uuid Dashed uuid.
+     * @param {string} key `group.<name>`.
+     * @param {string} source The `source` context value that marks our own entries.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    removeSyncedPlayerGroupEntry: async function (uuid, key, source) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .updateOne({ uuid: String(uuid) }, {
+                $pull: {
+                    permissions: {
+                        key: String(key),
+                        context: { $elemMatch: { key: 'source', value: String(source) } }
+                    }
+                }
+            });
+    },
+
     /**
      * Creates the indexes the link flow needs, once per process. Each spec is attempted
      * on its own (one failure used to skip every later one for the life of the process)
