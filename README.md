@@ -109,6 +109,7 @@ falling back to a legacy shared archive with the per-server snapshot laid over t
 | `/link <code>` | Link your Discord to your Minecraft account (code comes from `/link` in game) |
 | `/unlink [player]` | Unlink a Minecraft account from your Discord |
 | `/linked` | List the Minecraft accounts linked to your Discord |
+| `/pingroles [pack] [hours]` | Report which linked members would qualify for which pack ping role (report only) |
 | `/ping` | Health check |
 | `/reloadCommands` | Reload all bot commands |
 
@@ -218,6 +219,43 @@ left. `false` (the default) leaves roles alone — don't use `null` or `""`, the
 an empty value as unfilled and stops the bot. The bot needs **Manage Roles** and its own top role
 **above** the Verified role; a role failure is logged and never fails the link itself.
 
+## Role sync (Bifrost contract)
+
+`scheduler.roleSync` reconciles what `/link` and `/unlink` do per event, and mirrors Discord
+boosts into Bifrost's permission groups. **Off by default, and dry by default** — it does nothing
+until `enabled` is true and `guildId` is filled in, and while `dryRun` is true every intended
+change is logged and nothing is written.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `false` | the feature switch (`active` is the scheduler loader's) |
+| `guildId` | `""` | the guild to reconcile |
+| `verifiedRoleId` | `false` | falls back to `discordLink.verifiedRoleId` |
+| `boosterGroup` | `"booster"` | Bifrost permission group boosters land in |
+| `dryRun` | `true` | log every grant/revoke, write nothing |
+| `interval` | `30` | minutes between passes |
+| `maxChangesPerRun` | `50` | circuit breaker: a bigger plan is reported, not fired |
+
+**It needs the GuildMembers privileged intent, which is NOT enabled on this app.** Reading the
+member list is the only way to see `premium_since` or who holds a role; without the intent Discord
+answers 403/50001, the bot logs one warning naming the intent and every pass no-ops. `/link` and
+`/unlink` are unaffected — a single member fetch by id needs no intent.
+
+**Booster group membership is a permission entry on the player doc**, the shape Bifrost resolves
+(`src/plugins/permission-api`): `{key: 'group.<name>', value: true}` in `permissions` — `value`
+**must** be true, a `false` entry is an explicit denial. The sync's own entries carry
+`context: [{key: 'source', value: 'discord-boost'}]` (Bifrost only scopes on a `server` context, so
+the marker is inert there) and **only those are ever revoked** — a hand-made booster grant survives
+every pass. A grant is skipped when any `group.<name>` entry already exists, so nothing is
+duplicated or overwritten, and the group must exist in `permission_groups` or the half is skipped
+(membership of a group that does not exist grants nothing). Only linked accounts are touched:
+`bifrost.players.discord_id` is the only route from a member to a uuid. An empty linked-player read
+skips the whole pass rather than stripping the guild.
+
+`/pingroles` is the read-only half: per pack with a `discord_role_id`, the linked accounts with
+enough `playtime.<tag>` (milliseconds on the player doc) to be worth its ping role. **Nothing is
+assigned** — pack roles stay opt-in through the role assigner buttons.
+
 ## Schedulers
 
 | Scheduler | Description |
@@ -228,6 +266,7 @@ an empty value as unfilled and stops the bot. The bot needs **Manage Roles** and
 | **Role Assigner** | Automatically creates and assigns Discord roles for each server |
 | **Staff Permissions** | Manages Pterodactyl panel permissions for staff members |
 | **Player Event Scheduler** | Tracks player join/leave events and executes player-triggered commands |
+| **Role Sync** | Reconciles the Verified role with the Minecraft links and mirrors Discord boosts into the Bifrost booster group (off by default, needs the GuildMembers intent) |
 
 ## Tech Stack
 
