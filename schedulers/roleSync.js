@@ -18,8 +18,11 @@
  *
  * The maths is in modules/roleSyncPlan.js and is tested on its own; what is left here is
  * the I/O, the dry run, and the rails: nothing is written when the linked-player read
- * comes back empty, when the permission group does not exist, or when a single run wants
- * to make more changes than `maxChangesPerRun` (a bad read must not storm the guild).
+ * comes back empty or when the permission group does not exist, NOTHING is ever taken
+ * back on a member list that is not known to be whole, `maxChangesPerRun` is one shared
+ * budget across both halves (so a bad read cannot storm the guild) and what does not fit
+ * goes next pass instead of never, and one pass at a time - a slow run must not have a
+ * second one fighting it off a stale snapshot.
  */
 
 const mongo = require('../modules/mongo');
@@ -32,6 +35,10 @@ const LOG = 'RoleSync';
 // Warned-once flags, per process - a scheduled re-check every interval is fine, the same
 // warning every interval is not.
 let warnedNoGroup = false;
+
+// One pass at a time: pagination and rate limits can drag a run past the interval, and a
+// second one would be planning off a snapshot the first is busy invalidating.
+let running = false;
 
 module.exports = {
     name: 'roleSync',
@@ -102,11 +109,40 @@ module.exports = {
      * @returns {Promise<object>} A summary: `{ran, reason?, verified, booster, dryRun}`.
      */
     runOnce: async function (config, deps = {}) {
+        if (running) {
+            sessionLogger.warn(LOG, 'The last reconcile has not finished - skipping this interval');
+            return { ran: false, reason: 'in-flight' };
+        }
+        running = true;
+        try {
+            return await this.reconcile(config, deps);
+        } finally {
+            running = false;
+        }
+    },
+
+    /**
+     * The pass itself, without the in-flight guard around it.
+     * @param {object} config A resolved config.
+     * @param {object} deps `{guild}`.
+     * @returns {Promise<object>} The same summary runOnce hands back.
+     */
+    reconcile: async function (config, deps) {
         const guild = deps.guild || await this.getGuild(config.guildId);
         if (!guild) return { ran: false, reason: 'no-guild' };
 
         const fetched = await fetchGuildMembers(guild, LOG);
         if (!fetched.ok) return { ran: false, reason: fetched.reason };
+
+        // Everyone a partial read missed looks exactly like somebody who left, so an
+        // incomplete list may hand out grants but must never take anything back.
+        const complete = fetched.complete !== false;
+        if (!complete) {
+            sessionLogger.warn(LOG,
+                `The guild member list came back ${fetched.reason === 'empty' ? 'empty' : 'truncated'} ` +
+                `(${fetched.members.length} members) - granting only this pass, nothing is taken back off a list ` +
+                'that is not known to be whole');
+        }
 
         const players = await mongo.findLinkedBifrostPlayers();
         if (!players || players.length === 0) {
@@ -115,8 +151,19 @@ module.exports = {
             return { ran: false, reason: 'no-linked-players' };
         }
 
-        const verified = await this.syncVerifiedRole(config, fetched.members, players);
-        const booster = await this.syncBoosterGroup(config, fetched.members, players);
+        // One budget for the whole pass, or the two halves each spend the cap and a run
+        // writes twice what was configured.
+        const cap = Number(config.maxChangesPerRun) || 0;
+        const budget = { left: cap > 0 ? cap : Infinity, deferred: 0 };
+
+        const verified = await this.syncVerifiedRole(config, fetched.members, players, budget, complete);
+        const booster = await this.syncBoosterGroup(config, fetched.members, players, budget, complete);
+
+        if (budget.deferred > 0) {
+            sessionLogger.warn(LOG,
+                `${budget.deferred} more changes than the ${cap} this run allows - they go next pass. ` +
+                'Check the plan (dryRun) and raise scheduler.roleSync.maxChangesPerRun if this is normal.');
+        }
 
         const changes = verified.granted + verified.revoked + booster.granted + booster.revoked;
         if (changes > 0 || config.dryRun) {
@@ -125,7 +172,14 @@ module.exports = {
                 `verified +${verified.granted}/-${verified.revoked}, booster +${booster.granted}/-${booster.revoked}`);
         }
 
-        return { ran: true, verified: verified, booster: booster, dryRun: Boolean(config.dryRun) };
+        return {
+            ran: true,
+            complete: complete,
+            deferred: budget.deferred,
+            verified: verified,
+            booster: booster,
+            dryRun: Boolean(config.dryRun)
+        };
     },
 
     /**
@@ -149,21 +203,25 @@ module.exports = {
      * @param {object} config Resolved config.
      * @param {object[]} members Rows from fetchGuildMembers.
      * @param {object[]} players Linked player docs.
+     * @param {object} budget The pass's shared change budget.
+     * @param {boolean} complete Is the member list known to be whole?
      * @returns {Promise<{granted: number, revoked: number, planned: number}>} What happened.
      */
-    syncVerifiedRole: async function (config, members, players) {
+    syncVerifiedRole: async function (config, members, players, budget, complete) {
         const result = { granted: 0, revoked: 0, planned: 0 };
         if (!config.verifiedRoleId) return result;
 
-        const { grants, revokes } = plan.planVerifiedSync({
+        const planned = plan.planVerifiedSync({
             members: members,
             players: players,
-            roleId: config.verifiedRoleId
+            roleId: config.verifiedRoleId,
+            complete: complete
         });
-        result.planned = grants.length + revokes.length;
+        result.planned = planned.grants.length + planned.revokes.length;
         if (result.planned === 0) return result;
-        if (!this.underCap(config, result.planned, 'verified role')) return result;
 
+        const grants = this.takeBudget(budget, planned.grants);
+        const revokes = this.takeBudget(budget, planned.revokes);
         const byId = new Map(members.map(m => [m.id, m.member]));
 
         for (const row of grants) {
@@ -204,9 +262,11 @@ module.exports = {
      * @param {object} config Resolved config.
      * @param {object[]} members Rows from fetchGuildMembers.
      * @param {object[]} players Linked player docs.
+     * @param {object} budget The pass's shared change budget.
+     * @param {boolean} complete Is the member list known to be whole?
      * @returns {Promise<{granted: number, revoked: number, planned: number}>} What happened.
      */
-    syncBoosterGroup: async function (config, members, players) {
+    syncBoosterGroup: async function (config, members, players, budget, complete) {
         const result = { granted: 0, revoked: 0, planned: 0 };
         if (!config.boosterGroup) return result;
 
@@ -222,19 +282,25 @@ module.exports = {
         }
         warnedNoGroup = false;
 
-        const { grants, revokes, skipped } = plan.planBoosterSync({
+        // An account that unlinked is gone from the linked read for good, so the entry we
+        // gave it would never be looked at again - our own marker is what finds those.
+        const stranded = complete ? await this.findStrandedEntries(config, players) : [];
+
+        const planned = plan.planBoosterSync({
             members: members,
-            players: players,
-            group: config.boosterGroup
+            players: stranded.length ? players.concat(stranded) : players,
+            group: config.boosterGroup,
+            complete: complete
         });
-        for (const row of skipped) {
+        for (const row of planned.skipped) {
             sessionLogger.debug(LOG, `${row.username} boosts but their ${config.boosterGroup} entry is somebody else's - left alone`);
         }
 
-        result.planned = grants.length + revokes.length;
+        result.planned = planned.grants.length + planned.revokes.length;
         if (result.planned === 0) return result;
-        if (!this.underCap(config, result.planned, 'booster group')) return result;
 
+        const grants = this.takeBudget(budget, planned.grants);
+        const revokes = this.takeBudget(budget, planned.revokes);
         const entry = plan.boosterEntry(config.boosterGroup);
 
         for (const row of grants) {
@@ -269,19 +335,37 @@ module.exports = {
     },
 
     /**
-     * The circuit breaker: a pass that suddenly wants to change half the guild is a bad
-     * read far more often than it is real, so it reports instead of firing.
-     * @param {object} config Resolved config.
-     * @param {number} planned How many changes this half wants to make.
-     * @param {string} what Which half, for the log line.
-     * @returns {boolean} True when it may go ahead.
+     * The rate limiter: a pass that suddenly wants to change half the guild is a bad read
+     * far more often than it is real, so a run only ever makes `maxChangesPerRun` of them
+     * - but it MAKES them, and the rest go next pass, or real drift past the cap would
+     * sit there forever.
+     * @param {object} budget `{left, deferred}` for the whole pass.
+     * @param {object[]} rows What this half wants to do.
+     * @returns {object[]} What it may do this run.
      */
-    underCap: function (config, planned, what) {
-        const cap = Number(config.maxChangesPerRun) || 0;
-        if (cap <= 0 || planned <= cap) return true;
-        sessionLogger.warn(LOG,
-            `The ${what} pass wants ${planned} changes, over the ${cap} cap - nothing was done. ` +
-            'Check the plan (dryRun) and raise scheduler.roleSync.maxChangesPerRun if it is right.');
-        return false;
+    takeBudget: function (budget, rows) {
+        const take = rows.slice(0, budget.left);
+        budget.left -= take.length;
+        budget.deferred += rows.length - take.length;
+        return take;
+    },
+
+    /**
+     * The accounts holding an entry this sync wrote that the linked read no longer covers
+     * - i.e. somebody unlinked. Never throws: a failed lookup only costs a pass.
+     * @param {object} config Resolved config.
+     * @param {object[]} players The linked player docs this pass read.
+     * @returns {Promise<object[]>} Player docs not already in `players`.
+     */
+    findStrandedEntries: async function (config, players) {
+        try {
+            const owned = await mongo.findPlayersWithSyncedGroupEntry(
+                plan.groupKey(config.boosterGroup), plan.BOOSTER_SOURCE);
+            const known = new Set(players.map(p => p && p.uuid));
+            return (owned || []).filter(p => p && p.uuid && !known.has(p.uuid));
+        } catch (error) {
+            sessionLogger.error(LOG, 'Could not look up the group entries this sync owns', error.message);
+            return [];
+        }
     }
 };

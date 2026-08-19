@@ -326,20 +326,27 @@ test('no booster group in permission_groups: the booster half is skipped, the ro
     assert.deepStrictEqual(roleCalls, [{ action: 'add', userId: 'd-1', roleId: ROLE }]);
 });
 
-test('a pass that wants more changes than the cap reports instead of firing', async () => {
+test('a pass over the cap does what fits and converges on the next one', async () => {
+    // Skipping the whole pass meant drift past the cap NEVER converged: every
+    // later run wanted the same oversized plan and refused it again. The cap is
+    // a budget, not a veto.
     players = [
         { uuid: 'u-1', username: 'A', discord_id: 'd-1', permissions: [] },
         { uuid: 'u-2', username: 'B', discord_id: 'd-2', permissions: [] }
     ];
-    const summary = await roleSync.runOnce({ ...CONFIG, maxChangesPerRun: 1 }, {
-        guild: guild([member('d-1', { boosting: true }), member('d-2', { boosting: true })])
-    });
+    const capped = { ...CONFIG, maxChangesPerRun: 1 };
+    const members = () => guild([member('d-1', { boosting: true }), member('d-2', { boosting: true })]);
 
-    assert.deepStrictEqual(roleCalls, []);
-    assert.deepStrictEqual(adds, []);
-    assert.strictEqual(summary.verified.planned, 2);
-    assert.strictEqual(summary.verified.granted, 0);
-    assert.strictEqual(summary.booster.granted, 0);
+    const first = await roleSync.runOnce(capped, { guild: members() });
+    assert.strictEqual(first.verified.planned, 2, 'it still sees the whole plan');
+    const firstWrites = roleCalls.length + adds.length;
+    assert.ok(firstWrites > 0, 'and makes progress instead of standing still');
+    assert.ok(firstWrites <= 2, 'without blowing through the budget');
+
+    const second = await roleSync.runOnce(capped, { guild: members() });
+    const total = roleCalls.length + adds.length;
+    assert.ok(total > firstWrites, 'the next pass picks up what did not fit');
+    assert.ok(second.verified.planned <= first.verified.planned, 'and the backlog shrinks');
 });
 
 test('the member list is paged, and the last page ends it', async () => {

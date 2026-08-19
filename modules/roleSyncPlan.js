@@ -11,7 +11,9 @@
  *
  *  - An EMPTY linked-player list is treated as a fault, not as reality. A Mongo read
  *    that came back empty would otherwise strip the Verified role off the whole guild
- *    and every booster with it, so both planners bail and change nothing.
+ *    and every booster with it, so both planners bail and change nothing. Same for a
+ *    member list that is not KNOWN to be whole (`complete: false`): everyone the read
+ *    missed looks like they left, so an incomplete read plans grants and NO revokes.
  *  - The booster sync only ever takes back entries IT wrote. A permission entry carries
  *    `context: [{key: 'source', value: 'discord-boost'}]`, which Bifrost ignores while
  *    resolving (only a `server` context scopes an entry - src/plugins/permission-api/
@@ -84,15 +86,19 @@ function boostingIds(members) {
  * A grant only happens when the account has NO `group.<booster>` entry at all - an
  * existing one is either a manual grant (leave it) or an explicit `false` denial
  * (definitely leave it). A revoke only happens on our own marked entries, and covers
- * both "stopped boosting" and "left the guild".
+ * "stopped boosting", "left the guild" and "unlinked" - a doc with no `discord_id` left
+ * on it has nothing holding our entry up, which is how an unlinked account stops being
+ * a booster (the scheduler feeds those in by our own marker, since an unlinked doc is
+ * gone from the linked read forever).
  *
- * @param {object} input `{members, players, group}`; members are `{id, premiumSince}`,
- *     players are bifrost.players docs with `discord_id` and `permissions`.
+ * @param {object} input `{members, players, group, complete}`; members are
+ *     `{id, premiumSince}`, players are bifrost.players docs with `discord_id` and
+ *     `permissions`, `complete` says the member list is whole (default true).
  * @returns {{grants: object[], revokes: object[], skipped: object[]}} Grants and revokes
  *     as `{uuid, username, discordId}`; `skipped` are boosters we left alone because
  *     somebody else owns their entry.
  */
-function planBoosterSync({ members, players, group }) {
+function planBoosterSync({ members, players, group, complete = true }) {
     const empty = { grants: [], revokes: [], skipped: [] };
     if (!group || !Array.isArray(players) || players.length === 0) return empty;
 
@@ -102,22 +108,23 @@ function planBoosterSync({ members, players, group }) {
     const skipped = [];
 
     for (const player of players) {
-        if (!player || !player.uuid || player.discord_id == null) continue;
-        const discordId = String(player.discord_id);
+        if (!player || !player.uuid) continue;
+        const discordId = player.discord_id == null ? null : String(player.discord_id);
         const entry = findGroupEntry(player.permissions, group);
         const row = { uuid: player.uuid, username: player.username || player.uuid, discordId };
 
-        if (boosting.has(discordId)) {
+        if (discordId !== null && boosting.has(discordId)) {
             if (!entry) grants.push(row);
             else if (!isSyncOwned(entry)) skipped.push(row);
             continue;
         }
 
-        // Not boosting (or not in the guild any more) - only our own entry comes off.
+        // Not boosting, not in the guild any more, or not linked any more - only our own
+        // entry comes off.
         if (entry && isSyncOwned(entry)) revokes.push(row);
     }
 
-    return { grants, revokes, skipped };
+    return { grants, revokes: complete ? revokes : [], skipped };
 }
 
 /**
@@ -125,11 +132,12 @@ function planBoosterSync({ members, players, group }) {
  * does not. /link and /unlink already do this per event - this is what converges a role
  * somebody added or removed by hand, or a link that was made while the bot was down.
  *
- * @param {object} input `{members, players, roleId}`; members are `{id, roles}` with
- *     roles as an array of role ids.
+ * @param {object} input `{members, players, roleId, complete}`; members are `{id, roles}`
+ *     with roles as an array of role ids, `complete` says the member list is whole
+ *     (default true) - a partial read only ever plans grants.
  * @returns {{grants: object[], revokes: object[]}} `{discordId}` rows.
  */
-function planVerifiedSync({ members, players, roleId }) {
+function planVerifiedSync({ members, players, roleId, complete = true }) {
     const empty = { grants: [], revokes: [] };
     if (!roleId || !Array.isArray(players) || players.length === 0) return empty;
 
@@ -148,7 +156,7 @@ function planVerifiedSync({ members, players, roleId }) {
         if (!linked.has(id) && hasRole) revokes.push({ discordId: id });
     }
 
-    return { grants, revokes };
+    return { grants, revokes: complete ? revokes : [] };
 }
 
 /**

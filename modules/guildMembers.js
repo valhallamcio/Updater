@@ -37,19 +37,26 @@ function isMissingIntent(error) {
 
 /**
  * Lists every member of a guild over REST.
+ *
+ * `complete` is the load-bearing one: it is only true when the list ran out on its own.
+ * A read that used up the page cap, or came back with nobody in it, is a PARTIAL view of
+ * the guild - everyone we did not read looks exactly like somebody who left, so a caller
+ * that revokes things must not revoke on one of those.
+ *
  * @param {object} guild A discord.js Guild.
  * @param {string} component Log component name of the caller.
- * @returns {Promise<{ok: boolean, members: object[], reason: string|null}>} `members` are
- *     plain `{id, premiumSince, roles}` rows (roles as ids), plus the discord.js member
- *     on `member` so a caller can act on it. Never throws.
+ * @returns {Promise<{ok: boolean, complete: boolean, members: object[], reason: string|null}>}
+ *     `members` are plain `{id, premiumSince, roles}` rows (roles as ids), plus the
+ *     discord.js member on `member` so a caller can act on it. Never throws.
  */
 async function fetchGuildMembers(guild, component = 'RoleSync') {
     if (!guild || !guild.members || typeof guild.members.list !== 'function') {
-        return { ok: false, members: [], reason: 'no-guild' };
+        return { ok: false, complete: false, members: [], reason: 'no-guild' };
     }
 
     const members = [];
     let after;
+    let ranOut = false;
 
     try {
         for (let page = 0; page < MAX_PAGES; page++) {
@@ -63,7 +70,10 @@ async function fetchGuildMembers(guild, component = 'RoleSync') {
                     member: member
                 });
             }
-            if (rows.length < PAGE_SIZE) break;
+            if (rows.length < PAGE_SIZE) {
+                ranOut = true;
+                break;
+            }
             after = rows[rows.length - 1].id;
         }
     } catch (error) {
@@ -74,13 +84,18 @@ async function fetchGuildMembers(guild, component = 'RoleSync') {
                     'Cannot read the guild member list - the GuildMembers privileged intent is not enabled for this bot. ' +
                     'Enable "Server Members Intent" in the Discord developer portal to turn role sync on; until then it does nothing.');
             }
-            return { ok: false, members: [], reason: 'missing-intent' };
+            return { ok: false, complete: false, members: [], reason: 'missing-intent' };
         }
         sessionLogger.error(component, 'Could not list guild members', error.message);
-        return { ok: false, members: [], reason: 'error' };
+        return { ok: false, complete: false, members: [], reason: 'error' };
     }
 
-    return { ok: true, members: members, reason: null };
+    // A guild this bot is in always has at least the bot in it, so zero rows is a hiccup
+    // and not an empty server; a full last page means the cap cut the list short.
+    if (members.length === 0) return { ok: true, complete: false, members: members, reason: 'empty' };
+    if (!ranOut) return { ok: true, complete: false, members: members, reason: 'truncated' };
+
+    return { ok: true, complete: true, members: members, reason: null };
 }
 
 /**
@@ -91,4 +106,4 @@ function resetIntentWarning() {
     intentWarned = false;
 }
 
-module.exports = { fetchGuildMembers, isMissingIntent, resetIntentWarning, PAGE_SIZE };
+module.exports = { fetchGuildMembers, isMissingIntent, resetIntentWarning, PAGE_SIZE, MAX_PAGES };

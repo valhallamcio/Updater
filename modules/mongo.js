@@ -1191,10 +1191,38 @@ module.exports = {
     // The writes below are targeted operators on purpose: permission-api rewrites the
     // whole array, so a read-modify-write from here would race a staff /perms edit.
     /**
-     * Every account with a Discord link, with what the sync needs to decide.
-     * @returns {Promise<object[]>} `{uuid, username, discord_id, permissions, playtime}` docs.
+     * Every account with a Discord link, with what the sync needs to decide. The playtime
+     * map is per-pack and only /pingroles reads it, so it is off unless asked for - the
+     * reconcile does not need to drag it across the wire every interval.
+     * @param {object} [options] `{withPlaytime}`.
+     * @returns {Promise<object[]>} `{uuid, username, discord_id, permissions}` docs, plus
+     *     `playtime` when asked for.
      */
-    findLinkedBifrostPlayers: async function () {
+    findLinkedBifrostPlayers: async function (options = {}) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const projection = { _id: 0, uuid: 1, username: 1, discord_id: 1, permissions: 1 };
+        if (options && options.withPlaytime) projection.playtime = 1;
+
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .find({ discord_id: { $exists: true, $ne: null } }, { projection: projection })
+            .toArray();
+    },
+
+    /**
+     * Every account carrying a group entry THIS sync wrote, found by the marker rather
+     * than by who is linked today. Without it an /unlink (either side) drops the account
+     * out of the linked read and its granted entry is stuck on for good.
+     * @param {string} key `group.<name>`.
+     * @param {string} source The `source` context value that marks our own entries.
+     * @returns {Promise<object[]>} `{uuid, username, discord_id, permissions}` docs.
+     */
+    findPlayersWithSyncedGroupEntry: async function (key, source) {
         if (!mainClientConnected) {
             await mongoClient.connect();
             mainClientConnected = true;
@@ -1203,15 +1231,15 @@ module.exports = {
         return mongoClient
             .db('bifrost')
             .collection('players')
-            .find({ discord_id: { $exists: true, $ne: null } }, {
-                projection: {
-                    _id: 0,
-                    uuid: 1,
-                    username: 1,
-                    discord_id: 1,
-                    permissions: 1,
-                    playtime: 1
+            .find({
+                permissions: {
+                    $elemMatch: {
+                        key: String(key),
+                        context: { $elemMatch: { key: 'source', value: String(source) } }
+                    }
                 }
+            }, {
+                projection: { _id: 0, uuid: 1, username: 1, discord_id: 1, permissions: 1 }
             })
             .toArray();
     },
