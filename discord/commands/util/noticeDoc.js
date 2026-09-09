@@ -175,6 +175,8 @@ function buildNoticeDoc(input) {
     if (TITLE_REQUIRED.includes(type) && !title) return { ok: false, error: `A \`${type}\` needs a title.` };
     if (title.length > TITLE_CAP) return { ok: false, error: `Title is ${title.length} chars — the cap is ${TITLE_CAP}.` };
     if (title && hasForbiddenTags(title)) return { ok: false, error: 'Title carries a `<click:>`/`<hover:>` tag.' };
+    // The proxy reads the sidebar flag off a pinned doc only.
+    if (input.sidebar === true && type !== 'pinned') return { ok: false, error: 'sidebar is for pinned notices' };
 
     let id = input.id ? String(input.id).trim().toLowerCase() : '';
     if (id) {
@@ -220,6 +222,8 @@ function buildNoticeDoc(input) {
     // A tip is a guide card override, and the proxy reads that text from `card`.
     if (type === 'tip') doc.card = { en: body };
     else doc.body = { en: body };
+    // A flagged pinned doc also sits on the in-game sidebar until the player has seen it.
+    if (type === 'pinned' && input.sidebar === true) doc.sidebar = true;
     if (Object.keys(targets).length) doc.targets = targets;
     doc.buttons = [];
 

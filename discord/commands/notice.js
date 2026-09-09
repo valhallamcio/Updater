@@ -25,7 +25,7 @@ const TYPE_CHOICES = NOTICE_TYPES.map(t => ({ name: t, value: t }));
 const TYPE_BLURB = {
     announcement: 'joins the announcement rotation',
     broadcast: 'goes out once to everyone online now',
-    pinned: 'shows on join until the player clicks [Got it]',
+    pinned: 'shows on join until the player clicks [Got it]; with sidebar:true it also sits on the sidebar until seen',
     known_issue: 'shows on join and tops the board',
     event: 'shows on join and on the board until it ends',
     tip: 'overrides the guide card text with that id'
@@ -95,6 +95,10 @@ module.exports = {
                 .addBooleanOption(option =>
                     option.setName('new_only')
                         .setDescription('Show only to first-time players')
+                        .setRequired(false))
+                .addBooleanOption(option =>
+                    option.setName('sidebar')
+                        .setDescription('Also show it on the in-game sidebar until each player has seen it (pinned only)')
                         .setRequired(false))
                 .addStringOption(option =>
                     option.setName('min_version')
@@ -205,6 +209,7 @@ module.exports = {
             expires: interaction.options.getString('expires'),
             starts: interaction.options.getString('starts'),
             newOnly: interaction.options.getBoolean('new_only'),
+            sidebar: interaction.options.getBoolean('sidebar'),
             minVersion: interaction.options.getString('min_version'),
             maxVersion: interaction.options.getString('max_version'),
             updatedBy: this.author(interaction),

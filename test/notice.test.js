@@ -88,6 +88,43 @@ test('pinned doc: body under body.en, buttons array, no expiry unless asked', ()
     assert.strictEqual(built.doc.note, 'created via /notice');
 });
 
+test('a pinned notice can ask for the sidebar, and the option reaches the doc', async () => {
+    const built = util.buildNoticeDoc({ type: 'pinned', title: 'Staff Message', body: 'Project X is live!', sidebar: true, now: NOW });
+    assert.ok(built.ok);
+    assert.strictEqual(built.doc.sidebar, true);
+
+    const it = interaction('create', { type: 'pinned', title: 'Staff Message', body: 'Project X is live!', sidebar: true });
+    await command.execute(it);
+    assert.strictEqual(upserted.length, 1);
+    assert.strictEqual(upserted[0].sidebar, true, 'the create option has to reach buildNoticeDoc');
+});
+
+/*
+ * The proxy reads `sidebar` on a pinned doc only (notices/store.ts readBoardDoc), so the flag
+ * on any other type is a doc that never reaches the sidebar. Staff hear about it here.
+ */
+test('sidebar on any type but pinned is refused before Mongo', async () => {
+    const event = util.buildNoticeDoc({ type: 'event', title: 'Build contest', body: 'Come build.', expires: '3d', sidebar: true, now: NOW });
+    assert.strictEqual(event.ok, false);
+    assert.strictEqual(event.error, 'sidebar is for pinned notices');
+    assert.strictEqual(util.buildNoticeDoc({ type: 'announcement', body: 'Vote for us!', sidebar: true, now: NOW }).ok, false);
+
+    const it = interaction('create', { type: 'event', title: 'Build contest', body: 'Come build.', expires: '3d', sidebar: true });
+    await command.execute(it);
+    assert.strictEqual(upserted.length, 0);
+    assert.match(it.replies[0], /sidebar is for pinned notices/);
+});
+
+test('a pinned notice without the option carries no sidebar key at all', () => {
+    const built = util.buildNoticeDoc({ type: 'pinned', title: 'Server move', body: 'We move on Friday.', now: NOW });
+    assert.ok(built.ok);
+    assert.strictEqual('sidebar' in built.doc, false, 'an absent flag writes nothing, never false');
+
+    const off = util.buildNoticeDoc({ type: 'pinned', title: 'Server move', body: 'We move on Friday.', sidebar: false, now: NOW });
+    assert.ok(off.ok);
+    assert.strictEqual('sidebar' in off.doc, false);
+});
+
 test('tip doc stores its text under card (the shape guide validates), never body', () => {
     const built = util.buildNoticeDoc({ type: 'tip', id: 'tip.channel_churn', body: '<gray>Try /ch global.</gray>', now: NOW });
     assert.ok(built.ok);
