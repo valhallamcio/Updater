@@ -12,7 +12,8 @@
 
 const {
     MongoClient,
-    Long
+    Long,
+    ObjectId
 } = require('mongodb');
 require('dotenv').config();
 const sessionLogger = require('./sessionLogger');
@@ -38,6 +39,18 @@ let discordLinkIndexesEnsured = false;
 
 // bifrost.logs starts here; anything older lives only in valhallamc.logs (the archive)
 const ARCHIVE_CUTOFF = new Date('2026-03-01T00:00:00Z');
+
+/**
+ * A link request id, back in the form Mongo matches on. The Discord button carries the
+ * _id as text, so a 24-character hex string has to become an ObjectId again.
+ * @param {*} id Whatever the caller has - an ObjectId, or its string form.
+ * @returns {*} The id to filter with.
+ */
+function linkRequestId(id) {
+    if (id instanceof ObjectId) return id;
+    const text = String(id);
+    return text.length === 24 && ObjectId.isValid(text) ? new ObjectId(text) : text;
+}
 
 module.exports = {
 
@@ -1185,6 +1198,119 @@ module.exports = {
             .insertOne(doc);
     },
 
+    // In-game /link request (bifrost.link_requests). A player who cannot reach Discord -
+    // a country that blocks it, or any other reason - asks in game, staff decide on the
+    // embed schedulers/linkRequests.js posts, and an approval writes the exemption onto
+    // their bifrost.players doc. The proxy watches that collection, so they hear about it
+    // in about a second.
+    /**
+     * The open requests that have not been posted to Discord yet, oldest first.
+     * @param {number} limit Max requests per pass.
+     * @returns {Promise<object[]>} bifrost.link_requests docs.
+     */
+    findOpenLinkRequests: async function (limit = 10) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('link_requests')
+            .find({ status: 'open', postedAt: null })
+            .sort({ createdAt: 1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * Gets one request by id - the approve path needs the uuid and the reason off it.
+     * @param {*} id The request _id (an ObjectId, or its string form).
+     * @returns {Promise<object|null>} The request doc or null.
+     */
+    getLinkRequest: async function (id) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('link_requests')
+            .findOne({ _id: linkRequestId(id) });
+    },
+
+    /**
+     * Records the message staff decide on, so the request is never posted twice.
+     * @param {*} id The request _id.
+     * @param {string} messageId The Discord message the embed went to.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    markLinkRequestPosted: async function (id, messageId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('link_requests')
+            .updateOne({ _id: linkRequestId(id) }, {
+                $set: {
+                    postedAt: new Date(),
+                    messageId: String(messageId)
+                }
+            });
+    },
+
+    /**
+     * Moves a request out of `open`, and only while it still IS open. The filter is what
+     * makes a second click lose instead of decide the same request twice.
+     * @param {*} id The request _id.
+     * @param {string} status 'approved' or 'denied'.
+     * @param {string} decidedBy Discord id of whoever clicked.
+     * @param {string} decidedName Their username.
+     * @returns {Promise<object>} The updateOne result - `matchedCount` 0 means somebody
+     *     else decided it first and the caller must stop there.
+     */
+    claimLinkRequest: async function (id, status, decidedBy, decidedName) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('link_requests')
+            .updateOne({ _id: linkRequestId(id), status: 'open' }, {
+                $set: {
+                    status: String(status),
+                    decidedBy: String(decidedBy),
+                    decidedName: String(decidedName),
+                    decidedAt: new Date()
+                }
+            });
+    },
+
+    /**
+     * Writes the approval onto the player doc. The proxy reads it and stops asking that
+     * account to link through Discord.
+     * @param {string} uuid Dashed uuid of the Minecraft account.
+     * @param {object} exempt `{by, byName, reason, at}`.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    setBifrostLinkExempt: async function (uuid, exempt) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('players')
+            .updateOne({ uuid: String(uuid) }, { $set: { discord_link_exempt: exempt } });
+    },
+
     // Role sync (schedulers/roleSync.js): the linked accounts, and Bifrost's permission
     // shapes. Group membership is an entry on the player doc - `{key: 'group.<name>',
     // value: true}` in `permissions` - and the group itself is a permission_groups doc.
@@ -1192,11 +1318,13 @@ module.exports = {
     // whole array, so a read-modify-write from here would race a staff /perms edit.
     /**
      * Every account with a Discord link, with what the sync needs to decide. The playtime
-     * map is per-pack and only /pingroles reads it, so it is off unless asked for - the
-     * reconcile does not need to drag it across the wire every interval.
+     * maps are per-pack and only the playtime readers want them, so they are off unless
+     * asked for - the Verified reconcile does not need to drag them across the wire every
+     * interval. `afk_time` comes with `playtime`: active time is the one minus the other,
+     * and playtime on its own would count somebody who stood still all evening.
      * @param {object} [options] `{withPlaytime}`.
      * @returns {Promise<object[]>} `{uuid, username, discord_id, permissions}` docs, plus
-     *     `playtime` when asked for.
+     *     `playtime` and `afk_time` when asked for.
      */
     findLinkedBifrostPlayers: async function (options = {}) {
         if (!mainClientConnected) {
@@ -1205,7 +1333,10 @@ module.exports = {
         }
 
         const projection = { _id: 0, uuid: 1, username: 1, discord_id: 1, permissions: 1 };
-        if (options && options.withPlaytime) projection.playtime = 1;
+        if (options && options.withPlaytime) {
+            projection.playtime = 1;
+            projection.afk_time = 1;
+        }
 
         return mongoClient
             .db('bifrost')
@@ -1310,6 +1441,65 @@ module.exports = {
                     }
                 }
             });
+    },
+
+    // Pack role opt-outs (the updater's own DB). The #role-assignment buttons are how a
+    // member says no to a pack role, and the playtime sync in roleSync would hand it
+    // straight back on the next pass - so a button that REMOVES a role writes a row here,
+    // and one that adds it deletes that row again. Keyed on the Discord id: one person may
+    // hold several Minecraft accounts.
+    /**
+     * Remembers that somebody took a pack role off themselves.
+     * @param {string} discordId Discord snowflake, as a string.
+     * @param {string} tag Pack tag.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    recordPackRoleOptOut: async function (discordId, tag) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const row = { discordId: String(discordId), tag: String(tag) };
+        return mongoClient
+            .db(mongoDBName)
+            .collection('pack_role_optouts')
+            .updateOne(row, { $set: { ...row, at: new Date() } }, { upsert: true });
+    },
+
+    /**
+     * Forgets an opt-out, because they just switched the role back on.
+     * @param {string} discordId Discord snowflake, as a string.
+     * @param {string} tag Pack tag.
+     * @returns {Promise<object>} The deleteOne result.
+     */
+    clearPackRoleOptOut: async function (discordId, tag) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('pack_role_optouts')
+            .deleteOne({ discordId: String(discordId), tag: String(tag) });
+    },
+
+    /**
+     * Every opt-out on record. One read per sync pass feeds the planner.
+     * @returns {Promise<object[]>} `{discordId, tag, at}` rows.
+     */
+    findPackRoleOptOuts: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('pack_role_optouts')
+            .find({}, { projection: { _id: 0, discordId: 1, tag: 1, at: 1 } })
+            .toArray();
     },
 
     /**

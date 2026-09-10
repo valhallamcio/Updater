@@ -8,7 +8,9 @@
  *    (/link and /unlink already do it per event - this converges a role somebody moved
  *    by hand, or a link made while the bot was down),
  *  - a server booster holds membership of Bifrost's `booster` permission group, and
- *    loses it when the boost stops.
+ *    loses it when the boost stops,
+ *  - a linked player who has 15 minutes of ACTIVE playtime on a pack holds that pack's
+ *    Discord role (grants only - the #role-assignment buttons stay how somebody says no).
  *
  * OFF by default, and it stays off until the owner fills in `guildId` and flips
  * `enabled` - and `dryRun` is true out of the box, so the first real runs only say what
@@ -20,13 +22,14 @@
  * the I/O, the dry run, and the rails: nothing is written when the linked-player read
  * comes back empty or when the permission group does not exist, NOTHING is ever taken
  * back on a member list that is not known to be whole, `maxChangesPerRun` is one shared
- * budget across both halves (so a bad read cannot storm the guild) and what does not fit
- * goes next pass instead of never, and one pass at a time - a slow run must not have a
+ * budget across all three halves (so a bad read cannot storm the guild) and what does not
+ * fit goes next pass instead of never, and one pass at a time - a slow run must not have a
  * second one fighting it off a stale snapshot.
  */
 
 const mongo = require('../modules/mongo');
 const sessionLogger = require('../modules/sessionLogger');
+const yggdrasil = require('../modules/yggdrasil');
 const { fetchGuildMembers } = require('../modules/guildMembers');
 const plan = require('../modules/roleSyncPlan');
 
@@ -51,6 +54,10 @@ module.exports = {
         // falls back to discordLink.verifiedRoleId (what /link and /unlink use)
         "verifiedRoleId": false,
         "boosterGroup": "booster",
+        "packRoles": {
+            "enabled": false,
+            "minActiveMinutes": 15
+        },
         "dryRun": true,
         "maxChangesPerRun": 50
     },
@@ -85,10 +92,13 @@ module.exports = {
      * Fills in the defaults and the verified-role fallback, so the rest of the file can
      * read one object.
      * @param {object} options Raw scheduler config.
-     * @returns {object} `{enabled, guildId, verifiedRoleId, boosterGroup, dryRun, interval, maxChangesPerRun}`.
+     * @returns {object} `{enabled, guildId, verifiedRoleId, boosterGroup, packRoles, dryRun, interval, maxChangesPerRun}`.
      */
     resolveConfig: function (options) {
         const config = Object.assign({}, this.defaultConfig, options || {});
+        // Object.assign is shallow, so a config that only sets `enabled` under packRoles
+        // would otherwise arrive without a threshold.
+        config.packRoles = Object.assign({}, this.defaultConfig.packRoles, config.packRoles || {});
         if (!config.verifiedRoleId) {
             try {
                 const linkConfig = require('../config/config.json').discordLink;
@@ -144,7 +154,9 @@ module.exports = {
                 'that is not known to be whole');
         }
 
-        const players = await mongo.findLinkedBifrostPlayers();
+        // The playtime maps are only worth the wire when the pack roles are on.
+        const packRolesOn = Boolean(config.packRoles && config.packRoles.enabled);
+        const players = await mongo.findLinkedBifrostPlayers({ withPlaytime: packRolesOn });
         if (!players || players.length === 0) {
             // Never the moment to strip roles from a whole guild - treat it as a fault.
             sessionLogger.warn(LOG, 'No linked accounts came back from Mongo - skipping this pass');
@@ -158,6 +170,7 @@ module.exports = {
 
         const verified = await this.syncVerifiedRole(config, fetched.members, players, budget, complete);
         const booster = await this.syncBoosterGroup(config, fetched.members, players, budget, complete);
+        const packRoles = await this.syncPackRoles(config, fetched.members, players, budget, complete);
 
         if (budget.deferred > 0) {
             sessionLogger.warn(LOG,
@@ -165,11 +178,12 @@ module.exports = {
                 'Check the plan (dryRun) and raise scheduler.roleSync.maxChangesPerRun if this is normal.');
         }
 
-        const changes = verified.granted + verified.revoked + booster.granted + booster.revoked;
+        const changes = verified.granted + verified.revoked + booster.granted + booster.revoked + packRoles.granted;
         if (changes > 0 || config.dryRun) {
             sessionLogger.info(LOG,
                 `${config.dryRun ? '[dry run] ' : ''}${players.length} linked accounts, ${fetched.members.length} members: ` +
-                `verified +${verified.granted}/-${verified.revoked}, booster +${booster.granted}/-${booster.revoked}`);
+                `verified +${verified.granted}/-${verified.revoked}, booster +${booster.granted}/-${booster.revoked}, ` +
+                `pack roles +${packRoles.granted}`);
         }
 
         return {
@@ -178,6 +192,7 @@ module.exports = {
             deferred: budget.deferred,
             verified: verified,
             booster: booster,
+            packRoles: packRoles,
             dryRun: Boolean(config.dryRun)
         };
     },
@@ -328,6 +343,70 @@ module.exports = {
                 if (write && write.modifiedCount > 0) result.revoked++;
             } catch (error) {
                 sessionLogger.error(LOG, `Could not remove ${row.username} from ${config.boosterGroup}`, error.message);
+            }
+        }
+
+        return result;
+    },
+
+    /**
+     * Gives a pack's Discord role to linked players who have earned it in game. Grants
+     * only: the #role-assignment buttons are how somebody says no, and every removal made
+     * with one is remembered so this does not hand the role straight back.
+     * @param {object} config Resolved config.
+     * @param {object[]} members Rows from fetchGuildMembers.
+     * @param {object[]} players Linked player docs, with playtime and afk_time.
+     * @param {object} budget The pass's shared change budget.
+     * @param {boolean} complete Is the member list known to be whole?
+     * @returns {Promise<{granted: number, planned: number}>} What happened.
+     */
+    syncPackRoles: async function (config, members, players, budget, complete) {
+        const result = { granted: 0, planned: 0 };
+        const settings = config.packRoles;
+        if (!settings || !settings.enabled) return result;
+
+        let servers;
+        let optOuts;
+        try {
+            servers = await yggdrasil.getServers();
+            // An opt-out read that failed looks exactly like nobody having opted out, and
+            // this pass would undo every one of them - so a failure costs the pass.
+            const rows = await mongo.findPackRoleOptOuts();
+            optOuts = new Set((rows || []).map(row => `${row.discordId}:${row.tag}`));
+        } catch (error) {
+            sessionLogger.error(LOG, 'Could not read the packs or the opt-outs - skipping the pack roles', error.message);
+            return result;
+        }
+
+        const minutes = Math.max(0, Number(settings.minActiveMinutes) || 0);
+        const planned = plan.planPackRoles({
+            servers: servers,
+            players: players,
+            minActiveMs: minutes * 60 * 1000,
+            memberRoles: new Map(members.map(m => [m.id, m.roles])),
+            optOuts: optOuts,
+            complete: complete
+        });
+
+        result.planned = planned.length;
+        if (result.planned === 0) return result;
+
+        const grants = this.takeBudget(budget, planned);
+        const byId = new Map(members.map(m => [m.id, m.member]));
+
+        for (const row of grants) {
+            if (config.dryRun) {
+                sessionLogger.info(LOG, `[dry run] would give ${row.discordId} the ${row.name} role (${row.username} has ${Math.round(row.activeMs / 60000)} active minutes)`);
+                result.granted++;
+                continue;
+            }
+            try {
+                await byId.get(row.discordId).roles.add(row.roleId, `${minutes} active minutes on ${row.name}`);
+                result.granted++;
+            } catch (error) {
+                sessionLogger.error(LOG,
+                    `Could not give ${row.discordId} the ${row.name} role (Manage Roles, and the bot's top role above it?)`,
+                    error.message);
             }
         }
 

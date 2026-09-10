@@ -12,6 +12,7 @@
 const sharp = require('sharp');
 const axios = require('axios');
 const sessionLogger = require("../modules/sessionLogger");
+const mongo = require("../modules/mongo");
 const {
     getClient
 } = require("../discord/bot");
@@ -69,10 +70,12 @@ module.exports = {
 
                     if (guildMember.roles.cache.has(role.id)) {
                         await guildMember.roles.remove(role);
+                        await rememberOptOut(interaction.user.id, server.tag, true);
                         sessionLogger.info('RoleAssigner', `${interaction.user.globalName} disabled role for ${server.name}`);
                         replyMessage = `Role for ${server.name} **removed**!`;
                     } else {
                         await guildMember.roles.add(role);
+                        await rememberOptOut(interaction.user.id, server.tag, false);
                         sessionLogger.info('RoleAssigner', `${interaction.user.globalName} enabled role for ${server.name}`);
                         replyMessage = `Role for ${server.name} **enabled**!`;
                     }
@@ -88,6 +91,23 @@ module.exports = {
                 }
             }
         });
+
+        /**
+         * Remembers which way somebody used a button, so the playtime sync in roleSync
+         * does not hand back a role they just took off. Never throws - a Mongo hiccup must
+         * not cost the member their button.
+         * @param {string} discordId Who clicked.
+         * @param {string} tag Pack tag on the button.
+         * @param {boolean} optedOut True when the role was removed.
+         */
+        async function rememberOptOut(discordId, tag, optedOut) {
+            try {
+                if (optedOut) await mongo.recordPackRoleOptOut(discordId, tag);
+                else await mongo.clearPackRoleOptOut(discordId, tag);
+            } catch (error) {
+                sessionLogger.error('RoleAssigner', `Could not record the ${tag} opt-out for ${discordId}:`, error.message);
+            }
+        }
 
         async function buildButtons() {
             let serverList = await yggdrasil.getServers();

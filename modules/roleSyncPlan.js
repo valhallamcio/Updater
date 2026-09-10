@@ -167,12 +167,16 @@ function planVerifiedSync({ members, players, roleId, complete = true }) {
  * `playtime` on a Bifrost player doc is keyed by pack tag and counted in MILLISECONDS
  * (player-data $incs raw ms), so the threshold is converted here, once.
  *
+ * ACTIVE playtime, the same measure planPackRoles grants on. Raw playtime would name a
+ * different set of people than the assigner does, and staff read the two side by side.
+ *
  * @param {object} input `{servers, players, minHours, memberRoles}`; servers are the
  *     Yggdrasil docs (`tag`, `name`, `discordRoleId`), memberRoles is an optional
  *     `Map<discordId, string[]>` - without it the report cannot say who already holds
  *     the role (that needs the GuildMembers intent).
  * @returns {object[]} `{tag, name, roleId, qualified: [{discordId, username, hours, hasRole}]}`
- *     per pack that has a role, packs with nobody qualifying dropped.
+ *     per pack that has a role, `hours` being active hours; packs with nobody
+ *     qualifying dropped.
  */
 function planPingRoles({ servers, players, minHours, memberRoles }) {
     const minMs = Math.max(0, Number(minHours) || 0) * 60 * 60 * 1000;
@@ -192,7 +196,7 @@ function planPingRoles({ servers, players, minHours, memberRoles }) {
         const qualified = [];
         for (const player of players) {
             if (!player || player.discord_id == null) continue;
-            const ms = (player.playtime && Number(player.playtime[server.tag])) || 0;
+            const ms = activePlaytimeMs(player, server.tag);
             if (ms < minMs || ms <= 0) continue;
             const discordId = String(player.discord_id);
             const roles = memberRoles ? (memberRoles.get(discordId) || []) : null;
@@ -213,13 +217,91 @@ function planPingRoles({ servers, players, minHours, memberRoles }) {
     return report;
 }
 
+/**
+ * Active playtime on one pack, in milliseconds. Both maps sit on the player doc keyed by
+ * server TAG, and both are raw milliseconds.
+ * @param {object} player A bifrost.players doc.
+ * @param {string} tag Pack tag.
+ * @returns {number} `playtime[tag]` minus `afk_time[tag]`, never below zero.
+ */
+function activePlaytimeMs(player, tag) {
+    const played = (player.playtime && Number(player.playtime[tag])) || 0;
+    const afk = (player.afk_time && Number(player.afk_time[tag])) || 0;
+    return Math.max(0, played - afk);
+}
+
+/**
+ * Plans the pack roles a linked player has earned: enough active playtime on a pack and
+ * they hold that pack's Discord role.
+ *
+ * GRANTS ONLY. The #role-assignment buttons are how somebody says no to a pack role, so a
+ * sync that revoked would be fighting them - `optOuts` carries what those buttons removed
+ * and this leaves those alone. A member the read did not cover is skipped rather than
+ * granted: without their roles there is no way to tell a new role from one they already
+ * hold, and one person's several Minecraft accounts only ever earn the role once.
+ *
+ * @param {object} input `{servers, players, minActiveMs, memberRoles, optOuts, complete}`;
+ *     servers are the Yggdrasil docs (`tag`, `name`, `discordRoleId`), memberRoles is a
+ *     `Map<discordId, string[]>` (no map at all = the GuildMembers intent is off, and
+ *     nothing is granted), optOuts is a `Set` of `"<discordId>:<tag>"`. `complete` is here
+ *     for the same reason the other planners take it; nothing here revokes, so a partial
+ *     member list only grants less.
+ * @returns {object[]} `{discordId, tag, roleId, name, username, activeMs}` per grant.
+ */
+function planPackRoles({ servers, players, minActiveMs, memberRoles, optOuts, complete = true }) {
+    if (!Array.isArray(servers) || !Array.isArray(players) || !memberRoles) return [];
+    const minMs = Math.max(0, Number(minActiveMs) || 0);
+
+    const seen = new Set();
+    const granted = new Set();
+    const grants = [];
+
+    for (const server of servers) {
+        if (!server || !server.tag) continue;
+        const roleId = server.discordRoleId || server.discord_role_id;
+        if (!roleId) continue;
+        // Instances of one pack share a tag and a role - decide the pack once.
+        if (seen.has(server.tag)) continue;
+        seen.add(server.tag);
+
+        for (const player of players) {
+            if (!player || player.discord_id == null) continue;
+            const active = activePlaytimeMs(player, server.tag);
+            if (active <= 0 || active < minMs) continue;
+
+            const discordId = String(player.discord_id);
+            const key = `${discordId}:${server.tag}`;
+            if (granted.has(key)) continue;
+            if (optOuts && optOuts.has(key)) continue;
+
+            const roles = memberRoles.get(discordId);
+            if (!roles) continue;
+            if (roles.some(r => String(r) === String(roleId))) continue;
+
+            granted.add(key);
+            grants.push({
+                discordId: discordId,
+                tag: server.tag,
+                roleId: String(roleId),
+                name: server.name || server.tag,
+                username: player.username || player.uuid,
+                activeMs: active
+            });
+        }
+    }
+
+    return grants;
+}
+
 module.exports = {
     BOOSTER_SOURCE,
     boosterEntry,
     groupKey,
     isSyncOwned,
     findGroupEntry,
+    activePlaytimeMs,
     planBoosterSync,
     planVerifiedSync,
-    planPingRoles
+    planPingRoles,
+    planPackRoles
 };

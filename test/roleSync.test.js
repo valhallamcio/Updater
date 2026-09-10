@@ -218,6 +218,33 @@ test('the ping role report reads playtime as MILLISECONDS and only lists linked 
     assert.strictEqual(blind[0].qualified[0].hasRole, null, 'without member data it says unknown, not false');
 });
 
+test('the report and the pack role assigner threshold on the SAME active playtime', () => {
+    // The assigner grants on playtime minus afk_time. A report that read raw playtime
+    // would name people the assigner never touches, and staff read the two side by side.
+    const servers = [{ tag: 'arc', name: 'Arcadia', discordRoleId: 'role-arc' }];
+    const players = [
+        // 12h on the clock, 4h of it standing still: 8h active, under the 10h bar.
+        { uuid: 'u-1', username: 'Idle', discord_id: 'd-1', playtime: { arc: 43200000 }, afk_time: { arc: 14400000 } },
+        // 12h on the clock, 1h AFK: 11h active, over it.
+        { uuid: 'u-2', username: 'Real', discord_id: 'd-2', playtime: { arc: 43200000 }, afk_time: { arc: 3600000 } }
+    ];
+
+    const report = plan.planPingRoles({ minHours: 10, servers, players, memberRoles: new Map() });
+    assert.deepStrictEqual(report[0].qualified.map(q => q.username), ['Real'],
+        'the 8h-active player does not qualify on a 12h clock');
+    assert.strictEqual(report[0].qualified[0].hours, 11, 'and the hours column is ACTIVE hours, not the clock');
+
+    // The same two players through the assigner, at the same bar: the same one answer.
+    const grants = plan.planPackRoles({
+        servers,
+        players,
+        minActiveMs: 10 * 60 * 60 * 1000,
+        memberRoles: new Map([['d-1', []], ['d-2', []]]),
+        optOuts: new Set()
+    });
+    assert.deepStrictEqual(grants.map(g => g.username), ['Real'], 'the two halves agree');
+});
+
 // ---------------------------------------------------------------------------
 // The scheduler (I/O around the plan)
 // ---------------------------------------------------------------------------

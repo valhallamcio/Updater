@@ -6,7 +6,9 @@
  * at before nudging anyone.
  *
  * Only linked accounts can appear, because a Discord id is the only way from a player to
- * a member. Playtime comes off bifrost.players (`playtime.<tag>`, milliseconds).
+ * a member. Playtime comes off bifrost.players (`playtime.<tag>` minus `afk_time.<tag>`,
+ * milliseconds) - the same active measure the pack role assigner grants on, so the report
+ * and the assigner name the same people.
  *
  * Whether somebody ALREADY holds the role needs the guild member list, and that needs
  * the GuildMembers privileged intent - without it the report still lists everyone, it
@@ -37,7 +39,7 @@ module.exports = {
                 .setAutocomplete(true))
         .addIntegerOption(option =>
             option.setName('hours')
-                .setDescription(`Playtime needed to qualify (default ${DEFAULT_HOURS})`)
+                .setDescription(`Active playtime needed to qualify (default ${DEFAULT_HOURS})`)
                 .setMinValue(1)
                 .setMaxValue(1000)
                 .setRequired(false)),
@@ -68,7 +70,9 @@ module.exports = {
 
         const [servers, players] = await Promise.all([
             yggdrasil.getServers(),
-            mongo.findLinkedBifrostPlayers()
+            // without withPlaytime the docs come back with no playtime map, so every row
+            // reads as 0 hours and the report is always empty; afk_time rides playtime
+            mongo.findLinkedBifrostPlayers({ withPlaytime: true })
         ]);
 
         const wanted = pack
@@ -90,18 +94,18 @@ module.exports = {
 
         if (report.length === 0) {
             await interaction.editReply(
-                `Nobody linked has ${hours}h on ${pack ? `\`${pack}\`` : 'any pack with a ping role'}.`);
+                `Nobody linked has ${hours}h of active playtime on ${pack ? `\`${pack}\`` : 'any pack with a ping role'}.`);
             return;
         }
 
-        const lines = [`**Ping role candidates** — linked accounts with ${hours}h+ on a pack:`];
+        const lines = [`**Ping role candidates** — linked accounts with ${hours}h+ ACTIVE playtime on a pack:`];
         for (const row of report) {
             const missing = memberRoles ? row.qualified.filter(q => !q.hasRole) : row.qualified;
             lines.push('');
             lines.push(`**${row.name}** (\`${row.tag}\`) <@&${row.roleId}> — ${row.qualified.length} qualify` +
                 (memberRoles ? `, ${missing.length} without the role` : ''));
             for (const q of missing.slice(0, MAX_ROWS_PER_PACK)) {
-                lines.push(`• <@${q.discordId}> — ${q.username}, ${q.hours}h`);
+                lines.push(`• <@${q.discordId}> — ${q.username}, ${q.hours}h active`);
             }
             if (missing.length > MAX_ROWS_PER_PACK) lines.push(`• …and ${missing.length - MAX_ROWS_PER_PACK} more`);
         }
