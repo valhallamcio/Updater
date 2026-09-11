@@ -23,7 +23,9 @@ require('dotenv').config();
 const token = process.env.DISCORD_TOKEN;
 
 const client = new Client({
-    intents: [GatewayIntentBits.Guilds]
+    // GuildVoiceStates is what the voiceChannels scheduler reconciles on - without
+    // it the member count of a voice channel is always zero.
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
 });
 
 module.exports = {

@@ -341,6 +341,29 @@ module.exports = {
     },
 
     /**
+     * Marks a job as started, only while it is still active. The matched count
+     * is the answer: zero means somebody cancelled it first and it must not run.
+     * A oneTime job is claimed once only, so a restart between its run and its
+     * deactivation never runs it again.
+     * @param {string} jobId Schedule job ID.
+     * @param {boolean} [once] True for a oneTime job.
+     * @returns {Promise<object>} The updateOne result (`matchedCount`).
+     */
+    claimScheduleJob: async function (jobId, once = false) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const filter = { _id: jobId, active: true };
+        if (once) filter.startedAt = { $exists: false };
+        return mongoClient
+            .db(mongoDBName)
+            .collection('schedule_jobs')
+            .updateOne(filter, { $set: { startedAt: new Date() } });
+    },
+
+    /**
      * Deactivates a schedule job.
      * @param {string} jobId Schedule job ID.
      */
@@ -802,6 +825,46 @@ module.exports = {
             .db('bifrost')
             .collection('players')
             .findOne({ username: { $regex: `^${escaped}$`, $options: 'i' } });
+    },
+
+    /**
+     * Adds cake to a player's Bifrost balance and writes one audit row.
+     *
+     * The drop used to run `give` on the backend, which put thousands of stacks
+     * on the floor. It credits `bifrost.players.cake.balance` now and the player
+     * takes it out in game with `/cake`.
+     * @param {string} username Username (case-insensitive).
+     * @param {number} amount Cake to add.
+     * @param {object} [meta] `{kind, by, server}` for the ledger row.
+     * @returns {Promise<{uuid: string, username: string}|null>} The player, or null when no doc matches.
+     */
+    creditCake: async function (username, amount, meta = {}) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const escaped = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const bifrost = mongoClient.db('bifrost');
+        const player = await bifrost
+            .collection('players')
+            .findOne({ username: { $regex: `^${escaped}$`, $options: 'i' } });
+        if (!player || !player.uuid) return null;
+
+        const at = new Date();
+        await bifrost.collection('players').updateOne(
+            { uuid: player.uuid },
+            { $inc: { 'cake.balance': amount }, $set: { 'cake.updatedAt': at } }
+        );
+        await bifrost.collection('cake_ledger').insertOne({
+            uuid: player.uuid,
+            delta: amount,
+            kind: meta.kind || 'drop',
+            by: meta.by,
+            server: meta.server,
+            at: at
+        });
+        return { uuid: player.uuid, username: player.username };
     },
 
     /**

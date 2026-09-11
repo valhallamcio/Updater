@@ -19,7 +19,7 @@ const {
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('cake')
-        .setDescription('Drops cakes to players!')
+        .setDescription('Banks cake for every online player!')
         .setDefaultMemberPermissions(8192)
         .addIntegerOption(option =>
             option
@@ -30,9 +30,10 @@ module.exports = {
         await interaction.deferReply();
         let cakeAmount = interaction.options.getInteger('amount');
         if (cakeAmount === null) cakeAmount = 1;
-        await interaction.editReply(`Dropping ${cakeAmount} cakes! 🍰`);
+        await interaction.editReply(`Banking ${cakeAmount} cake! 🍰`);
 
-        const cakes = await dropCakeManual(cakeAmount);
+        const by = interaction.user.tag || interaction.user.username;
+        const cakes = await dropCakeManual(cakeAmount, by);
         await interaction.editReply(cakes);
     },
 };

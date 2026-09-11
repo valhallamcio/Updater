@@ -8,6 +8,32 @@ const sessionLogger = require("../modules/sessionLogger");
 // execution must not be fired twice by the next tick).
 const inFlight = new Set();
 
+/**
+ * The server a stored identifier names: a tag, a display name, or a Pterodactyl
+ * serverId. A tag names every instance of a pack; the other two name ONE.
+ * @param {object[]} servers Yggdrasil's server rows.
+ * @param {string} id What the job stored in `serverNames`.
+ * @returns {{server: object, byInstance: boolean}|null} The row, and whether it was named as one instance.
+ */
+function findServer(servers, id) {
+    const needle = String(id).trim().toLowerCase();
+    if (!needle) return null;
+    const byTag = servers.find(s => String(s.tag || '').toLowerCase() === needle);
+    if (byTag) return { server: byTag, byInstance: false };
+    const byName = servers.find(s => String(s.name || '').trim().toLowerCase() === needle);
+    if (byName) return { server: byName, byInstance: true };
+    const byId = servers.find(s => String(s.serverId || '').toLowerCase() === needle);
+    if (byId) return { server: byId, byInstance: true };
+    return null;
+}
+
+/** Two rows are one server when they share a Pterodactyl id, or failing that a name. */
+function sameServer(a, b) {
+    if (!a || !b) return false;
+    if (a.serverId && b.serverId) return String(a.serverId) === String(b.serverId);
+    return String(a.name || '').trim() === String(b.name || '').trim();
+}
+
 module.exports = {
     name: 'playerEventScheduler',
     defaultConfig: {
@@ -65,19 +91,19 @@ module.exports = {
             if (activeTriggers.length === 0) return;
 
             // playersData is keyed by server TAG (e.g. "gtnh"), but triggers store
-            // full server NAMES (e.g. "GT New Horizons") — so a direct
-            // playersData[serverName] lookup is always undefined and the player is
-            // never seen as online. Resolve each stored identifier (name or tag)
-            // back to its tag before looking it up.
+            // full server NAMES (e.g. "GT New Horizons") or Pterodactyl ids — so a
+            // direct playersData[serverName] lookup is always undefined and the
+            // player is never seen as online. Resolve each stored identifier back
+            // to its tag before looking it up.
             const servers = await yggdrasil.getServers();
-            const resolveTag = (id) => {
-                const needle = String(id).trim().toLowerCase();
-                const match = servers.find(s =>
-                    s.tag.toLowerCase() === needle ||
-                    s.name.trim().toLowerCase() === needle
-                );
-                return match ? match.tag : id;
-            };
+
+            // A job addressed to ONE instance (by name or id) only fires while the
+            // player stands on that instance. The console path cannot see a
+            // failed `give`, so a player who hopped to the sibling instance would
+            // get nothing and the job would still count as run.
+            const needsInstances = activeTriggers.some(t =>
+                (t.serverNames || []).some(id => (findServer(servers, id) || {}).byInstance));
+            const detailed = needsInstances ? await yggdrasil.getPlayersDetailed() : null;
 
             for (const trigger of activeTriggers) {
                 const { playerId, serverNames, commands, onJoin, lastSeenServers = [] } = trigger;
@@ -85,10 +111,12 @@ module.exports = {
                 // Track current servers (by their stored identifier) where the player is online.
                 const currentServers = [];
                 for (const serverName of serverNames) {
-                    const online = playersData[resolveTag(serverName)];
-                    if (online && online.some(u => u.toLowerCase() === String(playerId).toLowerCase())) {
-                        currentServers.push(serverName);
-                    }
+                    const found = findServer(servers, serverName);
+                    const tag = found ? found.server.tag : serverName;
+                    const online = playersData[tag];
+                    if (!online || !online.some(u => u.toLowerCase() === String(playerId).toLowerCase())) continue;
+                    if (found && found.byInstance && !this.onInstance(detailed, servers, tag, playerId, found.server)) continue;
+                    currentServers.push(serverName);
                 }
                 
                 const wasOnline = lastSeenServers.length > 0;
@@ -126,6 +154,24 @@ module.exports = {
     },
 
     /**
+     * Is the player standing on this one instance right now?
+     * @param {object|null} detailed `getPlayersDetailed()` rows by tag, or null when nothing asked for them.
+     * @param {object[]} servers Yggdrasil's server rows.
+     * @param {string} tag The instance's tag.
+     * @param {string} playerId Username.
+     * @param {object} server The instance the job names.
+     * @returns {boolean} True only on that instance. A row without an instance passes only on a single-instance tag.
+     */
+    onInstance: function (detailed, servers, tag, playerId, server) {
+        const rows = (detailed && detailed[tag]) || [];
+        const row = rows.find(r => String(r.username || '').toLowerCase() === String(playerId).toLowerCase());
+        if (!row) return false;
+        if (!row.instance) return servers.filter(s => s.tag === tag).length <= 1;
+        const standing = findServer(servers, row.instance);
+        return Boolean(standing) && sameServer(standing.server, server);
+    },
+
+    /**
      * Execute commands for player trigger
      * @param {object} trigger Trigger configuration
      * @param {string} serverName Server where player was found
@@ -136,11 +182,33 @@ module.exports = {
         inFlight.add(key);
         try {
             const servers = await yggdrasil.getServers();
-            const server = servers.find(s => s.tag === serverName || s.name.trim() === serverName.trim());
+            const found = findServer(servers, serverName);
+            const server = found ? found.server : null;
 
             if (!server) return;
 
+            // The proxy's cake bank cancels a job nobody ran inside its refund
+            // window. This claim and that cancel both filter on `active`, so
+            // exactly one of them wins, and a job that lost is never run. A
+            // oneTime job is also claimed once only: a restart between the run
+            // and the deactivation must not run it a second time.
+            const claim = await mongo.claimScheduleJob(trigger._id, Boolean(trigger.oneTime));
+            if (claim && claim.matchedCount === 0) {
+                sessionLogger.info('PlayerEventScheduler', `Player trigger ${key} was cancelled before it ran, skipping`);
+                return;
+            }
+
             const results = await this.runCommands(trigger, server);
+            // The results are the only record of what the backend said. A job
+            // writer (the proxy's cake bank) settles off them, so they go on the
+            // document BEFORE the oneTime deactivation flips `active`. A failed
+            // write here must not stop the deactivation: the commands already
+            // ran, and a second run is the one thing that may never happen.
+            try {
+                await mongo.updateScheduleJob(trigger._id, { results: results, executedAt: new Date() });
+            } catch (error) {
+                sessionLogger.warn('PlayerEventScheduler', `Could not persist the results of ${key} (the job still deactivates):`, error.message);
+            }
             await this.reportResults(trigger, server, results);
 
             // Mark trigger as executed (if it's one-time)
@@ -230,3 +298,6 @@ module.exports = {
         }
     }
 };
+
+module.exports.findServer = findServer;
+module.exports.sameServer = sameServer;

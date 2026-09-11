@@ -47,7 +47,7 @@ function generateConfigFiles() {
     const messagesContent = {
         alertScheduledUpdate: "tellraw @a {\"text\":\"This server has begun an automated update process. Please update your client to v[NEWVERSION]. This process can take up to 15 minutes!\",\"color\":\"red\"}",
         alertScheduledReboot: "tellraw @a {\"text\":\"This server has begun a scheduled reboot process. Please disconnect. This process can take up to 5 minutes!\",\"color\":\"red\"}",
-        alertCakeDrop: "tellraw [RECIEVERS] {\"text\":\"Cake drop!\",\"color\":\"green\"}",
+        alertCakeDrop: "tellraw [RECIEVERS] {\"text\":\"+[AMOUNT] cake banked. /cake to withdraw.\",\"color\":\"green\"}",
         updateMessage: "# <a:Update:1242446803345866883><a:U_:1242446802083385426><a:pd:1242446800586280960><a:ate:1242446799093104650>\n\nHey! **[PACKNAME]** server has been updated! \n## v[OLDVERSION] -> v[NEWVERSION]\n\n[SUMMARY]\nLearn more here: [Changelog](<[CHANGELOGURL]>)\n\nHaving issues? Make a ticket on <#1113399230359408711>. \n\n[PINGROLE]"
     };
 
