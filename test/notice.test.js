@@ -125,6 +125,52 @@ test('a pinned notice without the option carries no sidebar key at all', () => {
     assert.strictEqual('sidebar' in off.doc, false);
 });
 
+/*
+ * The proxy reads a `recurrence: 'yearly'` doc by the month, day and time of its two
+ * dates and ignores the year, and it drops a yearly doc that carries only one of them.
+ */
+test('a yearly notice writes recurrence, and half a window is refused', async () => {
+    const built = util.buildNoticeDoc({
+        type: 'pinned', title: 'Happy new year', body: 'Fireworks at spawn.',
+        starts: '1d', expires: '8d', yearly: true, now: NOW
+    });
+    assert.ok(built.ok);
+    assert.strictEqual(built.doc.recurrence, 'yearly');
+    assert.deepStrictEqual(built.doc.startsAt, new Date('2026-08-18T12:00:00Z'));
+    assert.deepStrictEqual(built.doc.expiresAt, new Date('2026-08-25T12:00:00Z'));
+
+    const off = util.buildNoticeDoc({ type: 'pinned', title: 'Happy new year', body: 'Fireworks.', starts: '1d', expires: '8d', now: NOW });
+    assert.strictEqual('recurrence' in off.doc, false, 'an absent flag writes nothing, never false');
+
+    const noStart = util.buildNoticeDoc({ type: 'pinned', title: 'x', body: 'y', expires: '8d', yearly: true, now: NOW });
+    assert.strictEqual(noStart.ok, false);
+    assert.match(noStart.error, /needs `starts` and `expires`/);
+    const noEnd = util.buildNoticeDoc({ type: 'pinned', title: 'x', body: 'y', starts: '1d', yearly: true, now: NOW });
+    assert.strictEqual(noEnd.ok, false);
+    assert.match(noEnd.error, /needs `starts` and `expires`/);
+
+    const it = interaction('create', {
+        type: 'event', title: 'Halloween', body: 'Trick or treat.', starts: '1d', expires: '8d', yearly: true
+    });
+    await command.execute(it);
+    assert.strictEqual(upserted.length, 1);
+    assert.strictEqual(upserted[0].recurrence, 'yearly', 'the create option has to reach buildNoticeDoc');
+    assert.ok(upserted[0].endsAt instanceof Date, 'an event repeats between startsAt and endsAt');
+
+    const refused = interaction('create', { type: 'pinned', title: 'Happy new year', body: 'Fireworks.', yearly: true });
+    await command.execute(refused);
+    assert.strictEqual(upserted.length, 1, 'nothing is written when the dates it needs are missing');
+    assert.match(refused.replies[0], /needs `starts` and `expires`/);
+
+    // A broadcast goes out once to whoever is online. The proxy refuses a yearly
+    // one, so the command says so here instead of writing a doc that never fires.
+    const broadcast = util.buildNoticeDoc({
+        type: 'broadcast', body: 'Happy new year', starts: '1d', expires: '8d', yearly: true, now: NOW,
+    });
+    assert.strictEqual(broadcast.ok, false);
+    assert.match(broadcast.error, /cannot recur/);
+});
+
 test('tip doc stores its text under card (the shape guide validates), never body', () => {
     const built = util.buildNoticeDoc({ type: 'tip', id: 'tip.channel_churn', body: '<gray>Try /ch global.</gray>', now: NOW });
     assert.ok(built.ok);

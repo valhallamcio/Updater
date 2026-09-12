@@ -100,6 +100,10 @@ module.exports = {
                     option.setName('sidebar')
                         .setDescription('Also show it on the in-game sidebar until each player has seen it (pinned only)')
                         .setRequired(false))
+                .addBooleanOption(option =>
+                    option.setName('yearly')
+                        .setDescription('Show it again every year on the same dates (needs starts and expires)')
+                        .setRequired(false))
                 .addStringOption(option =>
                     option.setName('min_version')
                         .setDescription('Only clients on this version or newer (e.g. 1.12.2)')
@@ -210,6 +214,7 @@ module.exports = {
             starts: interaction.options.getString('starts'),
             newOnly: interaction.options.getBoolean('new_only'),
             sidebar: interaction.options.getBoolean('sidebar'),
+            yearly: interaction.options.getBoolean('yearly'),
             minVersion: interaction.options.getString('min_version'),
             maxVersion: interaction.options.getString('max_version'),
             updatedBy: this.author(interaction),

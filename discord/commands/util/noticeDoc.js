@@ -177,6 +177,16 @@ function buildNoticeDoc(input) {
     if (title && hasForbiddenTags(title)) return { ok: false, error: 'Title carries a `<click:>`/`<hover:>` tag.' };
     // The proxy reads the sidebar flag off a pinned doc only.
     if (input.sidebar === true && type !== 'pinned') return { ok: false, error: 'sidebar is for pinned notices' };
+    // A yearly notice repeats the month, day and time of both its dates, so the proxy
+    // drops one that carries only half a window.
+    if (input.yearly === true && (!input.starts || !input.expires)) {
+        return { ok: false, error: 'A `yearly` notice needs `starts` and `expires` — those two dates are what repeats.' };
+    }
+    // A broadcast reaches whoever is online in its first ten minutes and is never
+    // replayed, so a yearly one would go out once and stay silent after that.
+    if (input.yearly === true && type === 'broadcast') {
+        return { ok: false, error: 'A `broadcast` cannot recur — it reaches whoever is online once. Use `pinned` or `event`.' };
+    }
 
     let id = input.id ? String(input.id).trim().toLowerCase() : '';
     if (id) {
@@ -241,6 +251,8 @@ function buildNoticeDoc(input) {
     } else if (type === 'event') {
         return { ok: false, error: 'An `event` needs `expires` (when it ends), e.g. `3d`.' };
     }
+    // The proxy then reads that window by month, day and time and ignores the year.
+    if (input.yearly === true) doc.recurrence = 'yearly';
 
     doc.createdAt = now;
     doc.updatedAt = now;
