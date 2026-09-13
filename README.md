@@ -37,7 +37,10 @@ from the pack itself even when the pack ships a new copy:
 - `config/prometheus_exporter-server.toml` (metrics `listen_port` — a shared port means one JVM
   fails to bind)
 
-GTO adds `config/gtocore.yaml` for its Normal/Expert difficulty split. Per-tag additions can go
+GTO adds `config/gtocore.yaml` for its Normal/Expert difficulty split; IL2 adds
+`config/servercore/config.yml` + `config/immersive_optimization.json` (the MineColonies
+citizen-distance exemptions in ServerCore + Immersive Optimization — a pack update re-shipping
+them reverts the 2026-08-01 colonist fix). Per-tag additions can go
 under `multiInstance.protectedFiles` in `config/config.json`.
 
 `/restore` follows the same rule: each instance goes back to its own archive where one exists,
