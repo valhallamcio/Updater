@@ -156,27 +156,30 @@ async function getLinkSession(server) {
     }
 }
 
-/**
- * Creates an op and waits for it to reach a terminal state (completed/failed/expired/cancelled).
- * Prefers the 'biforesting.op.updated' WS event, falls back to polling.
- * @returns {object} the terminal op doc.
- */
-async function runOp(server, op, timeoutMs = 30000) {
-    const { op: created } = await createOp(server, op);
-    const terminal = ['completed', 'failed', 'expired', 'cancelled'];
-    if (terminal.includes(created.state)) return created;
+const TERMINAL_OP_STATES = ['completed', 'failed', 'expired', 'cancelled'];
 
+/**
+ * Waits for an op to reach one of the `until` states (the terminal ones by default).
+ * Prefers the 'biforesting.op.updated' WS event, falls back to polling.
+ * @returns {object} the op doc in that state. Rejects after timeoutMs.
+ */
+function waitOp(opId, timeoutMs = 30000, until = TERMINAL_OP_STATES) {
+    // Through the export, so a test can stand in for the API.
+    const fetchOp = (id) => module.exports.getOp(id);
     return new Promise((resolve, reject) => {
         let pollTimer = null;
         const timeout = setTimeout(() => {
             cleanup();
-            reject(new Error(`op ${created._id} not terminal after ${timeoutMs}ms`));
+            // The op exists and has no answer yet. The id lets the caller cancel or read it.
+            const err = new Error(`op ${opId} not in ${until.join('/')} after ${timeoutMs}ms`);
+            err.opId = opId;
+            reject(err);
         }, timeoutMs);
 
         const onUpdate = (payload) => {
-            if (payload.opId !== created._id || !terminal.includes(payload.state)) return;
+            if (payload.opId !== opId || !until.includes(payload.state)) return;
             cleanup();
-            getOp(created._id).then(resolve, reject);
+            fetchOp(opId).then(resolve, reject);
         };
 
         const cleanup = () => {
@@ -188,14 +191,24 @@ async function runOp(server, op, timeoutMs = 30000) {
         emitter.on('biforesting.op.updated', onUpdate);
         pollTimer = setInterval(async () => {
             try {
-                const doc = await getOp(created._id);
-                if (terminal.includes(doc.state)) {
+                const doc = await fetchOp(opId);
+                if (until.includes(doc.state)) {
                     cleanup();
                     resolve(doc);
                 }
             } catch (err) { /* transient — keep polling until the timeout */ }
         }, 5000);
     });
+}
+
+/**
+ * Creates an op and waits for it to reach a terminal state (completed/failed/expired/cancelled).
+ * @returns {object} the terminal op doc.
+ */
+async function runOp(server, op, timeoutMs = 30000) {
+    const { op: created } = await createOp(server, op);
+    if (TERMINAL_OP_STATES.includes(created.state)) return created;
+    return waitOp(created._id, timeoutMs);
 }
 
 /**
@@ -290,6 +303,8 @@ module.exports = {
     cancelOp,
     resumeOp,
     runOp,
+    waitOp,
+    TERMINAL_OP_STATES,
     getLinkSession,
     getPlayerInventory,
     searchQuests,

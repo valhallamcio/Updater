@@ -8,6 +8,16 @@ const sessionLogger = require("../modules/sessionLogger");
 // execution must not be fired twice by the next tick).
 const inFlight = new Set();
 
+// A `give_item` op that is never dispatched expires after GIVE_EXPIRES_MS (Yggdrasil's
+// minimum), and its sweep runs every 15 s, so the wait covers both. The exec timeout
+// sits past the wait: an op the backend acked and never answered must still read as
+// acked when the wait ends, never as a `failed` that would run the console lines too.
+const GIVE_WAIT_MS = 75000;
+const OP_EXPIRES_MS = 60000;
+const GIVE_EXEC_TIMEOUT_MS = 120000;
+// How long one `run_command` op may take before it is cancelled or read as unknown.
+const COMMAND_WAIT_MS = 15000;
+
 /**
  * The server a stored identifier names: a tag, a display name, or a Pterodactyl
  * serverId. A tag names every instance of a pack; the other two name ONE.
@@ -198,7 +208,7 @@ module.exports = {
                 return;
             }
 
-            const results = await this.runCommands(trigger, server);
+            const results = trigger.give ? await this.runGive(trigger, server) : await this.runCommands(trigger, server);
             // The results are the only record of what the backend said. A job
             // writer (the proxy's cake bank) settles off them, so they go on the
             // document BEFORE the oneTime deactivation flips `active`. A failed
@@ -233,10 +243,12 @@ module.exports = {
      */
     runCommands: async function (trigger, server) {
         const results = [];
+        // By Pterodactyl id when there is one: a tag can name two instances.
+        const serverRef = server.serverId || server.tag;
         let viaOps = false;
         if (this.opsConfig().useOpsApi) {
             try {
-                viaOps = !!(await yggdrasil.getLinkSession(server.tag));
+                viaOps = !!(await yggdrasil.getLinkSession(serverRef));
             } catch (err) {
                 viaOps = false;
             }
@@ -245,20 +257,36 @@ module.exports = {
         for (let i = 0; i < trigger.commands.length; i++) {
             const command = trigger.commands[i];
             if (viaOps) {
+                let doc = null;
+                let exists = false;
                 try {
-                    const doc = await yggdrasil.runOp(server.tag, {
+                    // The expiry matters: with the policy `ops` bit off an op waits as
+                    // `pending` and runs the day the bit turns on, long after the console
+                    // below has run the same line.
+                    doc = await yggdrasil.runOp(serverRef, {
                         type: 'run_command',
-                        params: { command }
-                    }, 15000);
-                    const output = doc.result?.data?.output ?? doc.result?.error ?? '';
-                    sessionLogger.info('PlayerEventScheduler', `Player trigger (op ${doc.state}): '${command}' for ${trigger.playerId} on ${server.tag}`);
-                    results.push({ command, via: 'link', state: doc.state, output: String(output) });
-                    continue; // op failed = command RAN and errored — report only, no ptero re-run
+                        params: { command },
+                        expiresInMs: OP_EXPIRES_MS
+                    }, COMMAND_WAIT_MS);
+                    exists = true;
                 } catch (err) {
-                    // transport failure — this command did NOT run; fall back for it + the rest
-                    sessionLogger.warn('PlayerEventScheduler', `Ops path failed (${err.message}) — falling back to Pterodactyl for the remaining commands`);
-                    viaOps = false;
+                    if (err && err.opId) {
+                        // Queued with no answer yet: cancel it before anything else runs the line.
+                        exists = true;
+                        doc = await this.tryCancel(err.opId) || await this.tryGetOp(err.opId);
+                    } else {
+                        sessionLogger.warn('PlayerEventScheduler', `Ops path failed (${err.message})`);
+                    }
                 }
+                const row = exists ? this.commandRow(command, doc) : null;
+                if (row) {
+                    sessionLogger.info('PlayerEventScheduler', `Player trigger (op ${row.state}): '${command}' for ${trigger.playerId} on ${server.tag}`);
+                    results.push(row);
+                    continue; // op failed = command RAN and errored — report only, no ptero re-run
+                }
+                // The op provably never reached the backend: this line and the rest go by console.
+                sessionLogger.warn('PlayerEventScheduler', `'${command}' never reached ${server.tag} over the link — falling back to Pterodactyl for the remaining commands`);
+                viaOps = false;
             }
             sessionLogger.info('PlayerEventScheduler', `Player trigger: '${command}' executed for ${trigger.playerId} on ${server.tag}`);
             await pterodactyl.sendCommand(server.serverId, command);
@@ -266,6 +294,128 @@ module.exports = {
             results.push({ command, via: 'pterodactyl', state: 'sent', output: '' });
         }
         return results;
+    },
+
+    /**
+     * Hand over a `give` spec (the proxy's cake bank) through one `give_item` op. The op
+     * gives what fits and reports `given`, and the proxy puts the rest back in the bank.
+     *
+     * The console `commands` are the fallback, and they run only when the op provably
+     * never reached the backend. An op that was sent and never answered is an `unknown`
+     * row with no fallback: a second delivery is the one outcome that may never happen.
+     * @returns {object[]} the give row first, then any fallback rows.
+     */
+    runGive: async function (trigger, server) {
+        const give = trigger.give;
+        const cake = trigger.cake || {};
+        const fallback = async (rows = []) => rows.concat(await this.runCommands(trigger, server));
+        if (!this.opsConfig().useOpsApi) return fallback();
+
+        // By Pterodactyl id, never the tag: two instances can share a tag.
+        const serverRef = server.serverId;
+        let linked = false;
+        try {
+            linked = Boolean(serverRef) && Boolean(await yggdrasil.getLinkSession(serverRef));
+        } catch (err) {
+            linked = false;
+        }
+        if (!linked) return fallback();
+
+        // The mod tries the uuid first and the name after it.
+        const target = cake.uuid ? { uuid: cake.uuid, name: trigger.playerId } : { name: trigger.playerId };
+        let created;
+        try {
+            ({ op: created } = await yggdrasil.createOp(serverRef, {
+                type: 'give_item',
+                params: { id: give.item, count: give.count, overflow: 'fail' },
+                target,
+                expiresInMs: OP_EXPIRES_MS,
+                execTimeoutMs: GIVE_EXEC_TIMEOUT_MS,
+                idempotencyKey: `cakebank:${trigger._id}`
+            }));
+        } catch (err) {
+            sessionLogger.warn('PlayerEventScheduler', `give_item for ${trigger.playerId} on ${server.tag} could not be queued (${err.message}), using the console`);
+            return fallback();
+        }
+
+        const opId = created._id;
+        const base = { via: 'link', op: 'give_item', opId, requested: give.count };
+        const stopAt = [...yggdrasil.TERMINAL_OP_STATES, 'waiting_player'];
+        let doc = stopAt.includes(created.state) ? created : null;
+        if (!doc) {
+            try {
+                doc = await yggdrasil.waitOp(opId, GIVE_WAIT_MS, stopAt);
+            } catch (err) {
+                doc = null;
+            }
+        }
+
+        // The mod found no such player and gave nothing. The op waits for a login, so it
+        // is cancelled first. A dispatch between the two reads could still run it. No
+        // console run follows: the player left, a console give cannot reach them either,
+        // and a blind console row would read as delivered. The proxy refunds the lot.
+        if (doc && doc.state === 'waiting_player') {
+            const cancelled = await this.tryCancel(opId);
+            if (cancelled && cancelled.attempts === doc.attempts) {
+                sessionLogger.info('PlayerEventScheduler', `give_item ${opId}: ${trigger.playerId} is not on ${server.tag}, nothing given`);
+                return [{ ...base, state: 'cancelled', given: 0, offline: true }];
+            }
+            doc = cancelled || await this.tryGetOp(opId);
+        } else if (!doc) {
+            doc = await this.tryCancel(opId) || await this.tryGetOp(opId);
+        }
+
+        const state = doc ? doc.state : null;
+        if (state === 'completed') {
+            const data = (doc.result && doc.result.data) || {};
+            if (typeof data.given === 'number' && Number.isFinite(data.given)) {
+                sessionLogger.info('PlayerEventScheduler', `give_item ${opId}: ${data.given} of ${give.count} ${give.item} to ${trigger.playerId} on ${server.tag}`);
+                return [{ ...base, state: 'completed', given: data.given, full: Boolean(data.full) }];
+            }
+        } else if (state === 'failed') {
+            const error = String((doc.result && doc.result.error) || '');
+            sessionLogger.warn('PlayerEventScheduler', `give_item ${opId} failed (${error}), using the console`);
+            return fallback([{ ...base, state: 'failed', given: 0, error }]);
+        } else if ((state === 'expired' || state === 'cancelled') && doc.attempts === 0) {
+            sessionLogger.info('PlayerEventScheduler', `give_item ${opId} ${state} before it was sent, using the console`);
+            return fallback([{ ...base, state, given: 0, dispatched: false }]);
+        }
+
+        sessionLogger.warn('PlayerEventScheduler', `give_item ${opId} for ${trigger.playerId} on ${server.tag} was sent and has no count to read (${state || 'no state'}). No console fallback.`);
+        return [{ ...base, state: 'unknown' }];
+    },
+
+    /**
+     * The result row for a `run_command` op, or null when it provably never ran: it expired
+     * or was cancelled with no dispatch. An op that was sent and has no answer is `unknown`,
+     * and nothing runs the line again.
+     */
+    commandRow: function (command, doc) {
+        const state = doc ? doc.state : null;
+        if ((state === 'expired' || state === 'cancelled') && doc.attempts === 0) return null;
+        if (state === 'completed' || state === 'failed') {
+            const output = doc.result?.data?.output ?? doc.result?.error ?? '';
+            return { command, via: 'link', state, output: String(output) };
+        }
+        return { command, via: 'link', state: 'unknown', output: '', ...(doc && doc._id ? { opId: doc._id } : {}) };
+    },
+
+    /** The cancelled op, or null when the cancel was refused or did not reach Yggdrasil. */
+    tryCancel: async function (opId) {
+        try {
+            return (await yggdrasil.cancelOp(opId)) || null;
+        } catch (err) {
+            return null;
+        }
+    },
+
+    /** The op as Yggdrasil holds it now, or null. */
+    tryGetOp: async function (opId) {
+        try {
+            return (await yggdrasil.getOp(opId)) || null;
+        } catch (err) {
+            return null;
+        }
     },
 
     /**
@@ -282,13 +432,15 @@ module.exports = {
             const channel = await client.channels.fetch(trigger.discord.channelId);
             // field NAME caps at 256 chars — 200 leaves room for the backticks + status suffix
             const fields = results.slice(0, 25).map(r => ({
-                name: `\`${r.command.slice(0, 200)}\` — ${r.via === 'link' ? `🔗 ${r.state}` : '📟 sent (console)'}`,
-                value: r.output ? `\`\`\`\n${r.output.slice(0, 1000)}\n\`\`\`` : '*no output*'
+                name: `\`${String(r.command ?? `${r.op} ${r.opId ?? ''}`).slice(0, 200)}\` — ${r.via === 'link' ? `🔗 ${r.state}` : '📟 sent (console)'}`,
+                value: r.op === 'give_item'
+                    ? (r.state === 'completed' ? `given ${r.given} of ${r.requested}` : (r.error || `requested ${r.requested}`))
+                    : (r.output ? `\`\`\`\n${r.output.slice(0, 1000)}\n\`\`\`` : '*no output*')
             }));
             await channel.send({
                 embeds: [{
                     title: `Player trigger fired: ${trigger.playerId} on ${server.tag}`,
-                    color: results.some(r => r.state === 'failed') ? 0xe67e22 : 0x2ecc71,
+                    color: results.some(r => r.state === 'failed' || r.state === 'unknown') ? 0xe67e22 : 0x2ecc71,
                     fields,
                     timestamp: new Date().toISOString()
                 }]
