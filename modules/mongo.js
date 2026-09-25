@@ -41,12 +41,12 @@ let discordLinkIndexesEnsured = false;
 const ARCHIVE_CUTOFF = new Date('2026-03-01T00:00:00Z');
 
 /**
- * A link request id, back in the form Mongo matches on. The Discord button carries the
- * _id as text, so a 24-character hex string has to become an ObjectId again.
+ * A link request or chat flag id, back in the form Mongo matches on. The Discord button
+ * carries the _id as text, so a 24-character hex string has to become an ObjectId again.
  * @param {*} id Whatever the caller has - an ObjectId, or its string form.
  * @returns {*} The id to filter with.
  */
-function linkRequestId(id) {
+function buttonDocId(id) {
     if (id instanceof ObjectId) return id;
     const text = String(id);
     return text.length === 24 && ObjectId.isValid(text) ? new ObjectId(text) : text;
@@ -1300,7 +1300,7 @@ module.exports = {
         return mongoClient
             .db('bifrost')
             .collection('link_requests')
-            .findOne({ _id: linkRequestId(id) });
+            .findOne({ _id: buttonDocId(id) });
     },
 
     /**
@@ -1318,7 +1318,7 @@ module.exports = {
         return mongoClient
             .db('bifrost')
             .collection('link_requests')
-            .updateOne({ _id: linkRequestId(id) }, {
+            .updateOne({ _id: buttonDocId(id) }, {
                 $set: {
                     postedAt: new Date(),
                     messageId: String(messageId)
@@ -1345,7 +1345,7 @@ module.exports = {
         return mongoClient
             .db('bifrost')
             .collection('link_requests')
-            .updateOne({ _id: linkRequestId(id), status: 'open' }, {
+            .updateOne({ _id: buttonDocId(id), status: 'open' }, {
                 $set: {
                     status: String(status),
                     decidedBy: String(decidedBy),
@@ -1372,6 +1372,145 @@ module.exports = {
             .db('bifrost')
             .collection('players')
             .updateOne({ uuid: String(uuid) }, { $set: { discord_link_exempt: exempt } });
+    },
+
+    // Chat guard flags (bifrost.chat_flags). The proxy writes one open doc per player when
+    // a message trips the guard, and may add context lines or raise `action` while it stays
+    // open. schedulers/chatFlags.js posts the card and owns every field the proxy does not
+    // write. None of these helpers touch the proxy's fields.
+    /**
+     * The open flags that have no card yet, oldest first.
+     * @param {number} limit Max flags per pass.
+     * @returns {Promise<object[]>} bifrost.chat_flags docs.
+     */
+    findChatFlagsToPost: async function (limit = 10) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .find({ status: 'open', posted: { $ne: true } })
+            .sort({ createdAt: 1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * The open flags that already have a card, newest first. The scheduler compares each
+     * one with the card it last drew and edits the card when the proxy changed the doc.
+     * @param {number} limit Max flags per pass.
+     * @returns {Promise<object[]>} bifrost.chat_flags docs.
+     */
+    findPostedChatFlags: async function (limit = 50) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .find({ status: 'open', posted: true })
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * Gets one flag by id.
+     * @param {*} id The flag _id (an ObjectId, or its string form).
+     * @returns {Promise<object|null>} The flag doc or null.
+     */
+    getChatFlag: async function (id) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .findOne({ _id: buttonDocId(id) });
+    },
+
+    /**
+     * Records the card staff decide on, so the flag is never posted twice.
+     * @param {*} id The flag _id.
+     * @param {string} messageId The Discord message the card went to.
+     * @param {string} channelId The channel that message is in.
+     * @param {string} cardHash Fingerprint of the card as posted.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    markChatFlagPosted: async function (id, messageId, channelId, cardHash) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .updateOne({ _id: buttonDocId(id) }, {
+                $set: {
+                    posted: true,
+                    postedAt: new Date(),
+                    messageId: String(messageId),
+                    channelId: String(channelId),
+                    cardHash: String(cardHash)
+                }
+            });
+    },
+
+    /**
+     * Records the card as it was last drawn, while the flag is still open.
+     * @param {*} id The flag _id.
+     * @param {string} cardHash Fingerprint of the card after the edit.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    setChatFlagCardHash: async function (id, cardHash) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .updateOne({ _id: buttonDocId(id), status: 'open' }, { $set: { cardHash: String(cardHash) } });
+    },
+
+    /**
+     * Moves a flag out of `open`, and only while it is still open with the action the
+     * clicker saw. A second click matches nothing. So does a click on a card the proxy
+     * raised from review to muted after it was drawn.
+     * @param {*} id The flag _id.
+     * @param {string} action The `action` the card showed ('muted' or 'review').
+     * @param {string} status 'banned', 'unmuted', 'kept', 'muted' or 'dismissed'.
+     * @param {string} decidedBy Discord id of whoever clicked.
+     * @param {string} decidedName Their username.
+     * @returns {Promise<object>} The updateOne result. `matchedCount` 0 means the caller
+     *     must stop there.
+     */
+    claimChatFlag: async function (id, action, status, decidedBy, decidedName) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .updateOne({ _id: buttonDocId(id), status: 'open', action: String(action) }, {
+                $set: {
+                    status: String(status),
+                    decidedBy: String(decidedBy),
+                    decidedName: String(decidedName),
+                    decidedAt: new Date()
+                }
+            });
     },
 
     // Role sync (schedulers/roleSync.js): the linked accounts, and Bifrost's permission
