@@ -46,16 +46,21 @@ module.exports = {
             await command.execute(interaction);
         } catch (error) {
             sessionLogger.error('InteractionHandler', 'Error executing command:', error);
-            if (interaction.replied || interaction.deferred) {
-                await interaction.followUp({
-                    content: 'There was an error while executing this command!',
-                    ephemeral: true
-                });
-            } else {
-                await interaction.reply({
-                    content: 'There was an error while executing this command!',
-                    ephemeral: true
-                });
+            // The error notice can fail too (an expired interaction), and an uncaught throw here stops the bot.
+            try {
+                if (interaction.replied || interaction.deferred) {
+                    await interaction.followUp({
+                        content: 'There was an error while executing this command!',
+                        ephemeral: true
+                    });
+                } else {
+                    await interaction.reply({
+                        content: 'There was an error while executing this command!',
+                        ephemeral: true
+                    });
+                }
+            } catch (replyError) {
+                sessionLogger.error('InteractionHandler', 'Could not send the error notice:', replyError.message);
             }
         }
 	},

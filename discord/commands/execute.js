@@ -28,6 +28,42 @@ const {
 const pterodactylHostName = require("../../config/config.json").pterodactyl.pterodactylHostName.replace(/\/$/, "");
 require('dotenv').config();
 
+// Same limits as the player-event scheduler's run_command path.
+const OP_EXPIRES_MS = 60000;
+const COMMAND_WAIT_MS = 15000;
+
+/**
+ * Run one command over the link.
+ * Returns null when the op provably never reached the backend, so the console may run it.
+ * Otherwise returns the text to show. The command ran, or it may still run,
+ * and the console must not run it a second time.
+ */
+async function runViaLink(serverId, command) {
+    let doc = null;
+    let opId = null;
+    try {
+        // The expiry matters: a queued op must not run later, after the console has run the same line.
+        doc = await yggdrasil.runOp(serverId, {
+            type: 'run_command',
+            params: { command },
+            expiresInMs: OP_EXPIRES_MS
+        }, COMMAND_WAIT_MS);
+    } catch (err) {
+        if (!err || !err.opId) throw err; // the op was never created: the caller uses the console
+        opId = err.opId;
+        // Queued with no answer yet: cancel it before anything else runs the line.
+        doc = await yggdrasil.cancelOp(opId).catch(() => null) || await yggdrasil.getOp(opId).catch(() => null);
+    }
+    const state = doc ? doc.state : null;
+    if ((state === 'expired' || state === 'cancelled') && doc.attempts === 0) return null;
+    if (state === 'completed') {
+        const output = doc.result && doc.result.data ? doc.result.data.output : '';
+        return typeof output === 'string' && output !== '' ? output : '(no output)';
+    }
+    if (state === 'failed') return `Command failed: ${(doc.result && doc.result.error) || 'unknown error'}`;
+    return `No answer from the server yet (op ${(doc && doc._id) || opId}). It may still run, so check it before you send it again.`;
+}
+
 // Cache for server list with a 5-minute TTL
 let serverListCache = {
     data: null,
@@ -56,6 +92,7 @@ async function getCachedServers() {
 }
 
 module.exports = {
+    runViaLink,
     data: new SlashCommandBuilder()
         .setName('execute')
         .setDescription('Execute a command on the server!')
@@ -154,15 +191,11 @@ module.exports = {
                     try {
                         const session = await yggdrasil.getLinkSession(server.serverId);
                         if (session) {
-                            const doc = await yggdrasil.runOp(server.serverId, {
-                                type: 'run_command',
-                                params: { command }
-                            }, 15000);
-                            if (doc.state === 'completed' && doc.result && typeof doc.result.output === 'string') {
-                                response = doc.result.output;
+                            response = await runViaLink(server.serverId, command);
+                            if (response !== null) {
                                 reply = `Sending \`${command}\` to **${server.name}** via link... 🔗`;
                             } else {
-                                sessionLogger.warn('Execute', `Link op ${doc.state} on ${server.name}, falling back to console`);
+                                sessionLogger.warn('Execute', `Link op never reached ${server.name}, falling back to console`);
                             }
                         }
                     } catch (linkErr) {

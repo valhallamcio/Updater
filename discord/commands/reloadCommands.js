@@ -27,8 +27,10 @@ module.exports = {
             deployCommands
         } = require('../deploy');
 
+        // The deploy takes longer than Discord's 3 s reply window.
+        await interaction.deferReply();
         await loadCommandFiles(interaction.client);
         await deployCommands(interaction.client.user.id);
-        await interaction.reply('Reloaded all commands!');
+        await interaction.editReply('Reloaded all commands!');
     },
 };
