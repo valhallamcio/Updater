@@ -1117,6 +1117,73 @@ module.exports = {
             .insertOne(doc);
     },
 
+    // Player reports (bifrost.reports). The proxy files them from in-game /report, and staff
+    // close them in game with /reports close. `/reply ... report:<id>` closes one with the
+    // same fields. These go through getBifrostDb, so a test can hand them a fake database.
+    /**
+     * One player's reports, newest first, id and status only. A typed report id is matched
+     * against these, the way the proxy's `/report list <id>` does it.
+     * @param {string} uuid Reporter uuid.
+     * @param {number} limit Max reports.
+     * @returns {Promise<object[]>} `{_id, status}` docs.
+     */
+    findReportIdsOf: async function (uuid, limit = 500) {
+        const db = await module.exports.getBifrostDb();
+        return db
+            .collection('reports')
+            .find({ 'reporter.uuid': String(uuid) }, { projection: { _id: 1, status: 1 } })
+            .sort({ at: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * The newest reports of every player, id and reporter only. /reply reads these only to
+     * tell staff that the id they typed is another player's report.
+     * @param {number} limit Max reports.
+     * @returns {Promise<object[]>} `{_id, reporter}` docs.
+     */
+    findRecentReportIds: async function (limit = 500) {
+        const db = await module.exports.getBifrostDb();
+        return db
+            .collection('reports')
+            .find({}, { projection: { _id: 1, reporter: 1 } })
+            .sort({ at: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * One player's open reports, newest first, for the /reply autocomplete.
+     * @param {string} uuid Reporter uuid.
+     * @param {number} limit Max reports (Discord caps autocomplete at 25).
+     * @returns {Promise<object[]>} `{_id, text}` docs.
+     */
+    findOpenReportsOf: async function (uuid, limit = 25) {
+        const db = await module.exports.getBifrostDb();
+        return db
+            .collection('reports')
+            .find({ 'reporter.uuid': String(uuid), status: 'open' }, { projection: { _id: 1, text: 1 } })
+            .sort({ at: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * Closes one report of one player, and only while it is still open. The open filter is
+     * the proxy's own: two staff closing the same report at once never write twice.
+     * @param {*} id The report _id, as read from the collection.
+     * @param {string} reporterUuid The player the report must belong to.
+     * @param {object} fields The `$set` (build it with discord/commands/util/reportClose.js).
+     * @returns {Promise<object>} The updateOne result - `matchedCount` 0 means it was closed already.
+     */
+    closeReport: async function (id, reporterUuid, fields) {
+        const db = await module.exports.getBifrostDb();
+        return db
+            .collection('reports')
+            .updateOne({ _id: id, 'reporter.uuid': String(reporterUuid), status: 'open' }, { $set: fields });
+    },
+
     // Discord <-> Minecraft linking (bifrost.discord_link_codes, bifrost.players,
     // bifrost.discord_link_audit). The proxy mints the code in game and watches
     // bifrost.players, so the confirmation card follows the write here in about a second.

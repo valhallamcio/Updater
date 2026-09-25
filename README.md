@@ -108,7 +108,7 @@ falling back to a legacy shared archive with the per-server snapshot laid over t
 | `/cake [amount]` | Drop cakes to online players |
 | `/banall <players> <reason>` | Ban a list of players across servers |
 | `/notice` | Author the in-game notices players see (create, broadcast, list, expire, enable, translate, show) |
-| `/reply <player> <text>` | Send a player an in-game message from staff |
+| `/reply <player> <text> [report]` | Send a player an in-game message from staff. With `report:<id>` it also closes that report of theirs |
 | `/link <code>` | Link your Discord to your Minecraft account (code comes from `/link` in game) |
 | `/unlink [player]` | Unlink a Minecraft account from your Discord |
 | `/linked` | List the Minecraft accounts linked to your Discord |
@@ -142,6 +142,14 @@ both with change streams, so a write reaches players in about a second. Nothing 
 `from: { uuid: null, name }`, `kind: 'admin'`, `body` (max 500), `sentAt`, `readAt: null`,
 `expiresAt` (90 days), `meta: { via: 'discord', discordId }`. The proxy delivers an unread doc
 inline when the player is online, otherwise it waits in their in-game inbox (`/mail`).
+
+**`bifrost.reports`** (filed by the proxy's in-game `/report`): `/reply ... report:<id>` sends
+the mail first. Then it closes the report with the fields the proxy's `/reports close <id> <note>`
+writes: `status: 'closed'`, `closedBy` (the Discord username, same as the mail sender),
+`closedAt`, `note` (the reply text, cut at 200 chars). The filter is `_id`, `reporter.uuid` and
+`status: 'open'`. The id is the 6-character tail from the report embed, or the whole ObjectId.
+Only one report of that player can match. For any other id the report stays open and the reply
+says why. The player reads the note under the report in `/report list`.
 
 A **`tip`** doc overrides the text of ONE guide card, and the guide looks that card up by its
 fixed id — so `/notice create type:tip` **requires** an `id`, and it must start with `tip.`.
