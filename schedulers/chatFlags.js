@@ -16,6 +16,9 @@
  * clicker matches nothing, is told who got there first, and sends nothing. Bifrost's
  * console does not strip a leading slash, so the commands go without one.
  *
+ * A staff /unmute in game or on the Bifrost console closes the open muted flag on the proxy
+ * side, with `decidedIn: 'game'`. The next pass takes the buttons off that card once.
+ *
  * No channelId means one warning at startup and nothing else.
  */
 
@@ -194,8 +197,8 @@ module.exports = {
      * Never throws.
      * @param {object} config Scheduler config.
      * @param {object} [deps] `{channel}` - only tests pass one.
-     * @returns {Promise<object>} `{posted, edited, read}`, or `{posted: 0, edited: 0, reason}`
-     *     when it did nothing.
+     * @returns {Promise<object>} `{posted, edited, closed, read}`, or
+     *     `{posted: 0, edited: 0, reason}` when it did nothing.
      */
     postOpenFlags: async function (config, deps = {}) {
         if (posting) return { posted: 0, edited: 0, reason: 'in-flight' };
@@ -221,11 +224,12 @@ module.exports = {
             }
 
             const edited = await this.syncPostedFlags(channel);
+            const closed = await this.closeGameDecided(channel);
 
             if (posted > 0) {
                 sessionLogger.info(LOG, `Posted ${posted} chat flag${posted === 1 ? '' : 's'} for staff to decide`);
             }
-            return { posted: posted, edited: edited, read: (flags || []).length };
+            return { posted: posted, edited: edited, closed: closed, read: (flags || []).length };
         } finally {
             posting = false;
         }
@@ -275,6 +279,47 @@ module.exports = {
             }
         }
         return edited;
+    },
+
+    /**
+     * Takes the buttons off each card whose flag the proxy closed in game, then marks the
+     * flag so the card is edited only once. Never throws.
+     * @param {object} channel The configured staff channel.
+     * @returns {Promise<number>} How many cards it closed.
+     */
+    closeGameDecided: async function (channel) {
+        let flags;
+        try {
+            flags = await mongo.findChatFlagsClosedInGame(SYNC_BATCH);
+        } catch (error) {
+            sessionLogger.error(LOG, 'Could not read the chat flags closed in game:', error.message);
+            return 0;
+        }
+        let closed = 0;
+        for (const flag of flags || []) {
+            try {
+                const home = flag.channelId && String(flag.channelId) !== String(channel.id)
+                    ? await this.getChannel(flag.channelId)
+                    : channel;
+                if (!home) continue;
+                const message = await home.messages.fetch(String(flag.messageId));
+                await message.edit({
+                    embeds: [this.buildEmbed(flag, {
+                        status: flag.status,
+                        byName: flag.decidedName,
+                        at: flag.decidedAt,
+                        where: 'game'
+                    })],
+                    components: [],
+                    allowedMentions: NO_MENTIONS
+                });
+                await mongo.markChatFlagCardClosed(flag._id);
+                closed++;
+            } catch (error) {
+                sessionLogger.error(LOG, `Could not close the card for chat flag ${flag._id}:`, error.message);
+            }
+        }
+        return closed;
     },
 
     /**
@@ -472,7 +517,8 @@ module.exports = {
     /**
      * Builds the flag card.
      * @param {object} flag A bifrost.chat_flags doc.
-     * @param {object} [decision] `{status, byName, at, command, commandError}` once decided.
+     * @param {object} [decision] `{status, byName, at, where, command, commandError}` once
+     *     decided. `where` is 'game' when the proxy closed the flag.
      * @returns {EmbedBuilder} The embed.
      */
     buildEmbed: function (flag, decision) {
@@ -498,7 +544,8 @@ module.exports = {
             embed.addFields({
                 name: 'Decision',
                 value: `${DECIDED[decision.status] || cleanText(decision.status)} by `
-                    + `${cleanText(decision.byName || 'unknown')}${when ? `, ${when}` : ''}`
+                    + `${cleanText(decision.byName || 'unknown')}${decision.where === 'game' ? ' in game' : ''}`
+                    + `${when ? `, ${when}` : ''}`
             });
             if (decision.commandError) {
                 embed.addFields({

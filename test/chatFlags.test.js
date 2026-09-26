@@ -14,6 +14,8 @@
  *    the flag stays decided,
  *  - player text cannot format the card or mention anybody,
  *  - the card follows the proxy when it adds context or raises review to muted,
+ *  - a card the proxy closed on an in-game /unmute loses its buttons once, and a card
+ *    closed by a button is left alone,
  *  - somebody without the staff role is refused before any of it.
  *
  * Every module is faked at its own surface, the way test/linkRequests.test.js does it.
@@ -114,6 +116,14 @@ beforeEach(() => {
         if (!doc || doc.status !== 'open' || doc.action !== action) return { matchedCount: 0, modifiedCount: 0 };
         Object.assign(doc, { status, decidedBy: String(decidedBy), decidedName: String(decidedName), decidedAt: new Date() });
         writes.push('claim');
+        return { matchedCount: 1, modifiedCount: 1 };
+    };
+    mongo.findChatFlagsClosedInGame = async () => Object.values(flags)
+        .filter(f => f.posted === true && f.decidedIn === 'game' && f.cardClosed !== true)
+        .map(copy);
+    mongo.markChatFlagCardClosed = async (id) => {
+        flags[id].cardClosed = true;
+        writes.push('cardClosed');
         return { matchedCount: 1, modifiedCount: 1 };
     };
     pterodactyl.sendCommand = async (serverId, command) => {
@@ -436,6 +446,70 @@ test('a click that lands while the sync pass redraws the card leaves the card cl
     const last = card.edits[card.edits.length - 1];
     assert.deepStrictEqual(last.components, [], 'the redraw must not put the buttons back');
     assert.match(fields(last.embeds[0].toJSON()).get('Decision'), /^Banned by moda/);
+});
+
+// What Bifrost's chatguard writes on an in-game /unmute: only while the flag is still open.
+function closeInGame(id, byName, at) {
+    Object.assign(flags[id], { status: 'unmuted', decidedName: byName, decidedAt: at, decidedIn: 'game' });
+}
+
+test('a card the proxy closed in game loses its buttons once, with "in game" on the Decision', async () => {
+    delete flags['flag-2'];
+    const ch = channel();
+    await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    const card = messages.get('msg-1');
+
+    closeInGame('flag-1', 'Alp', new Date('2026-09-25T10:00:26Z'));
+    const result = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+
+    assert.strictEqual(result.closed, 1);
+    assert.strictEqual(result.edited, 0, 'the open-card sync no longer sees it');
+    assert.strictEqual(card.edits.length, 1);
+    const edit = card.edits[0];
+    const embed = edit.embeds[0].toJSON();
+    assert.deepStrictEqual(edit.components, [], 'no Ban, Unmute or Keep muted left to click');
+    assert.strictEqual(embed.color, GREY);
+    assert.strictEqual(fields(embed).get('Decision'), 'Unmuted by Alp in game, <t:1790330426:f>');
+    assert.deepStrictEqual(edit.allowedMentions, { parse: [] });
+    assert.strictEqual(flags['flag-1'].cardClosed, true);
+
+    const again = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    assert.strictEqual(again.closed, 0);
+    assert.strictEqual(card.edits.length, 1, 'edited once, never again');
+    assert.strictEqual(sent.length, 1);
+});
+
+test('a card closed by a button is not in the in-game pass', async () => {
+    delete flags['flag-2'];
+    const ch = channel();
+    await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    const card = messages.get('msg-1');
+
+    // The Unmute button claims first, then sends "unmute Griefer". Bifrost's close then
+    // matches nothing, because the flag is no longer open.
+    await chatFlags.handleButton(click('unmute', 'flag-1', { message: card }), CONFIG);
+    const result = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+
+    assert.strictEqual(result.closed, 0);
+    assert.strictEqual(card.edits.length, 1, 'only the click edited the card');
+    assert.match(fields(card.edits[0].embeds[0].toJSON()).get('Decision'), /^Unmuted by mod, <t:\d+:f>$/);
+    assert.ok(!writes.includes('cardClosed'));
+    assert.strictEqual(flags['flag-1'].cardClosed, undefined);
+});
+
+test('a card the in-game pass cannot reach is logged, left unmarked, and stops nothing', async () => {
+    delete flags['flag-2'];
+    const ch = channel();
+    await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    messages.delete('msg-1');
+
+    closeInGame('flag-1', 'Alp', new Date('2026-09-25T10:00:26Z'));
+    const result = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+
+    assert.strictEqual(result.closed, 0);
+    assert.strictEqual(flags['flag-1'].cardClosed, undefined, 'the next pass tries again');
+    assert.ok(logs.some(l => l.level === 'error' && l.text.includes('flag-1') && l.text.includes('Unknown Message')),
+        JSON.stringify(logs));
 });
 
 test('a name that could break the console line is refused before the claim', async () => {

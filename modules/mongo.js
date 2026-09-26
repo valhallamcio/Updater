@@ -1444,7 +1444,8 @@ module.exports = {
     // Chat guard flags (bifrost.chat_flags). The proxy writes one open doc per player when
     // a message trips the guard, and may add context lines or raise `action` while it stays
     // open. schedulers/chatFlags.js posts the card and owns every field the proxy does not
-    // write. None of these helpers touch the proxy's fields.
+    // write. None of these helpers touch the proxy's fields. A staff /unmute in game or on
+    // the Bifrost console has the proxy close the open muted flag, with `decidedIn: 'game'`.
     /**
      * The open flags that have no card yet, oldest first.
      * @param {number} limit Max flags per pass.
@@ -1578,6 +1579,45 @@ module.exports = {
                     decidedAt: new Date()
                 }
             });
+    },
+
+    /**
+     * The posted flags the proxy closed in game whose card still has its buttons, oldest
+     * decision first.
+     * @param {number} limit Max flags per pass.
+     * @returns {Promise<object[]>} bifrost.chat_flags docs.
+     */
+    findChatFlagsClosedInGame: async function (limit = 50) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .find({ posted: true, decidedIn: 'game', cardClosed: { $ne: true } })
+            .sort({ decidedAt: 1 })
+            .limit(limit)
+            .toArray();
+    },
+
+    /**
+     * Records that the card of a flag closed in game shows the decision, so it is not
+     * edited again.
+     * @param {*} id The flag _id.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    markChatFlagCardClosed: async function (id) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('chat_flags')
+            .updateOne({ _id: buttonDocId(id) }, { $set: { cardClosed: true } });
     },
 
     // Role sync (schedulers/roleSync.js): the linked accounts, and Bifrost's permission
