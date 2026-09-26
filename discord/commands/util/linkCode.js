@@ -14,6 +14,11 @@
  */
 
 const CODE_LENGTH = 6;
+// The proxy's CODE_TTL_MS, in the words a reply uses.
+const CODE_TTL_MINUTES = 10;
+// A failure row keeps this much of the code. Enough to match a support question to a
+// card, never enough to redeem it.
+const FAILURE_CODE_PREFIX = 2;
 const ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const CODE_RE = /^[0-9A-HJKMNP-TV-Z]{6}$/;
 
@@ -71,4 +76,30 @@ function buildLinkAudit(input) {
     return doc;
 }
 
-module.exports = { CODE_LENGTH, ALPHABET, normalizeCode, isValidCode, buildLinkFields, buildLinkAudit };
+/**
+ * Builds one row for bifrost.discord_link_failures: who tried, why it failed, and the
+ * first characters of what they typed. The full code never lands in the row.
+ * @param {object} input `{discordId, reason, code, via, now}`.
+ * @returns {object} The failure doc.
+ */
+function buildLinkFailure(input) {
+    const code = normalizeCode(input.code);
+    return {
+        discordId: String(input.discordId),
+        reason: String(input.reason),
+        codePrefix: code.slice(0, FAILURE_CODE_PREFIX),
+        via: input.via == null ? null : String(input.via),
+        at: input.now instanceof Date ? input.now : new Date()
+    };
+}
+
+module.exports = {
+    CODE_LENGTH,
+    CODE_TTL_MINUTES,
+    ALPHABET,
+    normalizeCode,
+    isValidCode,
+    buildLinkFields,
+    buildLinkAudit,
+    buildLinkFailure
+};

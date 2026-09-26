@@ -12,10 +12,22 @@
 
 const { Events } = require('discord.js');
 const sessionLogger = require('../../modules/sessionLogger');
+const linkFlow = require('../commands/util/linkFlow');
 
 module.exports = {
 	name: Events.InteractionCreate,
 	async execute(interaction) {
+
+        // The link buttons and the code box live here, not in the #link panel scheduler:
+        // /link with no code and the /wrapped reply need them with the panel switched off.
+        if (linkFlow.owns(interaction)) {
+            try {
+                await linkFlow.handleInteraction(interaction);
+            } catch (error) {
+                sessionLogger.error('InteractionHandler', 'A link button or the code box failed:', error.message);
+            }
+            return;
+        }
 
         if (interaction.isAutocomplete()) {
             const command = interaction.client.commands.get(interaction.commandName);

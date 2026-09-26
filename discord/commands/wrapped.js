@@ -16,13 +16,11 @@ const mongo = require('../../modules/mongo');
 const { mongoBase64ToUuid, normalizeUuid } = require('../../modules/uuidUtils');
 const { aggregatePlayerStats } = require('../../modules/wrappedStatsAggregator');
 const { generateWrappedEmbeds } = require('../../modules/wrappedGenerator');
+const linkFlow = require('./util/linkFlow');
 
 // Rate limiting
 const cooldowns = new Map();
 const COOLDOWN_MS = 60 * 1000; // 1 minute cooldown
-
-// Verification channel ID
-const VERIFY_CHANNEL_ID = '1103357751863812207';
 
 /**
  * Extracts UUID from MongoDB player document.
@@ -46,6 +44,39 @@ function extractPlayerUuid(player) {
     }
     
     return null;
+}
+
+/**
+ * The account a Discord's Wrapped is about. The link lives on bifrost.players, where
+ * the proxy's discord-link and Fenrir's /link write it. With several accounts the first
+ * one linked wins, which is the main account for nearly everyone.
+ * @param {string} discordId Discord snowflake.
+ * @returns {Promise<object|null>} `{uuid, username}` or null when nothing is linked.
+ */
+async function findLinkedAccount(discordId) {
+    const linked = await mongo.findBifrostPlayersByDiscordId(discordId);
+    if (!linked || linked.length === 0) return null;
+    const when = (p) => (p.discord_linked_at ? new Date(p.discord_linked_at).getTime() : Infinity);
+    return [...linked].sort((a, b) => when(a) - when(b))[0];
+}
+
+/**
+ * The reply for a Discord with no linked account: where to link, and the button.
+ * @returns {object} `{embeds, components}` for editReply.
+ */
+function notLinkedReply() {
+    const embed = new EmbedBuilder()
+        .setColor(0x9B59B6)
+        .setTitle('Discord Account Not Linked')
+        .setDescription(
+            `Your Discord account is not linked to a Minecraft account on ValhallaMC.\n\n` +
+            `**To link your account:**\n` +
+            `1. Join the server and type \`/link\` in game. You get a short code.\n` +
+            `2. Open <#${linkFlow.linkChannelId()}> and press **Link account**, or use the button below.\n` +
+            `3. Type the code.\n\n` +
+            `Once linked, come back and use \`/wrapped\` again!`
+        );
+    return { embeds: [embed], components: [linkFlow.buildOpenRow()] };
 }
 
 module.exports = {
@@ -105,27 +136,11 @@ module.exports = {
                 username = player.username || targetUsername;
                 
             } else {
-                // Normal mode - check if user has linked Discord account
-                console.log(`[Wrapped] Looking up Discord ID: ${userId}`);
-                player = await mongo.getPlayerByDiscordId(userId);
-                console.log(`[Wrapped] Player lookup result:`, player ? `Found: ${player.username}` : 'Not found');
+                // Normal mode - the Discord link the proxy and /link keep on bifrost.players
+                player = await findLinkedAccount(userId);
                 
                 if (!player) {
-                    // No linked account found
-                    const verifyEmbed = new EmbedBuilder()
-                        .setColor(0x9B59B6)
-                        .setTitle('Discord Account Not Linked')
-                        .setDescription(
-                            `Your Discord account is not linked to a Minecraft account on ValhallaMC.\n\n` +
-                            `**To link your account:**\n` +
-                            `1. Go to <#${VERIFY_CHANNEL_ID}>\n` +
-                            `2. Click the verification button\n` +
-                            `3. Follow the instructions to link your Minecraft account\n\n` +
-                            `Once linked, come back and use \`/wrapped\` again!\n\n` +
-                            `*Wrapped results are personal and sent via DM*`
-                        );
-                    
-                    return interaction.editReply({ embeds: [verifyEmbed] });
+                    return interaction.editReply(notLinkedReply());
                 }
                 
                 uuid = extractPlayerUuid(player);
@@ -230,5 +245,7 @@ module.exports = {
                 content: `An error occurred while generating your Wrapped. Please try again later.\n*Error: ${error.message}*`,
             });
         }
-    }
+    },
+
+    _internals: { findLinkedAccount, notLinkedReply }
 };

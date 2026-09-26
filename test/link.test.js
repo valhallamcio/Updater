@@ -12,6 +12,10 @@
  * The two races are covered here because neither shows up in a single-caller test: the
  * code is claimed atomically (two Discords, one code, one link) and the player write is
  * filtered on the account still being free (an in-game link landing mid-flow wins).
+ *
+ * Every refusal has its own reply (util/linkFlow.js) and its own failure row, and the
+ * row carries two characters of the code, never the code. `/link` with no code, the
+ * panel's [Link account] and the reply's [Try again] all open the same code box.
  */
 
 const { test, beforeEach } = require('node:test');
@@ -21,11 +25,15 @@ const verifiedRole = require('../discord/commands/util/verifiedRole');
 const link = require('../discord/commands/link');
 const unlink = require('../discord/commands/unlink');
 const linked = require('../discord/commands/linked');
+const linkFlow = require('../discord/commands/util/linkFlow');
+const wrapped = require('../discord/commands/wrapped');
 const mongo = require('../modules/mongo');
 // captured before beforeEach stubs it out - the index test drives the real one
 const ensureDiscordLinkIndexes = mongo.ensureDiscordLinkIndexes;
 
 const NOW = new Date('2026-08-17T12:00:00Z');
+const LATER = new Date(Date.now() + 10 * 60 * 1000);
+const EARLIER = new Date(Date.now() - 60 * 1000);
 
 let codeDocs;     // code -> doc in bifrost.discord_link_codes
 let players;      // uuid -> bifrost.players doc
@@ -34,13 +42,15 @@ let sets;         // setBifrostDiscordLink calls
 let unsets;       // unsetBifrostDiscordLink calls
 let claims;       // claimLinkCode calls
 let audits;       // insertLinkAudit docs
+let failures;     // insertLinkFailure docs
+let legacyReads;  // getPlayerByDiscordId calls (the old valhallamc.players lookup)
 let roleCalls;    // {action, userId, roleId} from the fake guild
 let roleFetchThrows;
 let configuredRole;
 
 beforeEach(() => {
     codeDocs = {
-        ABC234: { code: 'ABC234', uuid: 'uuid-alp', username: 'Alp', usedAt: null }
+        ABC234: { code: 'ABC234', uuid: 'uuid-alp', username: 'Alp', usedAt: null, expiresAt: LATER }
     };
     players = {
         'uuid-alp': { uuid: 'uuid-alp', username: 'Alp' },
@@ -51,6 +61,8 @@ beforeEach(() => {
     unsets = [];
     claims = [];
     audits = [];
+    failures = [];
+    legacyReads = [];
     roleCalls = [];
     roleFetchThrows = false;
     configuredRole = null;
@@ -59,7 +71,8 @@ beforeEach(() => {
     // this fake must not await before it mutates either
     mongo.claimLinkCode = async (code, discordId) => {
         const doc = codeDocs[code];
-        if (!doc || doc.usedAt) return null;
+        // the real filter: {code, usedAt: null, expiresAt: {$gt: now}}
+        if (!doc || doc.usedAt || !(doc.expiresAt > new Date())) return null;
         doc.usedAt = NOW;
         doc.usedBy = String(discordId);
         claims.push({ code, discordId });
@@ -89,6 +102,10 @@ beforeEach(() => {
         return { modifiedCount: 1 };
     };
     mongo.insertLinkAudit = async (doc) => { audits.push(doc); return { insertedId: 'a' }; };
+    // the read-back after a failed claim sees the doc whatever its state
+    mongo.findLinkCode = async (code) => (codeDocs[code] ? { ...codeDocs[code] } : null);
+    mongo.insertLinkFailure = async (doc) => { failures.push(doc); return { insertedId: 'f' }; };
+    mongo.getPlayerByDiscordId = async (discordId) => { legacyReads.push(discordId); return null; };
     mongo.ensureDiscordLinkIndexes = async () => {};
 
     verifiedRole.getVerifiedRoleId = () => configuredRole;
@@ -96,10 +113,25 @@ beforeEach(() => {
 
 function interaction(options, opts = {}) {
     const replies = [];
+    const modals = [];
     const user = { id: opts.userId || '4242', username: opts.username || 'alpdiscord' };
+    let deferred = false;
     return {
         replies,
+        modals,
+        get deferred() { return deferred; },
         user: user,
+        customId: opts.customId,
+        isButton: () => opts.kind === 'button',
+        isModalSubmit: () => opts.kind === 'modal',
+        isAutocomplete: () => opts.kind === 'autocomplete',
+        isChatInputCommand: () => !opts.kind,
+        fields: { getTextInputValue: (name) => (name === 'code' ? options.modalCode : '') },
+        showModal: async (modal) => {
+            // Discord refuses a modal after a deferral: it has to be the first answer.
+            if (deferred) throw new Error('a modal must be the first answer');
+            modals.push(modal);
+        },
         memberPermissions: { has: () => Boolean(opts.staff) },
         guild: {
             members: {
@@ -119,10 +151,20 @@ function interaction(options, opts = {}) {
             getString: (name) => (typeof options[name] === 'string' ? options[name] : null),
             getFocused: () => ({ name: 'player', value: options.focused || '' })
         },
-        deferReply: async () => {},
+        deferReply: async () => { deferred = true; },
         editReply: async (payload) => { replies.push(payload); return payload; },
         respond: async (choices) => { replies.push(choices); return choices; }
     };
+}
+
+/** A reply's text, whether it went out as a string or as `{content, components}`. */
+function text(reply) {
+    return typeof reply === 'string' ? reply : reply.content;
+}
+
+/** The custom ids on a reply's buttons. */
+function buttonIds(reply) {
+    return (reply.components || []).flatMap(row => row.toJSON().components.map(c => c.custom_id));
 }
 
 test('link code normalisation: case, spaces, dashes, underscores and the O/I/L lookalikes', () => {
@@ -203,10 +245,10 @@ test('/link writes discord_id as a STRING, burns the code and audits it', async 
     assert.strictEqual(audits[0].by, 'discord');
     assert.strictEqual(audits[0].discordName, 'alpdiscord');
     assert.ok(audits[0].at instanceof Date);
-    assert.match(it.replies[0], /Linked to \*\*Alp\*\*/);
+    assert.match(text(it.replies[0]), /Linked to \*\*Alp\*\*/);
 });
 
-test('/link refuses a malformed code before it reaches Mongo', async () => {
+test('/link: a typo gets its own reply, [Try again], and a failure row - never Mongo', async () => {
     let looked = 0;
     mongo.claimLinkCode = async () => { looked++; return null; };
     const it = interaction({ code: 'nope' });
@@ -214,22 +256,124 @@ test('/link refuses a malformed code before it reaches Mongo', async () => {
 
     assert.strictEqual(looked, 0);
     assert.strictEqual(sets.length, 0);
-    assert.match(it.replies[0], /not valid or has expired/);
+    assert.match(text(it.replies[0]), /`nope` is not a link code/);
+    assert.match(text(it.replies[0]), /6 letters and digits/);
+    assert.deepStrictEqual(buttonIds(it.replies[0]), ['link:open'], '[Try again] opens the code box');
+    assert.strictEqual(failures.length, 1);
+    assert.strictEqual(failures[0].reason, 'format');
+    assert.strictEqual(failures[0].via, 'command');
+    assert.strictEqual(failures[0].discordId, '4242');
+    assert.ok(failures[0].at instanceof Date);
 });
 
-test('/link refuses an expired or already-used code (the claim filters both)', async () => {
-    codeDocs = {}; // the claim only matches usedAt:null and expiresAt in the future
+test('/link: a code nobody minted is "no code exists"', async () => {
+    const it = interaction({ code: 'ZZZ999' });
+    await link.execute(it);
+
+    assert.strictEqual(sets.length, 0);
+    assert.strictEqual(claims.length, 0);
+    assert.match(text(it.replies[0]), /No code `ZZZ999` exists/);
+    assert.match(text(it.replies[0]), /`\/link` in game/);
+    assert.deepStrictEqual(failures.map(f => f.reason), ['unknown']);
+});
+
+test('/link: an expired code says so and sends them to /link in game', async () => {
+    codeDocs.ABC234.expiresAt = EARLIER; // the claim filter skips it, the read-back still sees it
     const it = interaction({ code: 'ABC234' });
     await link.execute(it);
 
     assert.strictEqual(sets.length, 0);
     assert.strictEqual(claims.length, 0);
     assert.strictEqual(audits.length, 0);
-    assert.match(it.replies[0], /not valid or has expired/);
+    assert.match(text(it.replies[0]), /expired/);
+    assert.match(text(it.replies[0]), /Type `\/link` in game for a new one/);
+    assert.deepStrictEqual(buttonIds(it.replies[0]), ['link:open']);
+    assert.deepStrictEqual(failures.map(f => f.reason), ['expired']);
+});
+
+test('/link: a code someone else spent says so, and warns about posting it', async () => {
+    codeDocs.ABC234.usedAt = NOW;
+    codeDocs.ABC234.usedBy = '5555';
+    const it = interaction({ code: 'ABC234' });
+    await link.execute(it);
+
+    assert.strictEqual(sets.length, 0);
+    assert.match(text(it.replies[0]), /Someone else already used this code/);
+    assert.match(text(it.replies[0]), /Do not post your code/);
+    assert.deepStrictEqual(failures.map(f => f.reason), ['used_other']);
+});
+
+test('/link: your own spent code is "already linked" only when the link is really there', async () => {
+    codeDocs.ABC234.usedAt = NOW;
+    codeDocs.ABC234.usedBy = '4242';
+
+    const notLinked = interaction({ code: 'ABC234' });
+    await link.execute(notLinked);
+    assert.match(text(notLinked.replies[0]), /You already used this code/);
+    assert.deepStrictEqual(buttonIds(notLinked.replies[0]), ['link:open']);
+
+    players['uuid-alp'].discord_id = '4242';
+    const isLinked = interaction({ code: 'ABC234' });
+    await link.execute(isLinked);
+    assert.match(text(isLinked.replies[0]), /\*\*Alp\*\* is already linked to this Discord/);
+    assert.deepStrictEqual(buttonIds(isLinked.replies[0]), [], 'nothing to try again');
+
+    assert.deepStrictEqual(failures.map(f => f.reason), ['used_self', 'already']);
+    assert.strictEqual(sets.length, 0);
+});
+
+test('/link: a code the in-game /unlink burnt says why it stopped working', async () => {
+    codeDocs.ABC234.usedAt = NOW;
+    codeDocs.ABC234.usedBy = 'unlink';
+    const it = interaction({ code: 'ABC234' });
+    await link.execute(it);
+
+    assert.match(text(it.replies[0]), /stopped working when the account was unlinked/);
+    assert.deepStrictEqual(failures.map(f => f.reason), ['revoked']);
+});
+
+test('/link: a code for a player doc that is gone says so', async () => {
+    codeDocs.GH0567 = { code: 'GH0567', uuid: 'uuid-gone', username: 'Gone', usedAt: null, expiresAt: LATER };
+    const it = interaction({ code: 'GH0567' });
+    await link.execute(it);
+
+    assert.strictEqual(sets.length, 0);
+    assert.match(text(it.replies[0]), /no longer knows/);
+    assert.deepStrictEqual(failures.map(f => f.reason), ['no_player']);
+});
+
+test('/link: a failure row keeps two characters of the code and never the code', async () => {
+    await link.execute(interaction({ code: 'zzz-999' }));
+    await link.execute(interaction({ code: 'nope' }));
+
+    assert.deepStrictEqual(failures.map(f => f.codePrefix), ['ZZ', 'N0']);
+    for (const row of failures) {
+        assert.deepStrictEqual(Object.keys(row).sort(), ['at', 'codePrefix', 'discordId', 'reason', 'via']);
+        assert.ok(!JSON.stringify(row).includes('ZZZ999'), 'the full code never lands in the row');
+    }
+    assert.deepStrictEqual(codes.buildLinkFailure({ discordId: 1, reason: 'unknown', code: 'ABC234', via: 'modal', now: NOW }), {
+        discordId: '1', reason: 'unknown', codePrefix: 'AB', via: 'modal', at: NOW
+    });
+});
+
+test('/link: a failure row that cannot be written still gets the player their reply', async () => {
+    mongo.insertLinkFailure = async () => { throw new Error('no primary'); };
+    const it = interaction({ code: 'ZZZ999' });
+    await link.execute(it);
+    assert.match(text(it.replies[0]), /No code `ZZZ999` exists/);
+});
+
+test('/link: success says no relog, carries no button, and logs no failure', async () => {
+    const it = interaction({ code: 'ABC234' });
+    await link.execute(it);
+
+    assert.strictEqual(text(it.replies[0]), '✅ Linked to **Alp**. No relog needed.');
+    assert.deepStrictEqual(buttonIds(it.replies[0]), []);
+    assert.deepStrictEqual(failures, []);
 });
 
 test('/link refuses a Minecraft account already linked to another Discord', async () => {
-    codeDocs.XYZ789 = { code: 'XYZ789', uuid: 'uuid-taken', username: 'Taken', usedAt: null };
+    codeDocs.XYZ789 = { code: 'XYZ789', uuid: 'uuid-taken', username: 'Taken', usedAt: null, expiresAt: LATER };
     const it = interaction({ code: 'XYZ789' });
     await link.execute(it);
 
@@ -237,9 +381,59 @@ test('/link refuses a Minecraft account already linked to another Discord', asyn
     assert.strictEqual(audits.length, 0);
     assert.strictEqual(players['uuid-taken'].discord_id, '999');
     assert.strictEqual(claims.length, 1, 'the claim came first, so the code is spent');
-    assert.match(it.replies[0], /another Discord account/);
-    assert.match(it.replies[0], /unlink/);
-    assert.match(it.replies[0], /`\/link` again/, 'the code is burnt - say how to get another');
+    assert.match(text(it.replies[0]), /another Discord account/);
+    assert.match(text(it.replies[0]), /unlink/);
+    assert.match(text(it.replies[0]), /`\/link` for a new code/, 'the code is burnt - say how to get another');
+    assert.deepStrictEqual(failures.map(f => f.reason), ['taken']);
+});
+
+test('/link with no code opens the code box and claims nothing', async () => {
+    const it = interaction({});
+    await link.execute(it);
+
+    assert.strictEqual(it.modals.length, 1);
+    const modal = it.modals[0].toJSON();
+    assert.strictEqual(modal.custom_id, 'link:modal');
+    const input = modal.components[0].components[0];
+    assert.strictEqual(input.custom_id, 'code');
+    assert.match(input.label, /\/link in game/);
+    assert.match(input.placeholder, /No code yet\?/);
+    assert.strictEqual(it.deferred, false, 'a modal has to be the first answer');
+    assert.strictEqual(claims.length + failures.length + it.replies.length, 0);
+
+    const blank = interaction({ code: '   ' });
+    await link.execute(blank);
+    assert.strictEqual(blank.modals.length, 1, 'a blank code is no code');
+});
+
+test('the code box, [Link account] and [My accounts] all go through the same flow', async () => {
+    const open = interaction({}, { kind: 'button', customId: 'link:open' });
+    assert.strictEqual(linkFlow.owns(open), true);
+    await linkFlow.handleInteraction(open);
+    assert.strictEqual(open.modals[0].toJSON().custom_id, 'link:modal');
+
+    const submit = interaction({ modalCode: ' abc 234 ' }, { kind: 'modal', customId: 'link:modal' });
+    assert.strictEqual(linkFlow.owns(submit), true);
+    await linkFlow.handleInteraction(submit);
+    assert.deepStrictEqual(claims, [{ code: 'ABC234', discordId: '4242' }]);
+    assert.strictEqual(text(submit.replies[0]), '✅ Linked to **Alp**. No relog needed.');
+
+    const again = interaction({ modalCode: 'ABC234' }, { kind: 'modal', customId: 'link:modal' });
+    await linkFlow.handleInteraction(again);
+    assert.match(text(again.replies[0]), /already linked/);
+    assert.strictEqual(failures[0].via, 'modal');
+
+    const mine = interaction({}, { kind: 'button', customId: 'link:mine' });
+    await linkFlow.handleInteraction(mine);
+    assert.match(mine.replies[0], /\*\*Alp\*\*/);
+});
+
+test('owns() takes our buttons and modal only', () => {
+    assert.strictEqual(linkFlow.owns(interaction({}, { kind: 'button', customId: 'linkreq:approve:1' })), false);
+    assert.strictEqual(linkFlow.owns(interaction({}, { kind: 'button', customId: 'chatflag:ban:1' })), false);
+    assert.strictEqual(linkFlow.owns(interaction({}, { kind: 'button', customId: 'ske' })), false, 'a role button');
+    assert.strictEqual(linkFlow.owns(interaction({}, { kind: 'autocomplete', customId: 'link:open' })), false);
+    assert.strictEqual(linkFlow.owns(interaction({}, {})), false, 'a slash command has no customId');
 });
 
 test('two Discords redeeming the same code: exactly one link and one role', async () => {
@@ -258,7 +452,7 @@ test('two Discords redeeming the same code: exactly one link and one role', asyn
     assert.strictEqual(players['uuid-alp'].discord_id, winner);
     assert.deepStrictEqual(roleCalls, [{ action: 'add', userId: winner, roleId: 'role-1' }]);
     const loser = winner === '4242' ? second : first;
-    assert.match(loser.replies[0], /not valid or has expired/);
+    assert.match(text(loser.replies[0]), /Someone else already used this code/);
 });
 
 test('a link landing between the claim and the write is refused, never overwritten', async () => {
@@ -279,20 +473,20 @@ test('a link landing between the claim and the write is refused, never overwritt
     assert.strictEqual(players['uuid-alp'].discord_name, 'someone');
     assert.strictEqual(audits.length, 0);
     assert.deepStrictEqual(roleCalls, []);
-    assert.match(it.replies[0], /another Discord account/);
+    assert.match(text(it.replies[0]), /another Discord account/);
 });
 
 test('/link twice from the same Discord is idempotent — one write, one audit', async () => {
     const first = interaction({ code: 'ABC234' });
     await link.execute(first);
-    codeDocs.DEF567 = { code: 'DEF567', uuid: 'uuid-alp', username: 'Alp', usedAt: null };
+    codeDocs.DEF567 = { code: 'DEF567', uuid: 'uuid-alp', username: 'Alp', usedAt: null, expiresAt: LATER };
     const second = interaction({ code: 'DEF567' });
     await link.execute(second);
 
     assert.strictEqual(sets.length, 1);
     assert.strictEqual(audits.length, 1);
     assert.strictEqual(claims.length, 2, 'the second code is still burnt');
-    assert.match(second.replies[0], /already linked/);
+    assert.match(text(second.replies[0]), /already linked/);
 });
 
 test('/link grants the Verified role when one is configured', async () => {
@@ -301,7 +495,7 @@ test('/link grants the Verified role when one is configured', async () => {
     await link.execute(it);
 
     assert.deepStrictEqual(roleCalls, [{ action: 'add', userId: '4242', roleId: 'role-1' }]);
-    assert.match(it.replies[0], /Linked to \*\*Alp\*\*/);
+    assert.match(text(it.replies[0]), /Linked to \*\*Alp\*\*/);
 });
 
 test('/link touches no role when none is configured', async () => {
@@ -320,7 +514,7 @@ test('a throwing role fetch does NOT fail the link', async () => {
     assert.strictEqual(sets.length, 1, 'the link is in Mongo either way');
     assert.strictEqual(audits.length, 1);
     assert.deepStrictEqual(roleCalls, []);
-    assert.match(it.replies[0], /Linked to \*\*Alp\*\*/);
+    assert.match(text(it.replies[0]), /Linked to \*\*Alp\*\*/);
 });
 
 test('/unlink drops the link, audits it and takes the role back when nothing is left', async () => {
@@ -404,6 +598,7 @@ test('/linked lists the caller`s accounts, and says so when there are none', asy
     const empty = interaction({});
     await linked.execute(empty);
     assert.match(empty.replies[0], /No Minecraft accounts are linked/);
+    assert.match(empty.replies[0], /<#1552762887276335294>/, 'it names #link, where the button is');
 
     players['uuid-alp'].discord_id = '4242';
     players['uuid-alp'].discord_linked_at = NOW;
@@ -411,6 +606,34 @@ test('/linked lists the caller`s accounts, and says so when there are none', asy
     await linked.execute(it);
     assert.match(it.replies[0], /\*\*Alp\*\*/);
     assert.match(it.replies[0], /<t:\d+:R>/);
+});
+
+test('/wrapped finds the account on bifrost.players, never the legacy collection', async () => {
+    players['uuid-alp'].discord_id = '4242';
+    players['uuid-alp'].discord_linked_at = new Date('2026-09-25T16:00:00Z');
+    players['uuid-alt'] = {
+        uuid: 'uuid-alt', username: 'AlpAlt', discord_id: '4242', discord_linked_at: new Date('2026-09-26T09:00:00Z')
+    };
+
+    const account = await wrapped._internals.findLinkedAccount('4242');
+    assert.strictEqual(account.uuid, 'uuid-alp', 'the first account linked is the one Wrapped is about');
+    assert.strictEqual(account.username, 'Alp');
+    assert.strictEqual(await wrapped._internals.findLinkedAccount('5555'), null);
+    assert.deepStrictEqual(legacyReads, [], 'valhallamc.players is not where links live any more');
+});
+
+test('/wrapped with no link points at #link and carries the [Link account] button', async () => {
+    const it = interaction({}, { userId: '7777' });
+    await wrapped.execute(it);
+
+    assert.deepStrictEqual(legacyReads, []);
+    const reply = it.replies[0];
+    const description = reply.embeds[0].toJSON().description;
+    assert.match(description, /<#1552762887276335294>/);
+    assert.match(description, /Link account/);
+    assert.ok(!description.includes('1103357751863812207'), 'the deleted #verify channel is gone');
+    assert.ok(!/verification button/i.test(description));
+    assert.deepStrictEqual(buttonIds(reply), ['link:open']);
 });
 
 test('the discord-link indexes are the proxy`s specs, and one failure is retried', async () => {

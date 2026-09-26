@@ -36,6 +36,9 @@ const DISCORD_LINK_INDEXES = [
     { collection: 'discord_link_codes', keys: { expiresAt: 1 }, options: { name: 'link_ttl', expireAfterSeconds: 0 } }
 ];
 let discordLinkIndexesEnsured = false;
+// Failed link attempts are support evidence for a few weeks, then noise.
+const LINK_FAILURE_TTL_SECONDS = 90 * 86400;
+let linkFailureIndexEnsured = false;
 
 // bifrost.logs starts here; anything older lives only in valhallamc.logs (the archive)
 const ARCHIVE_CUTOFF = new Date('2026-03-01T00:00:00Z');
@@ -1326,6 +1329,94 @@ module.exports = {
             .db('bifrost')
             .collection('discord_link_audit')
             .insertOne(doc);
+    },
+
+    /**
+     * Reads a code doc whatever its state, so a failed claim can say why it failed. The
+     * TTL index drops a code about a minute after it expires, so an old code reads as
+     * missing here.
+     * @param {string} code Normalised code.
+     * @returns {Promise<object|null>} `{code, uuid, username, expiresAt, usedAt, usedBy}` or null.
+     */
+    findLinkCode: async function (code) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('discord_link_codes')
+            .findOne({ code: String(code) }, {
+                projection: { _id: 0, code: 1, uuid: 1, username: 1, expiresAt: 1, usedAt: 1, usedBy: 1 }
+            });
+    },
+
+    /**
+     * Appends one failed link attempt. The first call in a process also makes the
+     * retention index, so the collection stays small.
+     * @param {object} doc A row from buildLinkFailure (discord/commands/util/linkCode.js).
+     * @returns {Promise<object>} The insertOne result.
+     */
+    insertLinkFailure: async function (doc) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const collection = mongoClient.db('bifrost').collection('discord_link_failures');
+        if (!linkFailureIndexEnsured) {
+            try {
+                await collection.createIndex({ at: 1 },
+                    { name: 'link_fail_ttl', expireAfterSeconds: LINK_FAILURE_TTL_SECONDS });
+                linkFailureIndexEnsured = true;
+            } catch (error) {
+                sessionLogger.warn('Mongo', 'Could not ensure the discord_link_failures TTL index', error.message);
+            }
+        }
+        return collection.insertOne(doc);
+    },
+
+    /**
+     * Reads where a bot-owned panel message lives (the #link panel, for one).
+     * @param {string} key Panel name.
+     * @returns {Promise<object|null>} `{_id, channelId, messageId, hash}` or null.
+     */
+    getDiscordPanel: async function (key) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('discord_panels')
+            .findOne({ _id: String(key) });
+    },
+
+    /**
+     * Remembers where a bot-owned panel message lives, so a restart edits it again.
+     * @param {string} key Panel name.
+     * @param {object} fields `{channelId, messageId, hash}`.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    saveDiscordPanel: async function (key, fields) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('discord_panels')
+            .updateOne({ _id: String(key) }, {
+                $set: {
+                    channelId: String(fields.channelId),
+                    messageId: String(fields.messageId),
+                    hash: fields.hash == null ? null : String(fields.hash),
+                    updatedAt: new Date()
+                }
+            }, { upsert: true });
     },
 
     // In-game /link request (bifrost.link_requests). A player who cannot reach Discord -
