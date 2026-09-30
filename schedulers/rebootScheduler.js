@@ -29,6 +29,18 @@ module.exports = {
     // stop step can stamp the doc it started and a retry inside the same minute can't double-write.
     rebootEventState: new Map(),
 
+    // Start send timings (startServerWithMonitoring). Wings can drop a start without an API error.
+    // A start sent while Wings still holds the stop lock is refused. A start whose container create
+    // fails goes starting, then offline. Both left the server offline for the full boot budget.
+    startRetry: {
+        lockSettleMs: 10000,     // wait after "offline" before the first send, so Wings releases its stop lock
+        pollMs: 10000,           // state poll interval while a start send is watched
+        droppedAfterMs: 45000,   // still offline this long after a send, no other state seen: resend
+        failedBootWaitMs: 60000, // offline this long after a starting state (failed boot): resend
+        maxSends: 3,             // start sends per reboot attempt
+        bootTimeoutMs: 1200000,  // 20 min for a boot that took, counted from its send
+    },
+
     // Enhanced state tracking with thread-safe operations
     state: {
         isRebootInProgress: false,
@@ -861,31 +873,39 @@ module.exports = {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             sessionLogger.info('RebootScheduler', `[${server.name}] Reboot attempt ${attempt}/${maxRetries}`);
             try {
-                // Warning window also honors a cancel request: returning false means a
-                // staff member cancelled mid-countdown — abort without stopping the server.
-                const warned = await this.executeRebootWarningsEnhanced(server, opts);
-                if (warned === false) {
-                    sessionLogger.warn('RebootScheduler', `[${server.name}] Reboot cancelled before stop`);
-                    this.stateOperations.removeActiveReboot(server.serverId);
-                    return { success: false, reason: 'cancelled' };
-                }
-                // Final uptime checkpoint AFTER the warning window: a crash or external restart
-                // during the countdown means the server is fresh again — don't stop it a second
-                // time. Players just saw the countdown, so tell them it's cancelled.
-                if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
-                    // Close the countdown doc as reached before walking away: the window did run to
-                    // its end, and a cancel stamp only matches a doc whose fireAt is still ahead —
-                    // this one's isn't, so left alone it stays open and the proxy keeps the bar up.
+                // A retry on a server that is already offline has no players to warn and nothing
+                // to stop, so it goes straight to the start. Before this, a start that did not take
+                // ran the full 15 min warning window again (2026-09-30 Storage Box stall).
+                if (attempt > 1 && await this.readServerState(server) === 'offline') {
+                    sessionLogger.info('RebootScheduler',
+                        `[${server.name}] Server is offline on retry: skipping warnings and stop, starting now`);
+                } else {
+                    // Warning window also honors a cancel request: returning false means a
+                    // staff member cancelled mid-countdown — abort without stopping the server.
+                    const warned = await this.executeRebootWarningsEnhanced(server, opts);
+                    if (warned === false) {
+                        sessionLogger.warn('RebootScheduler', `[${server.name}] Reboot cancelled before stop`);
+                        this.stateOperations.removeActiveReboot(server.serverId);
+                        return { success: false, reason: 'cancelled' };
+                    }
+                    // Final uptime checkpoint AFTER the warning window: a crash or external restart
+                    // during the countdown means the server is fresh again — don't stop it a second
+                    // time. Players just saw the countdown, so tell them it's cancelled.
+                    if (!opts.scheduled && await this.maybeSkipRecentlyRestarted(server)) {
+                        // Close the countdown doc as reached before walking away: the window did run to
+                        // its end, and a cancel stamp only matches a doc whose fireAt is still ahead —
+                        // this one's isn't, so left alone it stays open and the proxy keeps the bar up.
+                        this.finishRebootEvent(server.serverId);
+                        await this.sendFreshRestartCancelNotice(server);
+                        return { success: true, reason: 'recently_restarted', skipped: true };
+                    }
                     this.finishRebootEvent(server.serverId);
-                    await this.sendFreshRestartCancelNotice(server);
-                    return { success: true, reason: 'recently_restarted', skipped: true };
-                }
-                this.finishRebootEvent(server.serverId);
-                const stoppedResult = await this.ensureServerStopped(server, { checkFreshUptime: !opts.scheduled });
-                if (stoppedResult === 'skipped') {
-                    // Server bounced during the save flush — same handling as the post-warning checkpoint.
-                    await this.sendFreshRestartCancelNotice(server);
-                    return { success: true, reason: 'recently_restarted', skipped: true };
+                    const stoppedResult = await this.ensureServerStopped(server, { checkFreshUptime: !opts.scheduled });
+                    if (stoppedResult === 'skipped') {
+                        // Server bounced during the save flush — same handling as the post-warning checkpoint.
+                        await this.sendFreshRestartCancelNotice(server);
+                        return { success: true, reason: 'recently_restarted', skipped: true };
+                    }
                 }
                 await this.startServerWithMonitoring(server);
 
@@ -1337,27 +1357,95 @@ module.exports = {
     },
 
     /**
-     * Start server with enhanced monitoring
+     * Start server with enhanced monitoring.
+     * Each start send is watched (watchStartSend). A dropped send or a failed boot gets a new
+     * send, up to startRetry.maxSends. When the sends run out, the attempt fails at once and
+     * does not wait out the boot budget. A boot that stays starting keeps the full budget.
      */
     startServerWithMonitoring: async function (server) {
-        // Start the server
-        await pterodactyl.sendPowerAction(server.serverId, 'start');
-        
-        sessionLogger.info('RebootScheduler', `[${server.name}] Start command sent`);
-        
-        // Wait for server to be running
-        const started = await this.waitForServerState(server, 'running', 1200000); // 20 min timeout
-        
-        if (!started) {
+        const cfg = this.startRetry;
+
+        // Wings releases its stop lock a moment after the panel reports offline. A start sent
+        // inside that gap is dropped ("cannot acquire lock"), so let the lock go first.
+        await functions.sleep(cfg.lockSettleMs);
+
+        let outcome = null;
+        for (let send = 1; send <= cfg.maxSends; send++) {
+            if (send > 1) {
+                const reason = outcome === 'failed'
+                    ? `boot failed: went starting, then offline for ${cfg.failedBootWaitMs / 1000}s`
+                    : `still offline ${cfg.droppedAfterMs / 1000}s after the start, no starting state seen (start dropped)`;
+                sessionLogger.warn('RebootScheduler',
+                    `[${server.name}] ${reason}. Resending start (${send}/${cfg.maxSends})`);
+            }
+            await pterodactyl.sendPowerAction(server.serverId, 'start');
+            sessionLogger.info('RebootScheduler', `[${server.name}] Start command sent (${send}/${cfg.maxSends})`);
+
+            outcome = await this.watchStartSend(server, cfg);
+            if (outcome === 'running' || outcome === 'timeout') break;
+        }
+
+        if (outcome === 'timeout') {
             throw new Error('Server failed to start within timeout period');
         }
-        
+        if (outcome !== 'running') {
+            throw new Error(`Server did not start after ${cfg.maxSends} start sends (last: ${outcome === 'failed' ? 'boot failed' : 'start dropped'})`);
+        }
+
         sessionLogger.info('RebootScheduler', `[${server.name}] Server is running`);
         
         // Additional health check delay
         await functions.sleep(30000); // 30 seconds for server to stabilize
         
         return true;
+    },
+
+    /**
+     * Watches one start send by polling the state every cfg.pollMs.
+     * Returns 'running'; 'dropped' when the server is still offline cfg.droppedAfterMs after the
+     * send and no other state was seen; 'failed' when the boot went starting (or stopping), then
+     * stayed offline for cfg.failedBootWaitMs; 'timeout' when cfg.bootTimeoutMs runs out.
+     * Wings keeps the state offline during its pre-boot steps. A resend in that time hits the
+     * lock of the first start and does nothing.
+     */
+    watchStartSend: async function (server, cfg = this.startRetry) {
+        const sentAt = Date.now();
+        let booting = false;
+        let offlineSince = null;
+
+        while (Date.now() - sentAt < cfg.bootTimeoutMs) {
+            await functions.sleep(cfg.pollMs);
+            const state = await this.readServerState(server);
+
+            if (state === 'running') return 'running';
+            if (state === 'offline') {
+                if (!booting) {
+                    if (Date.now() - sentAt >= cfg.droppedAfterMs) return 'dropped';
+                } else {
+                    // A later starting state clears this, so a boot that picks up again is not resent.
+                    if (offlineSince === null) offlineSince = Date.now();
+                    if (Date.now() - offlineSince >= cfg.failedBootWaitMs) return 'failed';
+                }
+            } else if (state !== 'unknown') {
+                booting = true;
+                offlineSince = null;
+            }
+        }
+        return 'timeout';
+    },
+
+    /**
+     * Current power state from one status read. 'unknown' when the read fails
+     * (getStatus also returns 'unknown' on an API error).
+     */
+    readServerState: async function (server) {
+        try {
+            const status = await pterodactyl.getStatus(server.serverId);
+            return (status && status.attributes && status.attributes.current_state) || 'unknown';
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `[${server.name}] Status check error: ${error.message}`);
+            return 'unknown';
+        }
     },
 
     /**
