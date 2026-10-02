@@ -14,6 +14,11 @@
 
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 const DEFAULT_WEEK_COUNT = 8;
+// Reward keys the reader sets itself. A milestone key must not take one of them.
+const RESERVED_KEYS = new Set(['founder', 'finisher', 'speedrunner']);
+const WEEK_KEY = /^week\d+$/;
+// A milestone key goes into Mongo paths (`rewards.<key>`), so no dots and no `$`.
+const MILESTONE_KEY = /^[A-Za-z]\w*$/;
 
 /** The values of an NBT-JSON list or compound, in either of its two forms. */
 function entries(node) {
@@ -104,25 +109,71 @@ function weekEnd(sched, index) {
     return Math.min(sched.startAt + (index + 1) * sched.weekMs, sched.endAt);
 }
 
+/** True for the weekly reward keys, `week0` and up. */
+function isWeekKey(key) {
+    return WEEK_KEY.test(String(key));
+}
+
+/**
+ * The event's usable `milestones`: a key like `m50` that is free, and a positive
+ * integer `quests`. A bad entry or a second use of one key is left out.
+ * @returns {{key: string, quests: number, reward: object}[]} In the order of the event doc.
+ */
+function milestoneSpecs(event) {
+    if (!Array.isArray(event.milestones)) return [];
+    const specs = [];
+    const seen = new Set();
+    for (const milestone of event.milestones) {
+        const key = milestone && milestone.key;
+        const quests = Number(milestone && milestone.quests);
+        if (typeof key !== 'string' || !MILESTONE_KEY.test(key) || RESERVED_KEYS.has(key) || isWeekKey(key)) continue;
+        if (seen.has(key) || !Number.isInteger(quests) || quests <= 0) continue;
+        seen.add(key);
+        specs.push({ key, quests, reward: milestone.reward });
+    }
+    return specs;
+}
+
+/** The final quest the Season 2 finisher needs, or null when the event has no `finisher`. */
+function finisherQuestId(event) {
+    if (!event.finisher || typeof event.finisher !== 'object') return null;
+    const id = Number(event.finalQuestId);
+    return event.finalQuestId !== null && event.finalQuestId !== '' && Number.isInteger(id) ? id : null;
+}
+
+/** True when finisher number `n` also earns the speedrunner reward: `n <= finisher.firstN`. */
+function earnsSpeedrunner(event, n) {
+    const firstN = Number((event.finisher || {}).firstN);
+    return Number.isInteger(firstN) && firstN > 0 && Number.isInteger(n) && n > 0 && n <= firstN;
+}
+
 /**
  * Counts the completions that belong to the event: `startAt <= at < endAt`, uuid not
  * excluded. Each player's count is per uuid, as BQ recorded it.
- * @returns {{players: Map<string, {uuid: string, total: number, weeks: object, firstAt: number, founderAt: number|null}>,
- *     weekCounts: number[], quests: number, schedule: object}}
+ * @returns {{players: Map<string, {uuid: string, total: number, weeks: object, firstAt: number, founderAt: number|null,
+ *     milestoneAt?: object, finishedAt?: number|null}>, weekCounts: number[], quests: number, schedule: object}}
  *     `founderAt` is the time of the player's `founder.minQuests`-th completion, or null before they reach it.
+ *     `milestoneAt` maps each reached milestone key to the time of the completion that reached it.
+ *     `finishedAt` is the time of the counted `finalQuestId` completion, or null.
+ *     A row has `milestoneAt` only when the event has milestones, and `finishedAt` only with a `finisher`.
  */
 function countEvent(quests, event) {
     const sched = schedule(event);
     if (!sched) throw new Error(`Event ${event._id} has no startAt`);
     const excluded = new Set((event.excluded || []).map(normalizeUuid));
     const minQuests = event.founder && Number(event.founder.minQuests) > 0 ? Number(event.founder.minQuests) : null;
+    const milestones = milestoneSpecs(event);
+    const finalQuestId = finisherQuestId(event);
 
     const times = new Map();
+    const finished = new Map();
     for (const quest of quests) {
+        const final = finalQuestId !== null && quest.questId === finalQuestId;
         for (const { uuid, at } of quest.completions) {
             if (at < sched.startAt || at >= sched.endAt || excluded.has(uuid)) continue;
             if (!times.has(uuid)) times.set(uuid, []);
             times.get(uuid).push(at);
+            if (final && (!finished.has(uuid) || at < finished.get(uuid))) finished.set(uuid, at);
         }
     }
 
@@ -138,13 +189,20 @@ function countEvent(quests, event) {
             weekCounts[index]++;
         }
         total += list.length;
-        players.set(uuid, {
+        const row = {
             uuid,
             total: list.length,
             weeks,
             firstAt: list[0],
             founderAt: minQuests !== null && list.length >= minQuests ? list[minQuests - 1] : null
-        });
+        };
+        if (milestones.length) {
+            row.milestoneAt = Object.fromEntries(milestones
+                .filter(m => list.length >= m.quests)
+                .map(m => [m.key, list[m.quests - 1]]));
+        }
+        if (finalQuestId !== null) row.finishedAt = finished.has(uuid) ? finished.get(uuid) : null;
+        players.set(uuid, row);
     }
     return { players, weekCounts, quests: total, schedule: sched };
 }
@@ -223,6 +281,40 @@ function founderCandidates(progressDocs, event, sched) {
         .sort((a, b) => toMs(a.founderAt) - toMs(b.founderAt) || String(a.uuid).localeCompare(String(b.uuid)));
 }
 
+/**
+ * The progress docs that earn a number for one milestone: no number for that key yet,
+ * and `quests` reached inside the event. No founder-style window.
+ * @param {{key: string, quests: number}} milestone One entry of `milestoneSpecs`.
+ * @returns {object[]} The docs, in the order they reached `quests`.
+ */
+function milestoneCandidates(progressDocs, event, sched, milestone) {
+    const excluded = new Set((event.excluded || []).map(normalizeUuid));
+    const reachedAt = doc => toMs((doc.milestoneAt || {})[milestone.key]);
+    const numbered = doc => doc.milestoneNo && doc.milestoneNo[milestone.key] !== null && doc.milestoneNo[milestone.key] !== undefined;
+    return progressDocs
+        .filter(doc => !numbered(doc)
+            && reachedAt(doc) !== null && reachedAt(doc) >= sched.startAt && reachedAt(doc) < sched.endAt
+            && Number(doc.total) >= milestone.quests
+            && !excluded.has(normalizeUuid(doc.uuid)))
+        .sort((a, b) => reachedAt(a) - reachedAt(b) || String(a.uuid).localeCompare(String(b.uuid)));
+}
+
+/**
+ * The progress docs that earn a finisher number: no number yet, and a `finishedAt`
+ * inside the event. Empty when the event has no `finisher`.
+ * @returns {object[]} The docs, in the order they completed `finalQuestId`.
+ */
+function finisherCandidates(progressDocs, event, sched) {
+    if (finisherQuestId(event) === null) return [];
+    const excluded = new Set((event.excluded || []).map(normalizeUuid));
+    return progressDocs
+        .filter(doc => (doc.finisherNo === null || doc.finisherNo === undefined)
+            && toMs(doc.finishedAt) !== null && toMs(doc.finishedAt) >= sched.startAt && toMs(doc.finishedAt) < sched.endAt
+            && Number(doc.total) > 0
+            && !excluded.has(normalizeUuid(doc.uuid)))
+        .sort((a, b) => toMs(a.finishedAt) - toMs(b.finishedAt) || String(a.uuid).localeCompare(String(b.uuid)));
+}
+
 /** The progress docs that earn week `index`'s reward: enough completions that week, not excluded. */
 function weeklyRecipients(progressDocs, event, index) {
     const min = Number(event.weeklyMinContribution) || 0;
@@ -245,7 +337,9 @@ function diffProgress(existingDocs, players) {
             && Number(doc.total) === player.total
             && toMs(doc.firstAt) === player.firstAt
             && toMs(doc.founderAt) === player.founderAt
-            && sameWeeks(doc.weeks, player.weeks);
+            && sameWeeks(doc.weeks, player.weeks)
+            && (player.milestoneAt === undefined || sameTimes(doc.milestoneAt, player.milestoneAt))
+            && (player.finishedAt === undefined || toMs(doc.finishedAt) === player.finishedAt);
         if (!same) changed.push(player);
     }
     const cleared = existingDocs
@@ -262,6 +356,14 @@ function sameWeeks(a = {}, b = {}) {
     return true;
 }
 
+function sameTimes(a, b) {
+    const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+    for (const key of keys) {
+        if (toMs((a || {})[key]) !== toMs((b || {})[key])) return false;
+    }
+    return true;
+}
+
 module.exports = {
     WEEK_MS,
     DEFAULT_WEEK_COUNT,
@@ -272,12 +374,18 @@ module.exports = {
     weekTarget,
     weekIndexAt,
     weekEnd,
+    isWeekKey,
+    milestoneSpecs,
+    finisherQuestId,
+    earnsSpeedrunner,
     countEvent,
     finishers,
     buildTotals,
     closableWeeks,
     eventFinished,
     founderCandidates,
+    milestoneCandidates,
+    finisherCandidates,
     weeklyRecipients,
     diffProgress
 };

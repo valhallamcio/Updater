@@ -7,10 +7,16 @@
  *  - an unchanged file (mtime, size and count inputs) is not downloaded, and nothing is written,
  *  - a founder number comes from the `$inc` once per player, in the order players reached
  *    `minQuests`, and a lost race never gives one player two numbers,
+ *  - a milestone number comes from `milestoneSeq.<key>` once per player per milestone, in
+ *    the order players reached `quests`, with no window,
+ *  - a finisher number comes from `finisherSeq` once per player, in completion order, and
+ *    numbers up to `finisher.firstN` also mark `speedrunner`,
+ *  - a lost race or a crash after the `$inc` wastes that number, and the next pass takes a new one,
  *  - a week closes once, and only a week that met its target marks rewards,
  *  - a reward goes out as ONE `give_item` op per key: by the event's Pterodactyl id,
  *    target by uuid and name, `offlineMode: 'queue'`, a 14-day expiry, and the key
- *    `qe:<eventId>:<founder|week<i>>:<uuid>`,
+ *    `qe:<eventId>:<reward key>:<uuid>`,
+ *  - an event without `milestones` or `finisher` keeps its count key, reward keys and docs,
  *  - with the ops lever off nothing is sent, and the rewards wait as `pending`,
  *  - finishers are read on the legacy AND the event server, keep the earliest time,
  *    and ignore the window and the exclusion list.
@@ -23,6 +29,7 @@ const { test, beforeEach } = require('node:test');
 const assert = require('node:assert');
 const { NBTReader } = require('mc-nbt-lib/nbt-core');
 const reader = require('../schedulers/questEventReader');
+const questProgress = require('../modules/questProgress');
 const mongo = require('../modules/mongo');
 const yggdrasil = require('../modules/yggdrasil');
 const { seedDoc } = require('../scripts/seed-quest-event-dj2r');
@@ -35,7 +42,10 @@ const OPTIONS = { interval: 5, finisherInterval: 60, weekCloseDelayMinutes: 15 }
 const A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const B = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const C = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const D = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const E = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const NAMES = { [A]: 'Alp', [B]: 'Bommerhond' };
+const CAKE = { id: 'minecraft:cake' };
 
 let ev;           // the quest_events doc, as Mongo holds it
 let progress;     // quest_event_progress docs by _id
@@ -51,6 +61,9 @@ let created;      // createOp calls
 let opsById;      // what getOp answers
 let opsOn;        // the useOpsApi lever
 let founderRace;  // when true, setQuestEventFounderNo loses the race
+let milestoneIncs; // nextMilestoneNo keys, in order
+let finisherIncs; // nextFinisherNo calls
+let numberRace;   // when true, the milestone and finisher number writes lose the race
 
 function setPath(obj, path, value) {
     const parts = path.split('.');
@@ -73,6 +86,7 @@ function apply(store, { filter, update, upsert }) {
         doc = store[filter._id] = { _id: filter._id, ...structuredClone(update.$setOnInsert || {}) };
     }
     for (const [path, value] of Object.entries(update.$set || {})) setPath(doc, path, structuredClone(value));
+    for (const path of Object.keys(update.$unset || {})) delete doc[path];
 }
 
 /** A QuestProgress.json in the compound form, from [questId, uuid, at] rows. */
@@ -113,6 +127,9 @@ beforeEach(() => {
     opsById = {};
     opsOn = false;
     founderRace = false;
+    milestoneIncs = [];
+    finisherIncs = 0;
+    numberRace = false;
 
     reader.opsConfig = () => ({ useOpsApi: opsOn });
     reader.statProgressFile = async (serverId) => { stats.push(serverId); return files[serverId] ? { ...files[serverId].stat } : null; };
@@ -138,6 +155,34 @@ beforeEach(() => {
         if (founderRace || !doc || doc.founderNo !== null) return { matchedCount: 0, modifiedCount: 0 };
         doc.founderNo = founderNo;
         doc.rewards.founder = structuredClone(reward);
+        return { matchedCount: 1, modifiedCount: 1 };
+    };
+    mongo.nextMilestoneNo = async (id, key) => {
+        milestoneIncs.push(key);
+        ev.milestoneSeq = ev.milestoneSeq || {};
+        ev.milestoneSeq[key] = (ev.milestoneSeq[key] || 0) + 1;
+        return ev.milestoneSeq[key];
+    };
+    // Mongo's `{field: null}` filter matches a missing field too.
+    mongo.setQuestEventMilestoneNo = async (id, uuid, key, milestoneNo, reward) => {
+        const doc = progress[`${id}:${uuid}`];
+        const taken = doc && doc.milestoneNo && doc.milestoneNo[key] !== undefined && doc.milestoneNo[key] !== null;
+        if (numberRace || !doc || taken) return { matchedCount: 0, modifiedCount: 0 };
+        doc.milestoneNo = { ...(doc.milestoneNo || {}), [key]: milestoneNo };
+        doc.rewards[key] = structuredClone(reward);
+        return { matchedCount: 1, modifiedCount: 1 };
+    };
+    mongo.nextFinisherNo = async () => {
+        finisherIncs++;
+        ev.finisherSeq = (ev.finisherSeq || 0) + 1;
+        return ev.finisherSeq;
+    };
+    mongo.setQuestEventFinisherNo = async (id, uuid, finisherNo, rewards) => {
+        const doc = progress[`${id}:${uuid}`];
+        const taken = doc && doc.finisherNo !== undefined && doc.finisherNo !== null;
+        if (numberRace || !doc || taken) return { matchedCount: 0, modifiedCount: 0 };
+        doc.finisherNo = finisherNo;
+        for (const [key, reward] of Object.entries(rewards)) doc.rewards[key] = structuredClone(reward);
         return { matchedCount: 1, modifiedCount: 1 };
     };
     mongo.addQuestEventReward = async (id, uuid, key, reward) => {
@@ -398,4 +443,177 @@ test('finishers: run before the event has a server or a start', async () => {
     await reader.finisherPass(OPTIONS, START);
     assert.deepStrictEqual(stats, ['3f89e24a']);
     assert.ok(packs[`dj2r:${A}`]);
+});
+
+test('milestone: one number per player per milestone, in the order they reached it, no window', async () => {
+    ev.weekCount = 4;
+    ev.excluded = [D];
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }, { key: 'm3', quests: 3, reward: CAKE }];
+    // B reaches 2 first, then A, then C after the 14-day founder window. D is excluded.
+    setFile('season2', [
+        [1, A, START + 1000], [2, A, START + 3 * 3600e3], [3, A, START + 3 * DAY],
+        [1, B, START + 2000], [2, B, START + 2 * 3600e3],
+        [1, C, START + 15 * DAY], [2, C, START + 15 * DAY + 1],
+        [1, D, START + 10], [2, D, START + 20], [3, D, START + 30]
+    ]);
+    await reader.countPass(OPTIONS, START + 16 * DAY);
+    assert.deepStrictEqual(progress[pid(B)].milestoneNo, { m2: 1 });
+    assert.deepStrictEqual(progress[pid(A)].milestoneNo, { m2: 2, m3: 1 });
+    assert.deepStrictEqual(progress[pid(C)].milestoneNo, { m2: 3 });
+    assert.ok(!progress[pid(D)], 'an excluded player has no doc and no number');
+    assert.deepStrictEqual(milestoneIncs, ['m2', 'm2', 'm2', 'm3']);
+    assert.deepStrictEqual(ev.milestoneSeq, { m2: 3, m3: 1 });
+    assert.deepStrictEqual(progress[pid(A)].milestoneAt, { m2: new Date(START + 3 * 3600e3), m3: new Date(START + 3 * DAY) });
+    assert.deepStrictEqual(progress[pid(A)].rewards.m3,
+        { state: 'pending', n: 1, earnedAt: new Date(START + 3 * DAY), at: new Date(START + 16 * DAY) });
+
+    // A changed file and a second pass: only B's new milestone takes a number.
+    setFile('season2', [
+        [1, A, START + 1000], [2, A, START + 3 * 3600e3], [3, A, START + 3 * DAY],
+        [1, B, START + 2000], [2, B, START + 2 * 3600e3], [3, B, START + 5 * DAY],
+        [1, C, START + 15 * DAY], [2, C, START + 15 * DAY + 1]
+    ], '2026-10-27T00:00:00+02:00');
+    await reader.countPass(OPTIONS, START + 16 * DAY + 1);
+    assert.deepStrictEqual(progress[pid(B)].milestoneNo, { m2: 1, m3: 2 });
+    assert.deepStrictEqual(milestoneIncs, ['m2', 'm2', 'm2', 'm3', 'm3']);
+});
+
+test('finisher: numbers in completion order, the first firstN also get speedrunner', async () => {
+    ev.weekCount = 4;
+    ev.excluded = [D];
+    ev.finisher = { reward: CAKE, firstN: 2, firstReward: CAKE };
+    // C finished before the start. D is excluded. E finishes third.
+    setFile('season2', [
+        [1, A, START + 1000], [809, A, START + 3 * DAY],
+        [809, B, START + 2 * DAY],
+        [809, C, START - 1], [1, C, START + 5],
+        [809, D, START + DAY],
+        [809, E, START + 5 * DAY]
+    ]);
+    await reader.countPass(OPTIONS, START + 6 * DAY);
+    assert.strictEqual(progress[pid(B)].finisherNo, 1);
+    assert.strictEqual(progress[pid(A)].finisherNo, 2);
+    assert.strictEqual(progress[pid(E)].finisherNo, 3);
+    assert.strictEqual(progress[pid(C)].finisherNo, undefined, 'quest 809 before the start');
+    assert.strictEqual(progress[pid(C)].finishedAt, null);
+    assert.ok(!progress[pid(D)], 'an excluded player never finishes');
+    assert.strictEqual(finisherIncs, 3);
+    assert.strictEqual(ev.finisherSeq, 3);
+
+    const finisher = { state: 'pending', n: 1, earnedAt: new Date(START + 2 * DAY), at: new Date(START + 6 * DAY) };
+    assert.deepStrictEqual(progress[pid(B)].rewards.finisher, finisher);
+    assert.deepStrictEqual(progress[pid(B)].rewards.speedrunner, finisher);
+    assert.strictEqual(progress[pid(A)].rewards.speedrunner.n, 2);
+    assert.ok(!progress[pid(E)].rewards.speedrunner, 'number 3 is past firstN 2');
+
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 3 * DAY], [809, B, START + 2 * DAY], [809, E, START + 5 * DAY]],
+        '2026-10-17T00:00:00+02:00');
+    await reader.countPass(OPTIONS, START + 6 * DAY + 1);
+    assert.strictEqual(finisherIncs, 3, 'nobody gets a second number');
+});
+
+test('numbers: a lost race wastes the milestone or finisher number, and the next pass takes a new one', async () => {
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
+    ev.finisher = { reward: CAKE, firstN: 1, firstReward: CAKE };
+    numberRace = true;
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    assert.deepStrictEqual(milestoneIncs, ['m2']);
+    assert.strictEqual(finisherIncs, 1);
+    assert.strictEqual(progress[pid(A)].milestoneNo, undefined);
+    assert.strictEqual(progress[pid(A)].finisherNo, undefined);
+    assert.deepStrictEqual(Object.keys(progress[pid(A)].rewards), ['founder']);
+
+    numberRace = false;
+    await reader.countPass(OPTIONS, START + DAY + 1);
+    assert.deepStrictEqual(progress[pid(A)].milestoneNo, { m2: 2 });
+    assert.strictEqual(progress[pid(A)].finisherNo, 2);
+    assert.ok(!progress[pid(A)].rewards.speedrunner, 'number 2 is past firstN 1, the wasted 1 never comes back');
+});
+
+test('rewards: milestone, finisher and speedrunner go out with their own spec and read back', async () => {
+    opsOn = true;
+    ev.milestones = [{ key: 'm2', quests: 2, reward: { id: 'simple_trophies:trophy', name: 'Two quests #{n}' } }];
+    ev.finisher = {
+        reward: { id: 'simple_trophies:trophy', name: 'Finisher #{n}' },
+        firstN: 1,
+        firstReward: { id: 'minecraft:skull', meta: 3, skullOwner: 'AlpDerps', name: 'Speedrunner #{n}' }
+    };
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+
+    const key = (k) => `qe:dj2r-s2:${k}:${A}`;
+    assert.deepStrictEqual(created.map(c => c.op.idempotencyKey).sort(),
+        [key('founder'), key('m2'), key('finisher'), key('speedrunner')].sort());
+    const op = (k) => created.find(c => c.op.idempotencyKey === key(k)).op;
+    const tag = (k) => new NBTReader(Buffer.from(op(k).params.nbt, 'base64')).readTag().value;
+    assert.strictEqual(tag('m2').TrophyName.value, 'Two quests #1');
+    assert.strictEqual(tag('m2').TrophyEarnedAt.value, BigInt((START + 2000) / 1000));
+    assert.strictEqual(tag('finisher').TrophyName.value, 'Finisher #1');
+    assert.strictEqual(op('speedrunner').params.id, 'minecraft:skull');
+    assert.strictEqual(tag('speedrunner').display.value.Name.value, 'Speedrunner #1');
+    for (const k of ['m2', 'finisher', 'speedrunner']) assert.strictEqual(progress[pid(A)].rewards[k].state, 'queued');
+
+    const rewards = progress[pid(A)].rewards;
+    opsById[rewards.m2.opId] = { _id: rewards.m2.opId, state: 'completed', result: { data: { given: 1 } } };
+    opsById[rewards.finisher.opId] = { _id: rewards.finisher.opId, state: 'completed', result: { data: { given: 1 } } };
+    opsById[rewards.speedrunner.opId] = { _id: rewards.speedrunner.opId, state: 'expired', result: null };
+    await reader.finisherPass(OPTIONS, START + DAY + 3600e3);
+    assert.strictEqual(progress[pid(A)].rewards.m2.state, 'delivered');
+    assert.strictEqual(progress[pid(A)].rewards.finisher.state, 'delivered');
+    assert.strictEqual(progress[pid(A)].rewards.speedrunner.state, 'failed');
+    assert.strictEqual(progress[pid(A)].rewards.speedrunner.opState, 'expired');
+});
+
+test('count: a milestone or finisher change recounts an unchanged file, a reward change does not', async () => {
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    assert.strictEqual(progress[pid(A)].milestoneAt, undefined);
+
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
+    await reader.countPass(OPTIONS, START + DAY + 1);
+    assert.strictEqual(downloads.length, 2);
+    assert.deepStrictEqual(progress[pid(A)].milestoneAt, { m2: new Date(START + 2000) });
+
+    ev.milestones[0].reward = { id: 'minecraft:diamond' };
+    await reader.countPass(OPTIONS, START + DAY + 2);
+    assert.strictEqual(downloads.length, 2, 'the reward is no count input');
+
+    ev.finisher = { reward: CAKE };
+    await reader.countPass(OPTIONS, START + DAY + 3);
+    assert.strictEqual(downloads.length, 3);
+    assert.deepStrictEqual(progress[pid(A)].finishedAt, new Date(START + 2000));
+});
+
+test('count: a new exclusion drops milestoneAt and finishedAt', async () => {
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
+    ev.finisher = { reward: CAKE };
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    assert.ok(progress[pid(A)].milestoneAt.m2 && progress[pid(A)].finishedAt);
+    ev.excluded = [A];
+    await reader.countPass(OPTIONS, START + DAY + 1);
+    assert.strictEqual(progress[pid(A)].total, 0);
+    assert.ok(!('milestoneAt' in progress[pid(A)]));
+    assert.ok(!('finishedAt' in progress[pid(A)]));
+});
+
+test('no milestones or finisher: the same count key, reward keys, docs and numbers as before', async () => {
+    const sched = questProgress.schedule(ev);
+    assert.strictEqual(reader.countKey(ev, sched),
+        JSON.stringify({ startAt: START, endAt: START + 2 * WEEK, weekMs: WEEK, minQuests: 2, excluded: [] }));
+    assert.deepStrictEqual(reader.rewardKeys(ev, sched), ['founder', 'week0', 'week1']);
+
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    assert.deepStrictEqual(Object.keys(progress[pid(A)]).sort(),
+        ['_id', 'eventId', 'firstAt', 'founderAt', 'founderNo', 'rewards', 'total', 'updatedAt', 'uuid', 'weeks']);
+    assert.deepStrictEqual(Object.keys(progress[pid(A)].rewards), ['founder']);
+    assert.deepStrictEqual(milestoneIncs, []);
+    assert.strictEqual(finisherIncs, 0);
+    assert.ok(!('milestoneSeq' in ev) && !('finisherSeq' in ev));
+
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
+    ev.finisher = { reward: CAKE };
+    assert.deepStrictEqual(reader.rewardKeys(ev, sched), ['founder', 'week0', 'week1', 'm2', 'finisher', 'speedrunner']);
 });

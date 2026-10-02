@@ -3,8 +3,9 @@
  * Project: valhalla-updater
  * -----
  * Turns a quest event reward spec into `give_item` params for a 1.12.2 backend.
- * The spec lives on the event doc (`founder.reward`, `weeklyReward`), so staff can
- * change an item without a deploy. Text fields take `{n}` (founder number) and
+ * The spec lives on the event doc (`founder.reward`, `weeklyReward`, `milestones[].reward`,
+ * `finisher.reward`, `finisher.firstReward`), so staff can change an item without a
+ * deploy. Text fields take `{n}` (the founder, milestone or finisher number) and
  * `{week}` (week number, from 1).
  *
  * Spec shape:

@@ -1995,6 +1995,46 @@ module.exports = {
     },
 
     /**
+     * Takes the next number for one milestone. Each milestone has its own atomic `$inc`
+     * on `milestoneSeq.<key>`.
+     * @param {string} eventId The event `_id`.
+     * @param {string} key The milestone key.
+     * @returns {Promise<number|null>} The new `milestoneSeq.<key>`, or null when the event is gone.
+     */
+    nextMilestoneNo: async function (eventId, key) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const doc = await mongoClient
+            .db('bifrost')
+            .collection('quest_events')
+            .findOneAndUpdate({ _id: eventId }, { $inc: { [`milestoneSeq.${key}`]: 1 } },
+                { returnDocument: 'after', projection: { milestoneSeq: 1 } });
+        return doc && doc.milestoneSeq ? doc.milestoneSeq[key] : null;
+    },
+
+    /**
+     * Takes the next finisher number. The `$inc` on `finisherSeq` is atomic.
+     * @param {string} eventId The event `_id`.
+     * @returns {Promise<number|null>} The new `finisherSeq`, or null when the event is gone.
+     */
+    nextFinisherNo: async function (eventId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const doc = await mongoClient
+            .db('bifrost')
+            .collection('quest_events')
+            .findOneAndUpdate({ _id: eventId }, { $inc: { finisherSeq: 1 } },
+                { returnDocument: 'after', projection: { finisherSeq: 1 } });
+        return doc ? doc.finisherSeq : null;
+    },
+
+    /**
      * Records a closed week. The filter matches only while that week is not in the list,
      * so a week closes once.
      * @param {string} eventId The event `_id`.
@@ -2033,10 +2073,12 @@ module.exports = {
 
     /**
      * Writes fresh counts. A new doc starts with no founder number and no rewards; an
-     * existing doc keeps both.
+     * existing doc keeps both, and its milestone and finisher numbers too.
      * @param {string} eventId The event `_id`.
-     * @param {object[]} rows `{uuid, total, weeks, firstAt, founderAt}`, times in ms.
-     * @param {string[]} cleared Uuids that no longer count. Their numbers go to zero.
+     * @param {object[]} rows `{uuid, total, weeks, firstAt, founderAt, milestoneAt?, finishedAt?}`,
+     *     times in ms. A row without `milestoneAt` or `finishedAt` leaves that field alone.
+     * @param {string[]} cleared Uuids that no longer count. Their numbers go to zero, and
+     *     `milestoneAt` and `finishedAt` go away.
      * @param {Date} now The write time.
      * @returns {Promise<object|null>} The bulkWrite result, or null with nothing to write.
      */
@@ -2053,29 +2095,38 @@ module.exports = {
 
     /** The bulkWrite ops of `writeQuestEventProgress`. Pure, so tests can read them. */
     questProgressOps: function (eventId, rows, cleared, now) {
-        const ops = rows.map(row => ({
-            updateOne: {
-                filter: { _id: `${eventId}:${row.uuid}` },
-                update: {
-                    $set: {
-                        eventId: eventId,
-                        uuid: row.uuid,
-                        total: row.total,
-                        weeks: row.weeks,
-                        firstAt: row.firstAt === null ? null : new Date(row.firstAt),
-                        founderAt: row.founderAt === null ? null : new Date(row.founderAt),
-                        updatedAt: now
-                    },
-                    $setOnInsert: { founderNo: null, rewards: {} }
-                },
-                upsert: true
+        const ops = rows.map(row => {
+            const set = {
+                eventId: eventId,
+                uuid: row.uuid,
+                total: row.total,
+                weeks: row.weeks,
+                firstAt: row.firstAt === null ? null : new Date(row.firstAt),
+                founderAt: row.founderAt === null ? null : new Date(row.founderAt)
+            };
+            if (row.milestoneAt !== undefined) {
+                set.milestoneAt = Object.fromEntries(Object.entries(row.milestoneAt).map(([key, at]) => [key, new Date(at)]));
             }
-        }));
+            if (row.finishedAt !== undefined) {
+                set.finishedAt = row.finishedAt === null ? null : new Date(row.finishedAt);
+            }
+            set.updatedAt = now;
+            return {
+                updateOne: {
+                    filter: { _id: `${eventId}:${row.uuid}` },
+                    update: { $set: set, $setOnInsert: { founderNo: null, rewards: {} } },
+                    upsert: true
+                }
+            };
+        });
         for (const uuid of cleared) {
             ops.push({
                 updateOne: {
                     filter: { _id: `${eventId}:${uuid}` },
-                    update: { $set: { total: 0, weeks: {}, firstAt: null, founderAt: null, updatedAt: now } }
+                    update: {
+                        $set: { total: 0, weeks: {}, firstAt: null, founderAt: null, updatedAt: now },
+                        $unset: { milestoneAt: '', finishedAt: '' }
+                    }
                 }
             });
         }
@@ -2105,6 +2156,54 @@ module.exports = {
     },
 
     /**
+     * Gives a player their number for one milestone and a pending reward under the same
+     * key. The filter matches only while `milestoneNo.<key>` is unset, so a player gets
+     * one number per milestone at most.
+     * @param {string} eventId The event `_id`.
+     * @param {string} uuid Dashed uuid.
+     * @param {string} key The milestone key.
+     * @param {number} milestoneNo The number from `nextMilestoneNo`.
+     * @param {object} reward The `rewards.<key>` record.
+     * @returns {Promise<object>} The updateOne result. `matchedCount` 0 means the number is unused.
+     */
+    setQuestEventMilestoneNo: async function (eventId, uuid, key, milestoneNo, reward) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .updateOne({ _id: `${eventId}:${uuid}`, [`milestoneNo.${key}`]: null },
+                { $set: { [`milestoneNo.${key}`]: milestoneNo, [`rewards.${key}`]: reward, updatedAt: new Date() } });
+    },
+
+    /**
+     * Gives a player their finisher number and the pending rewards that go with it, in
+     * one write. The filter matches only while `finisherNo` is unset, so a player gets
+     * one number at most.
+     * @param {string} eventId The event `_id`.
+     * @param {string} uuid Dashed uuid.
+     * @param {number} finisherNo The number from `nextFinisherNo`.
+     * @param {object} rewards Records by key: `finisher`, and `speedrunner` for the first finishers.
+     * @returns {Promise<object>} The updateOne result. `matchedCount` 0 means the number is unused.
+     */
+    setQuestEventFinisherNo: async function (eventId, uuid, finisherNo, rewards) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const set = { finisherNo: finisherNo, updatedAt: new Date() };
+        for (const [key, reward] of Object.entries(rewards)) set[`rewards.${key}`] = reward;
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .updateOne({ _id: `${eventId}:${uuid}`, finisherNo: null }, { $set: set });
+    },
+
+    /**
      * Adds a reward record, but only when the player has none under that key yet.
      * @param {string} eventId The event `_id`.
      * @param {string} uuid Dashed uuid.
@@ -2129,7 +2228,7 @@ module.exports = {
      * Replaces one reward record (queued, delivered, failed).
      * @param {string} eventId The event `_id`.
      * @param {string} uuid Dashed uuid.
-     * @param {string} key `founder` or `week<index>`.
+     * @param {string} key `founder`, `week<index>`, a milestone key, `finisher` or `speedrunner`.
      * @param {object} reward The record.
      * @returns {Promise<object>} The updateOne result.
      */
