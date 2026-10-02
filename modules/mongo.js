@@ -1941,6 +1941,294 @@ module.exports = {
         discordLinkIndexesEnsured = allOk;
     },
 
+    // Quest events (bifrost.quest_events, quest_event_progress, pack_completions).
+    // schedulers/questEventReader.js counts BetterQuesting completions off the panel and
+    // writes them here. The proxy shows them and writes only `quest_events.excluded`.
+    /**
+     * Every quest event doc.
+     * @returns {Promise<object[]>} bifrost.quest_events docs.
+     */
+    listQuestEvents: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient.db('bifrost').collection('quest_events').find({}).toArray();
+    },
+
+    /**
+     * Sets fields on one quest event.
+     * @param {string} eventId The event `_id`.
+     * @param {object} fields `$set` paths and values.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    updateQuestEvent: async function (eventId, fields) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_events')
+            .updateOne({ _id: eventId }, { $set: fields });
+    },
+
+    /**
+     * Takes the next founder number. The `$inc` is atomic, so two callers never get one number.
+     * @param {string} eventId The event `_id`.
+     * @returns {Promise<number|null>} The new `founderSeq`, or null when the event is gone.
+     */
+    nextFounderNo: async function (eventId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const doc = await mongoClient
+            .db('bifrost')
+            .collection('quest_events')
+            .findOneAndUpdate({ _id: eventId }, { $inc: { founderSeq: 1 } },
+                { returnDocument: 'after', projection: { founderSeq: 1 } });
+        return doc ? doc.founderSeq : null;
+    },
+
+    /**
+     * Records a closed week. The filter matches only while that week is not in the list,
+     * so a week closes once.
+     * @param {string} eventId The event `_id`.
+     * @param {object} entry `{index, count, target, met, recipients, closedAt}`.
+     * @returns {Promise<object>} The updateOne result. `modifiedCount` 0 means it was closed already.
+     */
+    closeQuestEventWeek: async function (eventId, entry) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_events')
+            .updateOne({ _id: eventId, 'closedWeeks.index': { $ne: entry.index } }, { $push: { closedWeeks: entry } });
+    },
+
+    /**
+     * Every progress doc of one event.
+     * @param {string} eventId The event `_id`.
+     * @returns {Promise<object[]>} bifrost.quest_event_progress docs.
+     */
+    getQuestEventProgress: async function (eventId) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .find({ eventId: eventId })
+            .toArray();
+    },
+
+    /**
+     * Writes fresh counts. A new doc starts with no founder number and no rewards; an
+     * existing doc keeps both.
+     * @param {string} eventId The event `_id`.
+     * @param {object[]} rows `{uuid, total, weeks, firstAt, founderAt}`, times in ms.
+     * @param {string[]} cleared Uuids that no longer count. Their numbers go to zero.
+     * @param {Date} now The write time.
+     * @returns {Promise<object|null>} The bulkWrite result, or null with nothing to write.
+     */
+    writeQuestEventProgress: async function (eventId, rows, cleared, now) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const ops = module.exports.questProgressOps(eventId, rows, cleared, now);
+        if (ops.length === 0) return null;
+        return mongoClient.db('bifrost').collection('quest_event_progress').bulkWrite(ops);
+    },
+
+    /** The bulkWrite ops of `writeQuestEventProgress`. Pure, so tests can read them. */
+    questProgressOps: function (eventId, rows, cleared, now) {
+        const ops = rows.map(row => ({
+            updateOne: {
+                filter: { _id: `${eventId}:${row.uuid}` },
+                update: {
+                    $set: {
+                        eventId: eventId,
+                        uuid: row.uuid,
+                        total: row.total,
+                        weeks: row.weeks,
+                        firstAt: row.firstAt === null ? null : new Date(row.firstAt),
+                        founderAt: row.founderAt === null ? null : new Date(row.founderAt),
+                        updatedAt: now
+                    },
+                    $setOnInsert: { founderNo: null, rewards: {} }
+                },
+                upsert: true
+            }
+        }));
+        for (const uuid of cleared) {
+            ops.push({
+                updateOne: {
+                    filter: { _id: `${eventId}:${uuid}` },
+                    update: { $set: { total: 0, weeks: {}, firstAt: null, founderAt: null, updatedAt: now } }
+                }
+            });
+        }
+        return ops;
+    },
+
+    /**
+     * Gives a player their founder number and a pending founder reward. The filter matches
+     * only while the doc has no number, so a player gets one number at most.
+     * @param {string} eventId The event `_id`.
+     * @param {string} uuid Dashed uuid.
+     * @param {number} founderNo The number from `nextFounderNo`.
+     * @param {object} reward The `rewards.founder` record.
+     * @returns {Promise<object>} The updateOne result. `matchedCount` 0 means the number is unused.
+     */
+    setQuestEventFounderNo: async function (eventId, uuid, founderNo, reward) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .updateOne({ _id: `${eventId}:${uuid}`, founderNo: null },
+                { $set: { founderNo: founderNo, 'rewards.founder': reward, updatedAt: new Date() } });
+    },
+
+    /**
+     * Adds a reward record, but only when the player has none under that key yet.
+     * @param {string} eventId The event `_id`.
+     * @param {string} uuid Dashed uuid.
+     * @param {string} key `founder` or `week<index>`.
+     * @param {object} reward The record.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    addQuestEventReward: async function (eventId, uuid, key, reward) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .updateOne({ _id: `${eventId}:${uuid}`, [`rewards.${key}`]: { $exists: false } },
+                { $set: { [`rewards.${key}`]: reward, updatedAt: new Date() } });
+    },
+
+    /**
+     * Replaces one reward record (queued, delivered, failed).
+     * @param {string} eventId The event `_id`.
+     * @param {string} uuid Dashed uuid.
+     * @param {string} key `founder` or `week<index>`.
+     * @param {object} reward The record.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    setQuestEventReward: async function (eventId, uuid, key, reward) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .updateOne({ _id: `${eventId}:${uuid}` },
+                { $set: { [`rewards.${key}`]: reward, updatedAt: new Date() } });
+    },
+
+    /**
+     * The progress docs with at least one reward in `state` under any of `keys`.
+     * @param {string} eventId The event `_id`.
+     * @param {string[]} keys Reward keys to look at.
+     * @param {string} state `pending` or `queued`.
+     * @returns {Promise<object[]>} bifrost.quest_event_progress docs.
+     */
+    findQuestEventRewards: async function (eventId, keys, state) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        if (keys.length === 0) return [];
+        return mongoClient
+            .db('bifrost')
+            .collection('quest_event_progress')
+            .find({ eventId: eventId, $or: keys.map(key => ({ [`rewards.${key}.state`]: state })) })
+            .toArray();
+    },
+
+    /**
+     * Records pack finishers. A doc keeps the EARLIEST time over every server and every
+     * run: the insert sets it, and a later run only moves it back.
+     * @param {string} tag Pack tag.
+     * @param {string} serverId Pterodactyl id the file came from.
+     * @param {number} questId The final quest.
+     * @param {{uuid: string, at: number}[]} list Finishers, times in ms.
+     * @returns {Promise<object|null>} The bulkWrite result, or null with nothing to write.
+     */
+    upsertPackCompletions: async function (tag, serverId, questId, list) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const ops = module.exports.packCompletionOps(tag, serverId, questId, list);
+        if (ops.length === 0) return null;
+        return mongoClient.db('bifrost').collection('pack_completions').bulkWrite(ops);
+    },
+
+    /** The bulkWrite ops of `upsertPackCompletions`. Pure, so tests can read them. */
+    packCompletionOps: function (tag, serverId, questId, list) {
+        const ops = [];
+        for (const { uuid, at } of list) {
+            const _id = `${tag}:${uuid}`;
+            const when = new Date(at);
+            ops.push({
+                updateOne: {
+                    filter: { _id },
+                    update: { $setOnInsert: { tag, uuid, questId, at: when, serverId } },
+                    upsert: true
+                }
+            });
+            ops.push({
+                updateOne: {
+                    filter: { _id, at: { $gt: when } },
+                    update: { $set: { at: when, serverId, questId } }
+                }
+            });
+        }
+        return ops;
+    },
+
+    /**
+     * Usernames for a set of uuids, from bifrost.players.
+     * @param {string[]} uuids Dashed uuids.
+     * @returns {Promise<Map<string, string>>} uuid to username. Unknown uuids are left out.
+     */
+    getBifrostUsernames: async function (uuids) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const docs = await mongoClient
+            .db('bifrost')
+            .collection('players')
+            .find({ uuid: { $in: uuids.map(String) } }, { projection: { _id: 0, uuid: 1, username: 1 } })
+            .toArray();
+        return new Map(docs.filter(d => d.username).map(d => [String(d.uuid).toLowerCase(), d.username]));
+    },
+
     /**
      * Gets the main MongoDB client (for advanced queries).
      * @returns {MongoClient} The main MongoDB client
