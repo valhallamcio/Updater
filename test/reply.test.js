@@ -256,6 +256,28 @@ test('/reply report:#tail sends the mail, then closes that report with the text 
     assert.match(it.replies[0], /\n✅ Report #2c4a87 is closed\./);
 });
 
+test('/reply report: a matched report tags the mail with meta.report; a foreign or unknown id does not', async () => {
+    const it = interaction({ player: 'Alp', text: 'Your items are restored.', report: '#2c4a87' });
+    await command.execute(it);
+    assert.strictEqual(inserted[0].meta.report, OWN_ID, 'the full id, as a string, set before the insert');
+    assert.strictEqual(inserted[0].meta.via, 'discord');
+
+    inserted = [];
+    await command.execute(interaction({ player: 'Alp', text: 'hello', report: 'b7c001' }));
+    assert.strictEqual(inserted[0].meta.report, '66f3a0b1c2d3e4f5a6b7c001', 'a closed report still gets the answer tagged');
+
+    for (const report of ['d00d11', 'ffffff', 'not-an-id']) {
+        inserted = [];
+        await command.execute(interaction({ player: 'Alp', text: 'hello', report }));
+        assert.strictEqual(inserted.length, 1, `${report}: the mail is sent`);
+        assert.strictEqual(inserted[0].meta.report, undefined, `${report}: no tag`);
+    }
+
+    inserted = [];
+    await command.execute(interaction({ player: 'Alp', text: 'hello' }));
+    assert.strictEqual(inserted[0].meta.report, undefined, 'no report option, no tag');
+});
+
 test('/reply report: the bare tail and the full ObjectId close it too', async () => {
     for (const report of ['2c4a87', OWN_ID]) {
         reports[0].status = 'open';

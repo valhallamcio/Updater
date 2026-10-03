@@ -5,11 +5,12 @@
  * stream delivers it inline when they are online, otherwise it waits in their inbox and
  * they read it with /mail on their next login. Staff-only.
  *
- * With `report` (the id from the report embed), the mail goes out first. Then that report
- * in bifrost.reports is closed the way the proxy's `/reports close <id> <note>` closes it,
- * with the text as the note. The player reads it under the report in `/report list`. Only
- * a report the player filed is closed. For any other id the mail still goes out and the
- * reply says why the report stayed open.
+ * With `report` (the id from the report embed), the player's own report is looked up first.
+ * A match tags the mail with `meta.report` (the full report id), so the proxy shows it as the
+ * answer to that report, with a Reply button. Then the mail goes out, and the report in
+ * bifrost.reports is closed the way the proxy's `/reports close <id> <note>` closes it, with
+ * the text as the note. Only a report the player filed is closed. For any other id the mail
+ * still goes out untagged and the reply says why the report stayed open.
  */
 
 const { SlashCommandBuilder } = require('discord.js');
@@ -21,44 +22,57 @@ const {
 } = require('./util/reportClose');
 
 /**
- * Closes the player's report `raw` with the mail text. Never throws: the mail is out already.
+ * Finds the player's own report that `raw` names. Never throws.
  * @param {object} identity The player's bifrost.players doc.
  * @param {string} raw The `report` option.
- * @param {object} mail The mail doc that went out.
- * @returns {Promise<string>} The line for the staff reply.
+ * @param {string} name The player's name, for the staff line.
+ * @returns {Promise<{found: object}|{line: string}>} The report, or the line that says why not.
  */
-async function answerReport(identity, raw, mail) {
-    const name = mail.toName;
+async function findOwnReport(identity, raw, name) {
     const parsed = parseReportId(raw);
     if (!parsed.ok) {
-        return '⚠️ Report not updated: that is not a report id. Use the 6-character id from the report embed.';
+        return { line: '⚠️ Report not updated: that is not a report id. Use the 6-character id from the report embed.' };
     }
     const want = parsed.id;
     try {
         const own = await mongo.findReportIdsOf(identity.uuid, ID_SCAN_LIMIT);
         const hits = own.filter(doc => idMatches(doc._id, want));
         if (hits.length > 1) {
-            return `⚠️ Report not updated: #${want} fits more than one report from **${name}**. Type more of the id.`;
+            return { line: `⚠️ Report not updated: #${want} fits more than one report from **${name}**. Type more of the id.` };
         }
-        if (hits.length === 0) {
-            const others = await mongo.findRecentReportIds(ID_SCAN_LIMIT);
-            const owners = [...new Set(others
-                .filter(doc => idMatches(doc._id, want) && !(doc.reporter && doc.reporter.uuid === identity.uuid))
-                .map(doc => (doc.reporter && doc.reporter.username) || 'another player'))];
-            if (owners.length > 0) {
-                return `⚠️ Report not updated: #${want} belongs to **${owners.join(', ')}**. Only a report from **${name}** takes this reply.`;
-            }
-            return `⚠️ Report not updated: **${name}** has no report #${want}.`;
+        if (hits.length === 1) return { found: hits[0] };
+        const others = await mongo.findRecentReportIds(ID_SCAN_LIMIT);
+        const owners = [...new Set(others
+            .filter(doc => idMatches(doc._id, want) && !(doc.reporter && doc.reporter.uuid === identity.uuid))
+            .map(doc => (doc.reporter && doc.reporter.username) || 'another player'))];
+        if (owners.length > 0) {
+            return { line: `⚠️ Report not updated: #${want} belongs to **${owners.join(', ')}**. Only a report from **${name}** takes this reply.` };
         }
-        const found = hits[0];
-        const id = shortId(found._id);
+        return { line: `⚠️ Report not updated: **${name}** has no report #${want}.` };
+    } catch (error) {
+        sessionLogger.error('Reply', `Could not read report ${want} for ${identity.uuid}`, error.message);
+        return { line: '⚠️ Report not updated: the database did not answer. Close it in game with /reports close.' };
+    }
+}
+
+/**
+ * Closes the player's report with the mail text. Never throws: the mail is out already.
+ * @param {object} identity The player's bifrost.players doc.
+ * @param {object} found The report from findOwnReport.
+ * @param {object} mail The mail doc that went out.
+ * @returns {Promise<string>} The line for the staff reply.
+ */
+async function answerReport(identity, found, mail) {
+    const name = mail.toName;
+    const id = shortId(found._id);
+    try {
         if (found.status === 'closed') return `⚠️ Report not updated: #${id} is already closed.`;
         const res = await mongo.closeReport(found._id, identity.uuid,
             buildReportClose({ staffName: mail.from.name, text: mail.body, now: mail.sentAt }));
         if (!res || !res.matchedCount) return `⚠️ Report not updated: #${id} is already closed.`;
         return `✅ Report #${id} is closed. **${name}** sees this text as the answer in /report list.`;
     } catch (error) {
-        sessionLogger.error('Reply', `Could not close report ${want} for ${identity.uuid}`, error.message);
+        sessionLogger.error('Reply', `Could not close report ${id} for ${identity.uuid}`, error.message);
         return '⚠️ Report not updated: the database did not answer. Close it in game with /reports close.';
     }
 }
@@ -134,12 +148,18 @@ module.exports = {
             return;
         }
 
+        // The report is looked up before the insert: the proxy delivers the mail the moment it
+        // lands, and `meta.report` is what makes it show as an answer with a Reply button.
+        const target = parseReportId(report) === null ? null : await findOwnReport(identity, report, built.doc.toName);
+        if (target && target.found) built.doc.meta.report = String(target.found._id);
+
         await mongo.insertMail(built.doc);
         const sent = `✅ Sent — **${built.doc.toName}** sees it in game (now if online, else at next login).`;
-        if (parseReportId(report) === null) {
+        if (!target) {
             await interaction.editReply(sent);
             return;
         }
-        await interaction.editReply(`${sent}\n${await answerReport(identity, report, built.doc)}`);
+        const line = target.found ? await answerReport(identity, target.found, built.doc) : target.line;
+        await interaction.editReply(`${sent}\n${line}`);
     },
 };
