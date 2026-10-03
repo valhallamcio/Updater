@@ -91,6 +91,8 @@ web_modules/
 .env.test.local
 .env.production.local
 .env.local
+# backups and variants (.env-pre-investigate.bak) hold the same tokens
+.env*
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

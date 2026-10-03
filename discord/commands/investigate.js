@@ -151,7 +151,7 @@ module.exports = {
             );
         } else if (focusedOption.name === 'server') {
             const focusedValue = focusedOption.value;
-            const serverList = await yggdrasil.getServers();
+            const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
             const choices = [];
 
             for (const server of serverList) {

@@ -18,7 +18,8 @@ module.exports = {
                     !line.includes('Aprils_Fool')) {
                     // Extract just the filename without any URL prefixes that might be in the raw listing
                     const fileName = line.trim().split('/').pop();
-                    const url = `http://downloads.gtnewhorizons.com/ServerPacks/${fileName}`;
+                    // https: over plain http anyone on the path could swap the jars we deploy
+                    const url = `https://downloads.gtnewhorizons.com/ServerPacks/${fileName}`;
                     versions.push(url);
                 }
             }

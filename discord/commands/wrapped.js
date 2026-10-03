@@ -94,21 +94,18 @@ module.exports = {
         const userId = interaction.user.id;
         const targetUsername = interaction.options.getString('username');
         
-        // Check cooldown
-        if (!targetUsername) {
-            const lastUsed = cooldowns.get(userId) || 0;
-            const remaining = COOLDOWN_MS - (Date.now() - lastUsed);
-            
-            if (remaining > 0) {
-                return interaction.reply({
-                    content: `Please wait **${Math.ceil(remaining / 1000)} seconds** before using this command again.`,
-                    ephemeral: false
-                });
-            }
-            
-            // Set cooldown
-            cooldowns.set(userId, Date.now());
+        // Lookups scan the whole stats snapshot too, so they count against the cooldown as well
+        const lastUsed = cooldowns.get(userId) || 0;
+        const remaining = COOLDOWN_MS - (Date.now() - lastUsed);
+
+        if (remaining > 0) {
+            return interaction.reply({
+                content: `Please wait **${Math.ceil(remaining / 1000)} seconds** before using this command again.`,
+                ephemeral: false
+            });
         }
+
+        cooldowns.set(userId, Date.now());
         
         // Defer reply as this will take time
         await interaction.deferReply({ ephemeral: false });
@@ -129,6 +126,7 @@ module.exports = {
                 if (!player) {
                     return interaction.editReply({
                         content: `Could not find a player named **${targetUsername}** in the database.`,
+                        allowedMentions: { parse: [] }
                     });
                 }
                 

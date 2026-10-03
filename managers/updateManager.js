@@ -478,6 +478,31 @@ async function mergeAndDeployInstance(pack, serverId, options) {
     };
 }
 
+/**
+ * pack.tag names the scratch and vault folders, and every run starts with safeRm(`./<tag>`).
+ * An empty, dotted or slashed tag in a server doc would point that at the repo or above it.
+ * @param {object} pack Server doc.
+ * @throws If the tag is not a plain folder name.
+ */
+function assertSafeTag(pack) {
+    if (typeof pack.tag !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(pack.tag)) {
+        throw new Error(`refusing to work on server tag ${JSON.stringify(pack.tag)}`);
+    }
+}
+
+/**
+ * Mentions an update announcement may ping: the pack's own role and nothing else, so a
+ * mention smuggled into a version or pack name from upstream stays plain text.
+ * @param {object} pack Server doc.
+ * @returns {object} allowedMentions for the webhook.
+ */
+function announcementMentions(pack) {
+    return {
+        parse: [],
+        roles: pack.discordRoleId ? [String(pack.discordRoleId)] : []
+    };
+}
+
 module.exports = {
 
     // Exposed for test/multiInstance.test.js - these decide whether live server files
@@ -505,6 +530,7 @@ module.exports = {
      */
 
     updateCF: async function (pack, versionOverride, interaction, serverIds = null) {
+        assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
         const protectedFiles = perInstanceFiles.forTag(pack.tag);
@@ -714,6 +740,7 @@ module.exports = {
 
         const updateWebhook = {
             content: updateMessageContent,
+            allowedMentions: announcementMentions(pack),
             username: pack.name,
             avatarURL: packData.logo.url,
         };
@@ -737,6 +764,7 @@ module.exports = {
      * @param {object} interaction Object with the interaction data.(for Discord)
      */
     updateFTB: async function (pack, versionOverride, interaction, serverIds = null) {
+        assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
         const protectedFiles = perInstanceFiles.forTag(pack.tag);
@@ -896,6 +924,7 @@ module.exports = {
 
         const updateWebhook = {
             content: updateMessageContent,
+            allowedMentions: announcementMentions(pack),
             username: pack.name,
             avatarURL: packData.art[0].url,
         };
@@ -919,6 +948,7 @@ module.exports = {
      * @param {object} interaction Object containing the interaction data. (for Discord)
      */
     restore: async function (pack, backup, interaction, serverIds = null) {
+        assertSafeTag(pack);
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
 
         let restoredPackData = backup.match(/^.+?_(.+)_(.+)\.tar\.gz$/);
@@ -1033,6 +1063,7 @@ module.exports = {
      * @param {object} interaction Object with the interaction data (for Discord).
      */
     updateGTNH: async function (pack, versionOverride, interaction, serverIds = null) {
+        assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
         const gtnh = require('../modules/gregtechnewhorizons');
@@ -1304,6 +1335,7 @@ module.exports = {
 
         const updateWebhook = {
             content: updateMessageContent,
+            allowedMentions: announcementMentions(pack),
             username: `${pack.name} Updater`, // Consistent username
             avatarURL: "", // No standard avatar for GTNH packs
         };
@@ -1335,6 +1367,7 @@ module.exports = {
      * @param {Array} serverIds Pterodactyl server ids of all instances sharing the tag.
      */
     updateGTO: async function (pack, versionOverride, interaction, serverIds = null) {
+        assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
         const gto = require('../modules/gregtechodyssey');
@@ -1585,6 +1618,7 @@ module.exports = {
 
         const updateWebhook = {
             content: updateMessageContent,
+            allowedMentions: announcementMentions(pack),
             username: `${pack.name} Updater`,
             avatarURL: "",
         };

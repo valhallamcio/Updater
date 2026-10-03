@@ -638,11 +638,13 @@ module.exports = {
             mainClientConnected = true;
         }
         
+        // Escaped: this comes straight from a public command, and `.*` or a nested quantifier is a pattern
+        const escaped = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const player = await mongoClient
             .db('valhallamc')
             .collection('players')
             .findOne({
-                username: { $regex: new RegExp(`^${username}$`, 'i') }
+                username: { $regex: new RegExp(`^${escaped}$`, 'i') }
             });
 
         return player;

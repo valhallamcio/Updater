@@ -17,9 +17,10 @@ async function init() {
     const { getClient } = require('../discord/bot');
     discordClient = await getClient();
 
+    // No player.list.updated: the embed shows no players (see generateServerStateHash), so each
+    // join and leave only cost a Mongo read and a server list fetch
     const events = [
         'server.state.changed',
-        'player.list.updated',
         'server.crashed',
         'server.recovered',
         'server.crash-loop.started',

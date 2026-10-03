@@ -33,17 +33,17 @@ module.exports = {
         const maxRetries = 5;
         const baseDelay = 5000; // 5 seconds
         
+        // Loaded once, outside the retry loop: each retry added another set of event
+        // listeners, and after one failed login every command ran twice
+        commands.loadCommandFiles(client);
+        sessionLogger.info('DiscordBot', 'Command files loaded');
+
+        events.loadEventFiles(client);
+        sessionLogger.info('DiscordBot', 'Event files loaded');
+
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
-                sessionLogger.info('DiscordBot', `Initializing Discord bot... (Attempt ${attempt}/${maxRetries})`);
-                
-                commands.loadCommandFiles(client);
-                sessionLogger.info('DiscordBot', 'Command files loaded');
-                
-                events.loadEventFiles(client);
-                sessionLogger.info('DiscordBot', 'Event files loaded');
-
-                sessionLogger.info('DiscordBot', 'Connecting to Discord...');
+                sessionLogger.info('DiscordBot', `Connecting to Discord... (Attempt ${attempt}/${maxRetries})`);
                 await client.login(token);
                 sessionLogger.info('DiscordBot', 'Successfully connected to Discord');
                 return; // Success - exit retry loop

@@ -11,14 +11,21 @@
  */
 
 const axios = require('axios');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const {
+    pipeline
+} = require('stream/promises');
 const FormData = require('form-data');
 const progress = require('progress');
 const sessionLogger = require('./sessionLogger');
 
+// A stalled CDN connection must fail the run, not hang it. Idle time, not total time.
+const IDLE_TIMEOUT_MS = 60000;
 
-// Promisify pipeline for better error handling
+// Files fetched at once by downloadList. A big FTB update has hundreds of additions.
+const LIST_CONCURRENCY = 8;
 
 module.exports = {
     /**
@@ -40,7 +47,8 @@ module.exports = {
         } = await axios({
             url: fileUrl,
             method: 'GET',
-            responseType: 'stream'
+            responseType: 'stream',
+            timeout: IDLE_TIMEOUT_MS
         });
 
         const totalLength = parseInt(headers['content-length'], 10);
@@ -96,53 +104,82 @@ module.exports = {
 
     /**
      * Downloads a list of files to the specified destination folder.
+     * The list is an FTB manifest, so every entry is untrusted: its path must stay inside
+     * the folder, its URL must be https, and its bytes must match the manifest's hash.
      * @param {Array} list Array containing the objects of files to be downloaded.
      * @param {string} destinationFolder Path to save the downloaded files.
+     * @throws On the first file that fails; the rest are not started.
      */
     downloadList: async function (list, destinationFolder) {
-        const progressBar = new progress(`Downloading list [:bar] :rate/bps :percent :etas`, {
+        const root = path.resolve(destinationFolder);
+        const queue = list.filter(file => file.clientonly !== true);
+        const progressBar = new progress(`Downloading list [:bar] :current/:total :percent :etas`, {
             width: 40,
             complete: '=',
             incomplete: ' ',
             renderThrottle: 100,
-            total: list.length
+            total: Math.max(queue.length, 1)
         });
-    
-        const downloadPromises = list.map(async (file) => {
-            progressBar.tick(1);
-    
-            if (file.clientonly === true) return;
-    
-            let destinationPath = path.join(destinationFolder, file.path, file.name);
-    
-            if (!fs.existsSync(path.dirname(destinationPath))) {
-                fs.mkdirSync(path.dirname(destinationPath), {
-                    recursive: true
-                });
+
+        const fetchOne = async (file) => {
+            const destinationPath = path.resolve(root, file.path, file.name);
+            if (!destinationPath.startsWith(root + path.sep)) {
+                throw new Error(`manifest entry ${file.path}/${file.name} points outside ${destinationFolder}`);
             }
-    
+
             if (!file.url) {
                 file.url = `https://edge.forgecdn.net/files/${file.curseforge.file.toString().substring(0, 4)}/${file.curseforge.file.toString().substr(4, 7)}/${file.name}`;
             }
-    
-            const writer = fs.createWriteStream(destinationPath);
-            const { data } = await axios({
+            if (new URL(file.url).protocol !== 'https:') {
+                throw new Error(`refusing a non-https download for ${file.name}: ${file.url}`);
+            }
+
+            const expected = file.hashes && file.hashes.sha256 ? ['sha256', file.hashes.sha256]
+                : file.sha1 ? ['sha1', file.sha1] : null;
+            const hash = expected ? crypto.createHash(expected[0]) : null;
+
+            await fs.promises.mkdir(path.dirname(destinationPath), {
+                recursive: true
+            });
+            const {
+                data
+            } = await axios({
                 url: file.url,
                 method: 'GET',
-                responseType: 'stream'
+                responseType: 'stream',
+                timeout: IDLE_TIMEOUT_MS
             });
-    
-            data.pipe(writer);
-    
-            return new Promise((resolve, reject) => {
-                writer.on('finish', resolve);
-                writer.on('error', reject);
-            });
-        });
-    
-        // Wait for all downloads to complete
-        await Promise.all(downloadPromises);
-    
+            await pipeline(data, async function* (source) {
+                for await (const chunk of source) {
+                    if (hash) hash.update(chunk);
+                    yield chunk;
+                }
+            }, fs.createWriteStream(destinationPath));
+
+            if (hash && hash.digest('hex') !== String(expected[1]).toLowerCase()) {
+                fs.rmSync(destinationPath, {
+                    force: true
+                });
+                throw new Error(`${file.name} does not match its ${expected[0]} from the manifest`);
+            }
+            progressBar.tick();
+        };
+
+        let failed = false;
+        const worker = async () => {
+            while (!failed && queue.length > 0) {
+                try {
+                    await fetchOne(queue.shift());
+                } catch (error) {
+                    failed = true;
+                    throw error;
+                }
+            }
+        };
+        await Promise.all(Array.from({
+            length: Math.min(LIST_CONCURRENCY, queue.length)
+        }, worker));
+
         sessionLogger.info('Downloader', `List downloaded successfully`);
     },
 

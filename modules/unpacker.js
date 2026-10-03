@@ -10,7 +10,7 @@
  * Copyright 2024 flaasz
  */
 
-const unpacker = require("unpacker-with-progress");
+const tar = require('tar');
 const progress = require('progress');
 const path = require('path');
 const fs = require('fs');
@@ -54,25 +54,50 @@ module.exports = {
 
     /**
      * Unpacks a tar.gz file into the specified destination path.
-     * @param {string} zip Path to a tar.gz file.
+     * Only plain files and folders come out. A backup holds whatever a panel user or a mod
+     * wrote on the server, and a link in it would make the merge read or write outside the
+     * tree (a link to the bot's .env would be uploaded back to the server). Setuid, setgid
+     * and sticky bits are dropped. strict turns every tar warning into an error, so a bad
+     * archive aborts here, before the deploy wipes anything.
+     * @param {string} archive Path to a tar.gz file.
      * @param {string} destinationPath Path to the destination folder.
-     * @returns 
      */
-    unpack: async function (zip, destinationPath) {
-        const fileSize = fs.statSync(zip).size;
-        const progressBar = new progress(`Unpacking ${path.basename(zip)} [:bar] :rate/bps :percent :etas`, {
+    unpack: async function (archive, destinationPath) {
+        await fs.promises.mkdir(destinationPath, {
+            recursive: true
+        });
+        const progressBar = new progress(`Unpacking ${path.basename(archive)} [:bar] :rate/bps :percent :etas`, {
             width: 40,
             complete: '=',
             incomplete: ' ',
             renderThrottle: 100,
-            total: fileSize
+            total: fs.statSync(archive).size
         });
-        return Promise.all([
-            unpacker(zip, destinationPath, {
-                onprogress(progress) {
-                    progressBar.update(progress.percent);
+        const skipped = [];
+
+        await new Promise((resolve, reject) => {
+            const input = fs.createReadStream(archive);
+            const extract = tar.x({
+                cwd: destinationPath,
+                strict: true,
+                filter: (entryPath, entry) => {
+                    if (!['File', 'OldFile', 'ContiguousFile', 'Directory'].includes(entry.type)) {
+                        skipped.push(entryPath);
+                        return false;
+                    }
+                    if (typeof entry.mode === 'number') entry.mode &= 0o777;
+                    return true;
                 }
-            })
-        ]);
+            });
+            input.on('data', chunk => progressBar.tick(chunk.length));
+            input.on('error', reject);
+            extract.on('error', reject);
+            extract.on('close', resolve);
+            input.pipe(extract);
+        });
+
+        if (skipped.length > 0) {
+            sessionLogger.warn('Unpacker', `Skipped ${skipped.length} link or special entries in ${path.basename(archive)}: ${skipped.slice(0, 10).join(', ')}`);
+        }
     },
 };

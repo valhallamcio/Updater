@@ -72,9 +72,7 @@ module.exports = {
         
         // Start the main monitoring loop
         setInterval(() => this.mainLoop(options), options.interval * 1000);
-        
-        // Run initial check after a short delay
-        setTimeout(() => this.mainLoop(options), options.interval * 1000);
+        // No separate first run: it was a setTimeout of the same interval, so tick one ran twice at once
     },
 
     /**
@@ -191,7 +189,7 @@ module.exports = {
         if (inFlight.has(key)) return; // still executing from a previous tick
         inFlight.add(key);
         try {
-            const servers = await yggdrasil.getServers();
+            const servers = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
             const found = findServer(servers, serverName);
             const server = found ? found.server : null;
 

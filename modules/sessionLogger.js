@@ -1,6 +1,26 @@
 const fs = require('fs');
 const path = require('path');
-const moment = require('moment');
+
+const pad = n => String(n).padStart(2, '0');
+/** Local date as YYYY-MM-DD. */
+const day = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+/** Local time as HH:mm:ss. */
+const clock = (d = new Date()) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+/**
+ * Rough length of a duration, for the session end line.
+ * @param {number} ms Duration in milliseconds.
+ * @returns {string} For example "3 hours".
+ */
+function humanize(ms) {
+    for (const [unit, size] of [['day', 86400000], ['hour', 3600000], ['minute', 60000]]) {
+        if (ms >= size) {
+            const n = Math.round(ms / size);
+            return `${n} ${unit}${n === 1 ? '' : 's'}`;
+        }
+    }
+    return 'a few seconds';
+}
 
 class CircularBuffer {
     constructor(size) {
@@ -77,7 +97,7 @@ class SessionLogger {
         try {
             if (fs.existsSync(latestLogPath)) {
                 const stats = fs.statSync(latestLogPath);
-                const date = moment(stats.mtime).format('YYYY-MM-DD');
+                const date = day(stats.mtime);
                 
                 // Find next available session number for today
                 let sessionNum = 1;
@@ -135,7 +155,7 @@ class SessionLogger {
     }
 
     formatLogEntry(level, source, message, ...args) {
-        const timestamp = moment().format('HH:mm:ss');
+        const timestamp = clock();
         const formattedArgs = args.length > 0 ? ' ' + args.map(arg => {
             if (arg instanceof Error) return `${arg.message}\n${arg.stack}`;
             if (typeof arg === 'object') return JSON.stringify(arg);
@@ -195,7 +215,8 @@ class SessionLogger {
         if (this.isWriting || this.writeQueue.length === 0) return;
         
         this.isWriting = true;
-        const entries = this.writeQueue.splice(0, 100); // Process up to 100 entries at once
+        // Everything queued goes in one append. A cap of 100 per 100ms let a burst outgrow the writer.
+        const entries = this.writeQueue.splice(0);
         const data = entries.join('');
         
         this.writeToFile(data).finally(() => {
@@ -204,12 +225,12 @@ class SessionLogger {
     }
 
     async writeToFile(data) {
+        // No /tmp fallback: any local user can plant a link at a fixed /tmp name and have the log appended to its target.
         const writeLocations = [
             path.join(process.cwd(), 'logs', 'latest.log'),
-            path.join(process.cwd(), 'latest.log'),
-            path.join('/tmp', 'valhalla-latest.log'),
-            path.join(process.env.HOME || '/tmp', 'valhalla-latest.log')
+            path.join(process.cwd(), 'latest.log')
         ];
+        if (process.env.HOME) writeLocations.push(path.join(process.env.HOME, 'valhalla-latest.log'));
 
         for (const location of writeLocations) {
             try {
@@ -259,7 +280,7 @@ class SessionLogger {
 
     logSessionEnd() {
         const sessionInfo = this.getSessionInfo();
-        const duration = moment.duration(sessionInfo.duration).humanize();
+        const duration = humanize(sessionInfo.duration);
         
         this.info('SessionLogger', '='.repeat(60));
         this.info('SessionLogger', `Session ended after ${duration}`);
@@ -316,19 +337,21 @@ class SessionLogger {
 
     setupLogRetention() {
         // Clean up old log files daily at 3 AM
-        const cleanupTime = moment().startOf('day').add(3, 'hours');
-        if (cleanupTime.isBefore(moment())) {
-            cleanupTime.add(1, 'day');
+        const now = new Date();
+        const cleanupTime = new Date(now);
+        cleanupTime.setHours(3, 0, 0, 0);
+        if (cleanupTime < now) {
+            cleanupTime.setDate(cleanupTime.getDate() + 1);
         }
-        
-        const msUntilCleanup = cleanupTime.diff(moment());
+
+        const msUntilCleanup = cleanupTime - now;
         setTimeout(() => {
             this.cleanupOldLogs();
             // Set up daily cleanup
             setInterval(() => this.cleanupOldLogs(), 24 * 60 * 60 * 1000);
         }, msUntilCleanup);
         
-        this.info('SessionLogger', `Log cleanup scheduled for ${cleanupTime.format('YYYY-MM-DD HH:mm:ss')}`);
+        this.info('SessionLogger', `Log cleanup scheduled for ${day(cleanupTime)} ${clock(cleanupTime)}`);
     }
 
     cleanupOldLogs() {
@@ -336,9 +359,9 @@ class SessionLogger {
             const logsDir = path.join(process.cwd(), 'logs');
             const crashLogsDir = path.join(process.cwd(), 'crash-logs');
             const retentionDays = 7; // Keep logs for 7 days
-            const cutoffDate = moment().subtract(retentionDays, 'days');
-            
-            this.info('SessionLogger', `Starting log cleanup - removing files older than ${cutoffDate.format('YYYY-MM-DD')}`);
+            const cutoffMs = Date.now() - retentionDays * 86400000;
+
+            this.info('SessionLogger', `Starting log cleanup - removing files older than ${day(new Date(cutoffMs))}`);
             
             let cleanedFiles = 0;
             
@@ -351,7 +374,7 @@ class SessionLogger {
                     const filePath = path.join(logsDir, file);
                     const stats = fs.statSync(filePath);
                     
-                    if (moment(stats.mtime).isBefore(cutoffDate)) {
+                    if (stats.mtimeMs < cutoffMs) {
                         fs.unlinkSync(filePath);
                         cleanedFiles++;
                     }
@@ -365,7 +388,7 @@ class SessionLogger {
                     const filePath = path.join(crashLogsDir, file);
                     const stats = fs.statSync(filePath);
                     
-                    if (moment(stats.mtime).isBefore(cutoffDate)) {
+                    if (stats.mtimeMs < cutoffMs) {
                         fs.unlinkSync(filePath);
                         cleanedFiles++;
                     }

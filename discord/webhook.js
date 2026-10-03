@@ -30,8 +30,15 @@ module.exports = {
         }
 
         let webhook = await module.exports.getWebhook(channelId);
-        
-        await webhook.send(message);
+        if (!webhook) return;
+
+        // Pack names and versions come from upstream APIs. Nothing pings unless the caller names it.
+        await webhook.send({
+            allowedMentions: {
+                parse: []
+            },
+            ...message
+        });
     },
 
     getWebhook: async function(channelId) {
@@ -52,7 +59,8 @@ module.exports = {
                     name: "Valhalla Updater",
                     avatar: client.user.displayAvatarURL(),
                 });
-                process.stdout.moveCursor(0, -1);
+                // moveCursor only exists on a TTY. Under a service manager it threw and lost the new webhook.
+                if (process.stdout.isTTY) process.stdout.moveCursor(0, -1);
                 sessionLogger.info('Webhook', `Creating webhook for channel ${channel.name}... Done!`);
             }
 

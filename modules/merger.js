@@ -12,6 +12,10 @@
 
 var fs = require('fs');
 const {
+    resolve,
+    sep
+} = require('path');
+const {
     downloadList
 } = require('./downloader');
 const sessionLogger = require('./sessionLogger');
@@ -74,10 +78,15 @@ module.exports = {
 
         let deletedCount = 0;
         let notFoundCount = 0;
+        const root = resolve(dir);
         for (let path of changeList.deletions) {
             // Strip leading ./ from path before concatenating
             const relativePath = path.startsWith('./') ? path.substring(2) : path;
             const fullPath = `${dir}/${relativePath}`;
+            // Deletions come from the FTB manifests. A `..` path would rm -r outside the instance tree.
+            if (!resolve(fullPath).startsWith(root + sep)) {
+                throw new Error(`manifest path ${path} points outside ${dir}`);
+            }
 
             sessionLogger.debug('Merger', `Checking: ${fullPath}`);
 

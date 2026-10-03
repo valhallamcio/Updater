@@ -9,7 +9,7 @@ module.exports = {
     data: new SlashCommandBuilder()
         .setName('schedule-player')
         .setDescription('Configure player-triggered commands')
-        .setDefaultMemberPermissions(16)
+        .setDefaultMemberPermissions(1099511627776) // ModerateMembers, the same bar as /execute: this runs raw console lines
         .addSubcommand(subcommand =>
             subcommand
                 .setName('create')
@@ -73,7 +73,7 @@ module.exports = {
             );
         } else if (focusedOption.name === 'servers') {
             const focusedValue = focusedOption.value;
-            const serverList = await yggdrasil.getServers();
+            const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
             const choices = ["all"];
 
             for (const server of serverList) {

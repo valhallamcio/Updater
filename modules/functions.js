@@ -190,6 +190,8 @@ module.exports = {    /**
      * @param {number} amount Number of lines to move the cursor up by.
      */
     clearConsole: function (amount) {
+        // Cursor control only exists on a TTY; under a service manager these calls throw
+        if (!process.stdout.isTTY) return;
         process.stdout.moveCursor(0, -amount);
         process.stdout.clearScreenDown();
     },

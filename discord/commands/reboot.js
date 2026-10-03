@@ -42,7 +42,7 @@ module.exports = {
 
     async autocomplete(interaction) {
         const focused = interaction.options.getFocused().toLowerCase();
-        const servers = await yggdrasil.getServers();
+        const servers = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
         const byTag = new Map();
         for (const s of servers) {
             if (!s.tag) continue;

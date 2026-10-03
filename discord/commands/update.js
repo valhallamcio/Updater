@@ -35,7 +35,7 @@ module.exports = {
 
 	async autocomplete(interaction) {
         const focused = interaction.options.getFocused(true);
-        const serverList = await yggdrasil.getServers();
+        const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
 
         // GTO has no update polling, so offer its release tags for the version option
         if (focused.name === 'version') {

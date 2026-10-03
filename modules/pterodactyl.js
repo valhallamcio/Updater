@@ -658,7 +658,8 @@ module.exports = {
                         killWaitSeconds += interval;
                         progressBar.update(0.99);
                         sessionLogger.warn('Pterodactyl', 'Server shutdown taking longer than expected...');
-                        process.stdout.moveCursor(76, -2);
+                        // Off a TTY moveCursor does not exist. The throw killed this tick and the kill below never ran.
+                        if (process.stdout.isTTY) process.stdout.moveCursor(76, -2);
 
                         // A kill is SIGKILL — only send it when the JVM is CONFIRMED idle (save done /
                         // hung), never mid-write. getStatus() returns state 'unknown' + cpu 0 on an API

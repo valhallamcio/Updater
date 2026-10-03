@@ -64,7 +64,7 @@ module.exports = {
             .setAutocomplete(true)),
     async autocomplete(interaction) {
         const focusedValue = interaction.options.getFocused(true);
-        const serverList = await yggdrasil.getServers();
+        const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
         let choices = [];
 
         if (focusedValue.name === "server") {

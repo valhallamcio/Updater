@@ -9,6 +9,7 @@
  * -----
  * Copyright 2024 flaasz
  */
+const crypto = require('crypto');
 const sharp = require('sharp');
 const axios = require('axios');
 const sessionLogger = require("../modules/sessionLogger");
@@ -55,6 +56,8 @@ module.exports = {
         if (!options.roleChannelId) return sessionLogger.warn('RoleAssigner', "Set role assigner up in /config/config.json!");
 
         const client = await getClient();
+        // Hash of the button rows last written. A rebuild that lands on the same rows edits nothing.
+        let lastPayloadHash = null;
 
         client.on("interactionCreate", async interaction => {
             if (interaction.isButton() && interaction.message.channelId === options.roleChannelId) {
@@ -164,7 +167,12 @@ module.exports = {
                 }
                 return actionRows;
             });
-        
+
+            const payloadHash = crypto.createHash('sha1')
+                .update(JSON.stringify(actionRowsChunks.map(rows => rows.map(row => row.toJSON()))))
+                .digest('hex');
+            if (payloadHash === lastPayloadHash && messages.size === actionRowsChunks.length) return;
+
             for (let i = 0; i < actionRowsChunks.length; i++) {
                 const message = messages.at(i); 
                 if (message) {
@@ -187,6 +195,7 @@ module.exports = {
                     await message.delete();
                 }
             }
+            lastPayloadHash = payloadHash;
         }
 
         async function generateNewRoles(serverList) {

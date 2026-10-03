@@ -14,6 +14,19 @@ const { Events } = require('discord.js');
 const sessionLogger = require('../../modules/sessionLogger');
 const linkFlow = require('../commands/util/linkFlow');
 
+/**
+ * Whether a command is staff-only but was invoked outside a guild.
+ * default_member_permissions is only enforced inside a guild, so in a DM with the bot any
+ * member could run /cake, /stats or /tickets. Commands with no default permissions stay usable.
+ * @param {object} command The loaded command module.
+ * @param {object} interaction The interaction.
+ * @returns {boolean} True when the call must be refused.
+ */
+function staffCommandOutsideGuild(command, interaction) {
+    const perms = command.data && command.data.default_member_permissions;
+    return perms !== undefined && perms !== null && !interaction.inGuild();
+}
+
 module.exports = {
 	name: Events.InteractionCreate,
 	async execute(interaction) {
@@ -36,7 +49,11 @@ module.exports = {
                 sessionLogger.error('InteractionHandler', `No autocomplete command matching ${interaction.commandName} was found.`);
                 return;
             }
-    
+            if (staffCommandOutsideGuild(command, interaction)) {
+                await interaction.respond([]).catch(() => {});
+                return;
+            }
+
             try {
                 await command.autocomplete(interaction);
             } catch (error) {
@@ -53,7 +70,14 @@ module.exports = {
             sessionLogger.error('InteractionHandler', `No chat command matching ${interaction.commandName} was found.`);
             return;
         }
-    
+        if (staffCommandOutsideGuild(command, interaction)) {
+            await interaction.reply({
+                content: 'This command only works in the server.',
+                ephemeral: true
+            }).catch(() => {});
+            return;
+        }
+
         try {
             await command.execute(interaction);
         } catch (error) {

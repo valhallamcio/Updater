@@ -29,12 +29,11 @@ function generateEnvFile() {
 
     const envFilePath = path.join(__dirname, '../.env');
 
-    fs.writeFileSync(envFilePath, envContent.trim(), (err) => {
-        if (err) {
-            return sessionLogger.error('Initializer', 'Error writing .env file:', err);
-        }
-        sessionLogger.info('Initializer', '.env file created successfully!');
+    // Owner-only: the file ends up holding every token the bot has
+    fs.writeFileSync(envFilePath, envContent.trim(), {
+        mode: 0o600
     });
+    sessionLogger.info('Initializer', '.env file created successfully!');
 }
 
 function generateConfigFiles() {

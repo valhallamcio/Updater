@@ -25,6 +25,9 @@ module.exports = {
             option
             .setName('amount')
             .setDescription('Amount to drop')
+            // A negative amount drained every online player's bank
+            .setMinValue(1)
+            .setMaxValue(1000)
             .setRequired(false)),
     async execute(interaction) {
         await interaction.deferReply();

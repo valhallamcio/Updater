@@ -51,8 +51,22 @@ async function getPlayersDetailed() {
     return response.data.data;
 }
 
-async function getServers() {
+// Max age autocomplete accepts. It asks on every keystroke, and names and tags rarely change.
+const SERVER_LIST_MAX_AGE_MS = 30000;
+let serverListCache = null;
+
+/**
+ * Server docs from Yggdrasil.
+ * @param {number} [maxAgeMs=0] Accept a cached list up to this old. The default always asks
+ *   Yggdrasil, because state and status fields go stale fast.
+ * @returns {Promise<Array>} Server docs. Always the caller's own copy: roleAssigner unshifts into it.
+ */
+async function getServers(maxAgeMs = 0) {
+    if (maxAgeMs > 0 && serverListCache && Date.now() - serverListCache.at <= maxAgeMs) {
+        return structuredClone(serverListCache.data);
+    }
     const response = await client.get('/servers/');
+    serverListCache = { at: Date.now(), data: structuredClone(response.data.data) };
     return response.data.data;
 }
 
@@ -62,7 +76,8 @@ async function getServers() {
  * @param {object} fields - Fields to update (e.g. { modpack_version, fileID }).
  */
 async function updateServer(tag, fields) {
-    await client.patch(`/servers/${tag}`, fields);
+    serverListCache = null;
+    await client.patch(`/servers/${encodeURIComponent(tag)}`, fields);
 }
 
 // ── Durable ops (biforesting v2 phase 2) ────────────────────────────────────
@@ -77,12 +92,12 @@ async function updateServer(tag, fields) {
  * @returns {{ op: object, replayed: boolean }} replayed=true when the idempotencyKey already existed.
  */
 async function createOp(server, op) {
-    const response = await client.post(`/biforesting/${server}/ops`, op);
+    const response = await client.post(`/biforesting/${encodeURIComponent(server)}/ops`, op);
     return response.data.data;
 }
 
 async function getOp(opId) {
-    const response = await client.get(`/biforesting/ops/${opId}`);
+    const response = await client.get(`/biforesting/ops/${encodeURIComponent(opId)}`);
     return response.data.data;
 }
 
@@ -92,19 +107,19 @@ async function getOp(opId) {
  * @returns {Array} op docs (the endpoint wraps them as { instanceKey, ops, count }).
  */
 async function listOps(server, query = {}) {
-    const response = await client.get(`/biforesting/${server}/ops`, { params: query });
+    const response = await client.get(`/biforesting/${encodeURIComponent(server)}/ops`, { params: query });
     return response.data.data.ops;
 }
 
 /** Cancels a queued op (pending/dispatched/waiting_player — post-ack is too late). */
 async function cancelOp(opId) {
-    const response = await client.post(`/biforesting/ops/${opId}/cancel`);
+    const response = await client.post(`/biforesting/ops/${encodeURIComponent(opId)}/cancel`);
     return response.data.data;
 }
 
 /** Resumes a FAILED compound op (account_reset) from its checkpoint (v2 phase 7). */
 async function resumeOp(opId) {
-    const response = await client.post(`/biforesting/ops/${opId}/resume`);
+    const response = await client.post(`/biforesting/ops/${encodeURIComponent(opId)}/resume`);
     return response.data.data;
 }
 
@@ -113,7 +128,7 @@ async function resumeOp(opId) {
  * stored snapshot with stale:true. Response: { source: 'live'|'snapshot', stale, inventory|snapshot }.
  */
 async function getPlayerInventory(server, player) {
-    const response = await client.get(`/biforesting/${server}/players/${encodeURIComponent(player)}/inventory`, {
+    const response = await client.get(`/biforesting/${encodeURIComponent(server)}/players/${encodeURIComponent(player)}/inventory`, {
         timeout: 15000 // the live path long-polls up to ~8s
     });
     return response.data.data;
@@ -124,7 +139,7 @@ async function getPlayerInventory(server, player) {
  * Response: { instanceKey, source: 'ftbq'|'bq', registryCount, dumpedAt, count, quests }.
  */
 async function searchQuests(server, search, limit = 10) {
-    const response = await client.get(`/biforesting/${server}/quests`, {
+    const response = await client.get(`/biforesting/${encodeURIComponent(server)}/quests`, {
         params: search ? { search, limit } : { limit }
     });
     return response.data.data;
@@ -136,7 +151,7 @@ async function searchQuests(server, search, limit = 10) {
  * dumpedAt, count, items:[{ id, num, mod, display, maxStack, variants }] }.
  */
 async function searchItems(server, search, limit = 25) {
-    const response = await client.get(`/biforesting/${server}/items`, {
+    const response = await client.get(`/biforesting/${encodeURIComponent(server)}/items`, {
         params: search ? { search, limit } : { limit },
         // Discord autocomplete must answer within 3s — the default 15s timeout meant a slow
         // yggdrasil expired the interaction token and autocomplete died instead of degrading.
@@ -148,7 +163,7 @@ async function searchItems(server, search, limit = 25) {
 /** Live link session snapshot for a server, or null when it isn't linked right now. */
 async function getLinkSession(server) {
     try {
-        const response = await client.get(`/biforesting/link/${server}`);
+        const response = await client.get(`/biforesting/link/${encodeURIComponent(server)}`);
         return response.data.data;
     } catch (err) {
         if (err.response && err.response.status === 404) return null;
@@ -293,6 +308,7 @@ function isConnected() {
 }
 
 module.exports = {
+    SERVER_LIST_MAX_AGE_MS,
     getPlayers,
     getPlayersDetailed,
     getServers,

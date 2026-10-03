@@ -25,7 +25,8 @@ const {
     ButtonBuilder,
     ButtonStyle,
     EmbedBuilder,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    escapeMarkdown
 } = require('discord.js');
 const mongo = require('../modules/mongo');
 const sessionLogger = require('../modules/sessionLogger');
@@ -260,7 +261,8 @@ module.exports = {
                 { name: 'Minecraft name', value: String(request.username || 'unknown'), inline: true },
                 { name: 'UUID', value: `\`${String(request.uuid)}\``, inline: true },
                 { name: 'Country', value: country },
-                { name: 'Reason', value: String(request.reason || 'None given').slice(0, 1024) }
+                // The player typed this in game. Escaped so `[Approve](https://...)` is not a live link on a staff card.
+                { name: 'Reason', value: escapeMarkdown(String(request.reason || 'None given'), { maskedLink: true }).slice(0, 1024) }
             )
             .setFooter({ text: `Request ${request._id}` });
 

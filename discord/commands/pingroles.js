@@ -50,7 +50,7 @@ module.exports = {
 
         let tags = [];
         try {
-            const servers = await yggdrasil.getServers();
+            const servers = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
             const typed = String(focused.value || '').toLowerCase();
             tags = [...new Set(servers.map(s => s.tag).filter(Boolean))]
                 .filter(tag => tag.toLowerCase().startsWith(typed))

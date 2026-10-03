@@ -23,6 +23,9 @@ let releaseCacheTime = 0;
  * @param {object} release Raw release object from the GitHub API.
  */
 function toVersion(release) {
+    // The tag lands in file paths, tellraw JSON and the announcement. Anything past a plain
+    // version string ("0.5.5", "0.5.6-beta") is not a release we can use.
+    if (!/^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/.test(release.tag_name)) return null;
     const asset = release.assets.find(a => a.name === SERVER_ASSET);
     if (!asset) return null;
     return {

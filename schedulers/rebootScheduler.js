@@ -140,9 +140,7 @@ module.exports = {
         
         // Start the main monitoring loop
         setInterval(() => this.mainLoop(options), options.interval * 1000);
-        
-        // Run initial check after a short delay
-        setTimeout(() => this.mainLoop(options), options.interval * 1000);
+        // No separate first run: it was a setTimeout of the same interval, so tick one ran twice at once
     },
 
     /**
