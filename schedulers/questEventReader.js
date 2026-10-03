@@ -12,12 +12,16 @@
  *   2. It writes one quest_event_progress doc per uuid, then `totals` on the event.
  *      With `milestones`, a doc keeps when the player reached each one (`milestoneAt`).
  *      With `finisher`, it keeps when the player completed `finalQuestId` (`finishedAt`).
+ *      With `chapters`, the event keeps the week's completions per chapter (`weekChapters`).
  *   3. It gives founder numbers (atomic `$inc` on `founderSeq`, once per player).
  *   4. It gives milestone numbers (`$inc` on `milestoneSeq.<key>`, once per player per
  *      milestone) and finisher numbers (`$inc` on `finisherSeq`) the same way. The first
  *      `finisher.firstN` finishers also get the `speedrunner` reward.
  *   5. It closes each finished week once, and marks the weekly reward for every
- *      player who did enough that week, when the community met the target.
+ *      player who did enough that week, when the community met the target. The week
+ *      keeps its top chapter, and the weekly trophy shows that chapter's icon. The close
+ *      of the last week also marks the `veteran` reward for every player who did enough
+ *      in every week.
  *   6. It queues every pending reward as a `give_item` op that waits up to 14 days
  *      for the player (`waiting_player`), with an idempotency key per reward.
  *
@@ -49,12 +53,16 @@ const SETTLED_OP_STATES = ['completed', 'failed', 'expired', 'cancelled'];
 // Passes currently running. A slow 19 MB download must not overlap the next tick.
 const inFlight = new Set();
 
-/** The reward keys an event can have: `founder`, one per week, one per milestone, then the finisher pair. */
+/**
+ * The reward keys an event can have: `founder`, one per week, one per milestone, the
+ * finisher pair, then `veteran`.
+ */
 function rewardKeys(event, sched) {
     const keys = ['founder'];
     for (let i = 0; i < sched.weekCount; i++) keys.push(`week${i}`);
     for (const milestone of questProgress.milestoneSpecs(event)) keys.push(milestone.key);
     if (event.finisher) keys.push('finisher', 'speedrunner');
+    if (event.veteran) keys.push('veteran');
     return keys;
 }
 
@@ -63,15 +71,28 @@ function rewardSpec(event, key) {
     if (key === 'founder') return { spec: (event.founder || {}).reward, field: 'founder.reward' };
     if (key === 'finisher') return { spec: (event.finisher || {}).reward, field: 'finisher.reward' };
     if (key === 'speedrunner') return { spec: (event.finisher || {}).firstReward, field: 'finisher.firstReward' };
+    if (key === 'veteran') return { spec: (event.veteran || {}).reward, field: 'veteran.reward' };
     if (questProgress.isWeekKey(key)) return { spec: event.weeklyReward, field: 'weeklyReward' };
     const milestone = questProgress.milestoneSpecs(event).find(m => m.key === key);
     return { spec: milestone && milestone.reward, field: `milestone ${key} reward` };
 }
 
 /**
+ * The chapter a week reward shows. The closed week keeps it. The event doc in hand can
+ * predate the close, so the chapter list by index comes second.
+ * @returns {{index: number, name: string, icon: object|null}|null} Null when the reward has no chapter.
+ */
+function rewardChapter(event, reward) {
+    if (!Number.isInteger(reward.chapter)) return null;
+    const closed = (event.closedWeeks || []).find(w => w.index === Number(reward.week));
+    if (closed && closed.chapter && closed.chapter.index === reward.chapter) return closed.chapter;
+    return questProgress.chapterSpecs(event).find(c => c.index === reward.chapter) || null;
+}
+
+/**
  * Every input that changes the count. A change here forces a recount of an unchanged file.
- * The milestone and finisher inputs join only when the event has them, so an event
- * without them keeps its key.
+ * The milestone, finisher and chapter inputs join only when the event has them, so an
+ * event without them keeps its key.
  */
 function countKey(event, sched) {
     const inputs = {
@@ -85,6 +106,8 @@ function countKey(event, sched) {
     if (milestones.length) inputs.milestones = milestones.map(m => [m.key, m.quests]);
     const finalQuestId = questProgress.finisherQuestId(event);
     if (finalQuestId !== null) inputs.finalQuestId = finalQuestId;
+    const chapters = questProgress.chapterSpecs(event);
+    if (chapters.length) inputs.chapters = chapters.map(c => [c.index, c.quests]);
     return JSON.stringify(inputs);
 }
 
@@ -175,8 +198,8 @@ module.exports = {
 
     /**
      * Reads the file when it changed, writes the progress docs that changed, then `totals`.
-     * @returns {Promise<{quests: number, players: number, weekCounts: number[]}|null>} The
-     *     current counts, or null when the file could not be read.
+     * @returns {Promise<{quests: number, players: number, weekCounts: number[], weekChapters: object[]}|null>}
+     *     The current counts, or null when the file could not be read.
      */
     refreshCounts: async function (event, sched, now) {
         const path = event.progressPath || PROGRESS_PATH;
@@ -193,7 +216,12 @@ module.exports = {
         let counts;
         if (unchanged) {
             const totals = event.totals || {};
-            counts = { quests: totals.quests || 0, players: totals.players || 0, weekCounts: event.weekCounts || [] };
+            counts = {
+                quests: totals.quests || 0,
+                players: totals.players || 0,
+                weekCounts: event.weekCounts || [],
+                weekChapters: event.weekChapters || []
+            };
         } else {
             const text = await this.downloadProgressFile(event.serverId, path);
             const { quests, skipped } = questProgress.parseQuestProgress(text);
@@ -209,9 +237,10 @@ module.exports = {
             if (changed.length || cleared.length) {
                 await mongo.writeQuestEventProgress(event._id, changed, cleared, new Date(now));
             }
-            counts = { quests: result.quests, players: result.players.size, weekCounts: result.weekCounts };
+            counts = { quests: result.quests, players: result.players.size, weekCounts: result.weekCounts, weekChapters: result.weekChapters };
             fields.source = { mtime: stat.mtime, size: stat.size, key, readAt: new Date(now) };
             fields.weekCounts = counts.weekCounts;
+            fields.weekChapters = counts.weekChapters;
             sessionLogger.info('QuestEventReader', `Event ${event._id}: ${counts.quests} completions by ${counts.players} players (${changed.length} changed, ${cleared.length} cleared)`);
         }
 
@@ -303,23 +332,46 @@ module.exports = {
      * Closes each week that ended `weekCloseDelayMinutes` ago. When the week met its
      * target, every player with `weeklyMinContribution` that week gets a pending reward
      * first. The close comes after, so a crash in between marks the rewards again (a no-op)
-     * and then closes.
+     * and then closes. The closed week and its rewards keep the week's top chapter.
+     * The close that finishes the event marks the veteran rewards before it closes, for
+     * the same reason. No later pass counts, so this is their only chance.
      */
     closeWeeks: async function (event, sched, progress, counts, options, now) {
         const delayMs = (Number(options.weekCloseDelayMinutes) || 0) * 60 * 1000;
+        const closed = (event.closedWeeks || []).map(w => ({ index: w.index }));
         for (const index of questProgress.closableWeeks(sched, event.closedWeeks, now, delayMs)) {
             const count = Number(counts.weekCounts[index]) || 0;
             const target = questProgress.weekTarget(event.weeklyTargets, index);
             const met = target !== null && count >= target;
+            const chapter = questProgress.topChapter(event, counts.weekChapters, index);
             const recipients = met ? questProgress.weeklyRecipients(progress, event, index) : [];
+            const reward = { state: 'pending', week: index, at: new Date(now) };
+            if (chapter) reward.chapter = chapter.index;
             for (const doc of recipients) {
-                await mongo.addQuestEventReward(event._id, doc.uuid, `week${index}`, { state: 'pending', week: index, at: new Date(now) });
+                await mongo.addQuestEventReward(event._id, doc.uuid, `week${index}`, { ...reward });
             }
-            await mongo.closeQuestEventWeek(event._id, {
-                index, count, target, met, recipients: recipients.length, closedAt: new Date(now)
-            });
-            sessionLogger.info('QuestEventReader', `Event ${event._id}: week ${index + 1} closed at ${count}/${target}${met ? `, ${recipients.length} rewards` : ', target missed'}`);
+            closed.push({ index });
+            if (questProgress.eventFinished(sched, closed, now)) {
+                await this.markVeterans(event, sched, progress, now);
+            }
+            const entry = { index, count, target, met, recipients: recipients.length, closedAt: new Date(now) };
+            if (chapter) entry.chapter = chapter;
+            await mongo.closeQuestEventWeek(event._id, entry);
+            sessionLogger.info('QuestEventReader', `Event ${event._id}: week ${index + 1} closed at ${count}/${target}${met ? `, ${recipients.length} rewards` : ', target missed'}${chapter ? `, top chapter ${chapter.name}` : ''}`);
         }
+    },
+
+    /**
+     * Marks the `veteran` reward for every player with `veteran.minQuests` in every week.
+     * `addQuestEventReward` never replaces a record, so a second run marks nothing new.
+     */
+    markVeterans: async function (event, sched, progress, now) {
+        if (!event.veteran) return;
+        const recipients = questProgress.veteranRecipients(progress, event, sched);
+        for (const doc of recipients) {
+            await mongo.addQuestEventReward(event._id, doc.uuid, 'veteran', { state: 'pending', at: new Date(now), earnedAt: new Date(now) });
+        }
+        sessionLogger.info('QuestEventReader', `Event ${event._id}: ${recipients.length} veteran rewards`);
     },
 
     /**
@@ -347,12 +399,23 @@ module.exports = {
         }
     },
 
-    /** Queues one reward and records the op on the progress doc. */
+    /**
+     * Queues one reward and records the op on the progress doc. A week reward with a
+     * chapter fills `{chapter}`, and a trophy shows the chapter icon.
+     */
     queueReward: async function (event, uuid, name, key, reward, spec, now) {
         const idempotencyKey = `qe:${event._id}:${key}:${uuid}`;
-        const vars = questProgress.isWeekKey(key)
-            ? { week: Number(reward.week) + 1 }
-            : { n: reward.n, earnedAt: questProgress.toMs(reward.earnedAt) };
+        let vars;
+        if (questProgress.isWeekKey(key)) {
+            vars = { week: Number(reward.week) + 1 };
+            const chapter = rewardChapter(event, reward);
+            if (chapter) {
+                vars.chapter = chapter.name;
+                if (chapter.icon) vars.displayItem = chapter.icon;
+            }
+        } else {
+            vars = { n: reward.n, earnedAt: questProgress.toMs(reward.earnedAt) };
+        }
 
         let params;
         try {

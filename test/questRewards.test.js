@@ -11,6 +11,8 @@
  *    (Simple Trophies moves a display Name there on the first tick anyway),
  *    TrophyEarnedAt is a long in epoch SECONDS,
  *  - the weekly head is minecraft:skull meta 3 with a SkullOwner string,
+ *  - a week trophy with a chapter shows the chapter icon in TrophyItem and its name in
+ *    `{chapter}`. Without one, the spec's own display item stays,
  *  - `nbt` passes Yggdrasil's base64 check.
  *
  * The bytes are read back with mc-nbt-lib's reader, a decoder this repo did not write.
@@ -131,4 +133,31 @@ test('rewards: a plain item with no name or lore gets no nbt', () => {
 test('rewards: a token with no value stays, and a spec without an id is refused', () => {
     assert.strictEqual(questRewards.fill('Founder #{n} {missing}', { n: 2 }), 'Founder #2 {missing}');
     assert.throws(() => questRewards.rewardParams({ name: 'x' }), /needs an item id/);
+});
+
+test('rewards: a week trophy shows the chapter icon and fills {chapter}, without one it keeps its own item', () => {
+    const spec = {
+        id: 'simple_trophies:trophy',
+        name: 'Week {week}: {chapter}',
+        lore: ['Top chapter: {chapter}'],
+        trophy: { displayItem: { id: 'minecraft:nether_star' } }
+    };
+    const tag = decode(questRewards.rewardParams(spec, { week: 2, chapter: '6. Mechanized!', displayItem: { id: 'mekanism:controlcircuit', meta: 1 } }).nbt);
+    assert.deepStrictEqual(tag.TrophyItem.value, {
+        id: { type: 'string', value: 'mekanism:controlcircuit' },
+        Count: { type: 'byte', value: 1 },
+        Damage: { type: 'short', value: 1 }
+    });
+    assert.deepStrictEqual(tag.TrophyName, { type: 'string', value: 'Week 2: 6. Mechanized!' });
+    assert.deepStrictEqual(tag.display.value.Lore.value.value, ['Top chapter: 6. Mechanized!']);
+
+    const plain = decode(questRewards.rewardParams({ ...spec, lore: ['Week {week} goal met.', 'Top chapter: {chapter}'] }, { week: 2 }).nbt);
+    assert.strictEqual(plain.TrophyItem.value.id.value, 'minecraft:nether_star');
+    assert.strictEqual(plain.TrophyName.value, 'Week 2: {chapter}');
+    assert.deepStrictEqual(plain.display.value.Lore.value.value, ['Week 2 goal met.'], 'the lore line with no chapter is left out');
+
+    const bare = decode(questRewards.rewardParams({ id: 'simple_trophies:trophy' }, { displayItem: { id: 'atum:scarab' } }).nbt);
+    assert.strictEqual(bare.TrophyItem.value.id.value, 'atum:scarab', 'the icon also lands on a trophy with no display item');
+    const head = decode(questRewards.rewardParams(WEEKLY, { week: 2, displayItem: { id: 'atum:scarab' } }).nbt);
+    assert.ok(!('TrophyItem' in head), 'a head ignores the icon');
 });

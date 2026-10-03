@@ -19,7 +19,10 @@
  *  - an event without `milestones` or `finisher` keeps its count key, reward keys and docs,
  *  - with the ops lever off nothing is sent, and the rewards wait as `pending`,
  *  - finishers are read on the legacy AND the event server, keep the earliest time,
- *    and ignore the window and the exclusion list.
+ *    and ignore the window and the exclusion list,
+ *  - `chapters` join the count key, a closed week keeps its top chapter, and the weekly
+ *    trophy shows that chapter's icon and name. Without chapter data the spec stays as it is,
+ *  - the close of the LAST week marks `veteran` once, for players with enough in every week.
  *
  * Every module is faked at its own surface, the way test/cakeDrop.test.js does it. The
  * Mongo fakes apply the real bulkWrite ops from modules/mongo.js to an in-memory store.
@@ -616,4 +619,156 @@ test('no milestones or finisher: the same count key, reward keys, docs and numbe
     ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
     ev.finisher = { reward: CAKE };
     assert.deepStrictEqual(reader.rewardKeys(ev, sched), ['founder', 'week0', 'week1', 'm2', 'finisher', 'speedrunner']);
+});
+
+const CHAPTERS = [
+    { index: 0, name: '1. The Journey begins!', icon: { id: 'tconstruct:tooltables', meta: 0 }, quests: [1, 2, 6, 7] },
+    { index: 1, name: '4. Immerse Yourself', icon: { id: 'immersiveengineering:tool', meta: 2 }, quests: [3, 4, 5, 8, 9] }
+];
+const WEEK_TROPHY = {
+    id: 'simple_trophies:trophy',
+    name: 'Week {week}: {chapter}',
+    lore: ['Top chapter: {chapter}'],
+    trophy: { displayItem: { id: 'minecraft:nether_star', meta: 0 } }
+};
+const CLOSE_DELAY = 15 * 60 * 1000;
+const decodeOp = (key, uuid) => {
+    const found = created.find(c => c.op.idempotencyKey === `qe:dj2r-s2:${key}:${uuid}`);
+    return new NBTReader(Buffer.from(found.op.params.nbt, 'base64')).readTag().value;
+};
+
+/**
+ * Week 1: chapter 1 leads, 5 to 4. Week 2: a 1-1 tie. A does 2 or more in both weeks,
+ * B and C do nothing in week 2, D is one short in week 2, E does both weeks.
+ */
+function chapterWeeks() {
+    const w0 = START + 1000;
+    const w1 = START + WEEK + 1000;
+    setFile('season2', [
+        [1, A, w0], [2, A, w0 + 1], [3, A, w0 + 2],
+        [4, B, w0 + 3], [5, B, w0 + 4],
+        [4, C, w0 + 5], [5, C, w0 + 6],
+        [1, D, w0 + 7], [2, D, w0 + 8],
+        [3, E, w0 + 9], [4, E, w0 + 10],
+        [6, A, w1], [8, A, w1 + 1],
+        [10, D, w1 + 2],
+        [6, E, w1 + 3], [8, E, w1 + 4]
+    ]);
+}
+
+test('count: chapters join the count key and recount an unchanged file, a name or icon change does not', async () => {
+    setFile('season2', [[1, A, START + 1000], [3, A, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    const sched = questProgress.schedule(ev);
+    const plain = reader.countKey(ev, sched);
+    assert.deepStrictEqual(ev.weekChapters, [{}, {}]);
+
+    ev.chapters = structuredClone(CHAPTERS);
+    assert.strictEqual(reader.countKey(ev, sched),
+        JSON.stringify({ ...JSON.parse(plain), chapters: [[0, [1, 2, 6, 7]], [1, [3, 4, 5, 8, 9]]] }));
+    await reader.countPass(OPTIONS, START + DAY + 1);
+    assert.strictEqual(downloads.length, 2);
+    assert.deepStrictEqual(ev.weekChapters, [{ 0: 1, 1: 1 }, {}]);
+
+    ev.chapters[0].name = 'Renamed';
+    ev.chapters[0].icon = { id: 'minecraft:stone', meta: 0 };
+    await reader.countPass(OPTIONS, START + DAY + 2);
+    assert.strictEqual(downloads.length, 2, 'name and icon are no count input');
+
+    ev.chapters[1].quests.push(10);
+    await reader.countPass(OPTIONS, START + DAY + 3);
+    assert.strictEqual(downloads.length, 3);
+});
+
+test('chapters: a closed week keeps its top chapter, and the weekly trophy shows its icon and name', async () => {
+    opsOn = true;
+    ev.chapters = CHAPTERS;
+    ev.weeklyReward = WEEK_TROPHY;
+    ev.excluded = [E];
+    chapterWeeks();
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+
+    assert.deepStrictEqual(ev.weekChapters, [{ 0: 4, 1: 5 }, { 0: 1, 1: 1 }], 'E is excluded and q10 is in no chapter');
+    assert.deepStrictEqual(closes[0].chapter, { index: 1, name: '4. Immerse Yourself', icon: { id: 'immersiveengineering:tool', meta: 2 } });
+    for (const uuid of [A, B, C, D]) assert.strictEqual(progress[pid(uuid)].rewards.week0.chapter, 1);
+
+    // The event doc of this pass predates the close, so the chapter comes from `chapters`.
+    const week0 = decodeOp('week0', A);
+    assert.deepStrictEqual(week0.TrophyItem.value, {
+        id: { type: 'string', value: 'immersiveengineering:tool' },
+        Count: { type: 'byte', value: 1 },
+        Damage: { type: 'short', value: 2 }
+    });
+    assert.strictEqual(week0.TrophyName.value, 'Week 1: 4. Immerse Yourself');
+    assert.deepStrictEqual(week0.display.value.Lore.value.value, ['Top chapter: 4. Immerse Yourself']);
+
+    await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
+    assert.deepStrictEqual(closes[1].chapter, { index: 0, name: '1. The Journey begins!', icon: { id: 'tconstruct:tooltables', meta: 0 } },
+        'a 1-1 tie goes to the lower index');
+    assert.strictEqual(progress[pid(A)].rewards.week1.chapter, 0);
+    assert.strictEqual(decodeOp('week1', A).TrophyItem.value.id.value, 'tconstruct:tooltables');
+});
+
+test('chapters: a pending week reward keeps the chapter its week closed with', async () => {
+    ev.chapters = structuredClone(CHAPTERS);
+    ev.weeklyReward = WEEK_TROPHY;
+    setFile('season2', [[3, A, START + 1000], [4, A, START + 2000], [5, A, START + 3000]]);
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+    ev.chapters[1].name = 'Renamed';
+    opsOn = true;
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY + 1);
+    assert.strictEqual(decodeOp('week0', A).TrophyName.value, 'Week 1: 4. Immerse Yourself');
+});
+
+test('chapters: without chapter data the trophy keeps its own display item and the token stays', async () => {
+    opsOn = true;
+    ev.weeklyReward = WEEK_TROPHY;
+    setFile('season2', [[1, A, START + 1000], [2, A, START + 2000], [3, A, START + 3000]]);
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+    assert.ok(!('chapter' in closes[0]));
+    assert.ok(!('chapter' in progress[pid(A)].rewards.week0));
+    const week0 = decodeOp('week0', A);
+    assert.strictEqual(week0.TrophyItem.value.id.value, 'minecraft:nether_star');
+    assert.strictEqual(week0.TrophyName.value, 'Week 1: {chapter}');
+});
+
+test('veteran: marked once, on the close of the last week, for players with enough in every week', async () => {
+    ev.excluded = [E];
+    ev.veteran = { reward: { id: 'simple_trophies:trophy', name: 'DJ2 Season 2 Veteran' } };
+    assert.deepStrictEqual(reader.rewardKeys(ev, questProgress.schedule(ev)), ['founder', 'week0', 'week1', 'veteran']);
+    chapterWeeks();
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+    assert.strictEqual(closes.length, 1);
+    assert.ok(Object.values(progress).every(d => !d.rewards.veteran), 'A already qualifies, but week 2 is still open');
+
+    const lastClose = START + 2 * WEEK + CLOSE_DELAY;
+    await reader.countPass(OPTIONS, lastClose);
+    assert.strictEqual(closes.length, 2);
+    assert.deepStrictEqual(progress[pid(A)].rewards.veteran, { state: 'pending', at: new Date(lastClose), earnedAt: new Date(lastClose) });
+    // B and C did nothing in week 2, D is one short in week 2, E is excluded.
+    assert.deepStrictEqual(Object.values(progress).filter(d => d.rewards.veteran).map(d => d.uuid), [A]);
+    assert.ok(!progress[pid(E)]);
+
+    // The event is over. A later pass closes nothing and sends the veteran op once.
+    opsOn = true;
+    await reader.countPass(OPTIONS, lastClose + DAY);
+    const veteranOps = () => created.filter(c => c.op.idempotencyKey === `qe:dj2r-s2:veteran:${A}`);
+    assert.strictEqual(closes.length, 2);
+    assert.strictEqual(veteranOps().length, 1);
+    assert.strictEqual(decodeOp('veteran', A).TrophyName.value, 'DJ2 Season 2 Veteran');
+    assert.strictEqual(progress[pid(A)].rewards.veteran.state, 'queued');
+
+    // A crash before the last close was written runs that close again. The queued record stays.
+    ev.closedWeeks.pop();
+    await reader.countPass(OPTIONS, lastClose + DAY + 1);
+    assert.strictEqual(closes.length, 3);
+    assert.strictEqual(progress[pid(A)].rewards.veteran.state, 'queued');
+    assert.strictEqual(veteranOps().length, 1);
+});
+
+test('veteran: an event without it marks nothing on the last close', async () => {
+    chapterWeeks();
+    await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
+    assert.strictEqual(closes.length, 2);
+    assert.ok(Object.values(progress).every(d => !d.rewards.veteran));
 });

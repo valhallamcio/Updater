@@ -16,7 +16,12 @@
  *    candidates come in that order per key, with no window, and a bad or taken key is skipped,
  *  - the Season 2 finisher (`finishedAt`) needs `finalQuestId` inside `startAt <= at < endAt`
  *    from a uuid not excluded, and only numbers up to `firstN` earn the speedrunner reward,
- *  - an event without `milestones` or `finisher` keeps the old row shape.
+ *  - an event without `milestones` or `finisher` keeps the old row shape,
+ *  - `weekChapters` counts the same completions as `weekCounts`, and a quest in several
+ *    chapters counts for the lowest index only,
+ *  - the top chapter of a week has the most completions, and a tie goes to the lower index,
+ *  - a veteran did `veteran.minQuests` (default: the weekly minimum) in EVERY week,
+ *  - the chapter seed reads the BQ quest lines in book order, with lang names and icons.
  *
  * The fixture is a few quests in the real file's shape. The 19 MB file never enters the repo.
  */
@@ -24,6 +29,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const qp = require('../modules/questProgress');
+const { parseLang, parseChapters } = require('../scripts/seed-quest-event-chapters');
 
 const DAY = 24 * 3600 * 1000;
 const WEEK = 7 * DAY;
@@ -248,6 +254,7 @@ test('milestones: a bad or taken key, a bad quests count and a second use of a k
         { key: 'founder', quests: 10 },
         { key: 'finisher', quests: 10 },
         { key: 'speedrunner', quests: 10 },
+        { key: 'veteran', quests: 10 },
         { key: 'week2', quests: 10 },
         { key: 'a.b', quests: 10 },
         { key: '$m', quests: 10 },
@@ -342,4 +349,115 @@ test('diff: a new milestoneAt or finishedAt is a change, a row without them comp
     assert.strictEqual(changes({ ...row, milestoneAt: { m2: START + 5, m3: START + 9 } }), 1);
     assert.strictEqual(changes({ ...row, milestoneAt: {} }), 1, 'a dropped milestone rewrites the map');
     assert.strictEqual(changes({ ...row, finishedAt: START + 9 }), 1);
+});
+
+const CHAPTERS = [
+    { index: 2, name: 'Two', icon: { id: 'x:two' }, quests: [1, 2] },
+    { index: 0, name: 'Zero', icon: { id: 'x:zero', meta: 3 }, quests: [2, 3] }
+];
+
+test('count: weekChapters counts the weekCounts completions per chapter, lowest index first', () => {
+    const end = START + 2 * WEEK;
+    const quests = parsed([
+        [1, A, START + 1000],
+        [2, A, START + 2000],
+        [3, B, START + WEEK],
+        [4, B, START + 10],
+        [1, C, START - 1],
+        [3, C, end],
+        [2, D, START + 5]
+    ]);
+    const counts = qp.countEvent(quests, event({ endAt: new Date(end), excluded: [D.toUpperCase()], chapters: CHAPTERS }));
+    assert.deepStrictEqual(counts.weekCounts, [3, 1]);
+    // Quest 2 is in chapters 2 and 0, so it counts for 0. Quest 4 is in no chapter.
+    // C's completions are before the start and at endAt, D is excluded.
+    assert.deepStrictEqual(counts.weekChapters, [{ 0: 1, 2: 1 }, { 0: 1 }]);
+    assert.deepStrictEqual(qp.countEvent(quests, event()).weekChapters, [{}, {}, {}], 'no chapters: an empty count per week');
+});
+
+test('chapters: a bad or taken index and a missing quests list are skipped, the rest sorted by index', () => {
+    const specs = qp.chapterSpecs({ chapters: [
+        { index: 1, name: 'One', icon: { id: 'a:b', meta: 2 }, quests: [5, '6', 'x'] },
+        { index: 0, name: 'Zero', quests: [1] },
+        { index: 1, name: 'Again', quests: [9] },
+        { index: -1, quests: [1] },
+        { index: 1.5, quests: [1] },
+        { index: '2', quests: [1] },
+        { index: 3, name: 'No quests' },
+        null
+    ] });
+    assert.deepStrictEqual(specs, [
+        { index: 0, name: 'Zero', icon: null, quests: [1] },
+        { index: 1, name: 'One', icon: { id: 'a:b', meta: 2 }, quests: [5, 6] }
+    ]);
+    assert.deepStrictEqual(qp.chapterSpecs(event()), []);
+});
+
+test('top chapter: the most completions that week, a tie to the lower index', () => {
+    const ev = event({ chapters: [
+        { index: 0, name: 'Zero', icon: { id: 'x:zero' }, quests: [1] },
+        { index: 1, name: 'One', quests: [2] },
+        { index: 2, name: 'Two', icon: { id: 'x:two', meta: 1 }, quests: [3] }
+    ] });
+    assert.deepStrictEqual(qp.topChapter(ev, [{ 0: 3, 1: 5, 2: 5 }], 0), { index: 1, name: 'One', icon: null });
+    assert.deepStrictEqual(qp.topChapter(ev, [{}, { 2: 4, 0: 4 }], 1), { index: 0, name: 'Zero', icon: { id: 'x:zero', meta: 0 } });
+    assert.strictEqual(qp.topChapter(ev, [{ 7: 9, 2: 1 }], 0).index, 2, 'a chapter no longer on the event is skipped');
+    assert.strictEqual(qp.topChapter(ev, [{ 0: 0 }], 0), null);
+    assert.strictEqual(qp.topChapter(ev, [{}], 0), null);
+    assert.strictEqual(qp.topChapter(ev, undefined, 0), null);
+    assert.strictEqual(qp.topChapter(event(), [{ 0: 3 }], 0), null, 'no chapters on the event');
+});
+
+test('veterans: minQuests in every week, the weekly minimum by default, exclusion applied', () => {
+    const sched = qp.schedule(event());
+    const docs = [
+        { uuid: A, weeks: { 0: 2, 1: 3, 2: 2 } },
+        { uuid: B, weeks: { 0: 5, 1: 1, 2: 5 } },
+        { uuid: C, weeks: { 0: 5, 1: 5, 2: 5 } },
+        { uuid: D, weeks: { 0: 5, 1: 5 } },
+        { uuid: 'e', weeks: { 0: 3, 1: 3, 2: 3 } }
+    ];
+    const veteran = { reward: { id: 'minecraft:cake' } };
+    const got = (extra) => qp.veteranRecipients(docs, event({ excluded: [C.toUpperCase()], ...extra }), sched).map(d => d.uuid);
+    // B is one short in week 1, C is excluded, D has nothing in week 2.
+    assert.deepStrictEqual(got({ weeklyMinContribution: 2, veteran }), [A, 'e']);
+    assert.deepStrictEqual(got({ weeklyMinContribution: 2, veteran: { ...veteran, minQuests: 3 } }), ['e']);
+    assert.deepStrictEqual(got({ weeklyMinContribution: 0, veteran }), [A, B, 'e'], 'a minimum of 0 means 1');
+    assert.deepStrictEqual(got({ weeklyMinContribution: 2 }), [], 'no veteran on the event');
+});
+
+/** A quest line in the shape the season 2 QuestDatabase.json has. */
+function questLine(order, name, icon, quests) {
+    const line = { 'lineID:3': order, 'properties:10': { 'betterquesting:10': { 'name:8': name, 'visibility:8': 'ALWAYS', 'bg_size:3': 256 } }, 'quests:9': quests };
+    if (order !== undefined) line['order:3'] = order;
+    if (icon) line['properties:10']['betterquesting:10']['icon:10'] = icon;
+    return line;
+}
+
+test('chapter seed: quest lines in book order, lang names, icons and unique quest ids', () => {
+    const lang = parseLang('\uFEFF# comment\r\npack.ql.0.title=1. The Journey begins!\r\npack.ql.0.desc=Welcome = hi\n\n');
+    assert.deepStrictEqual([...lang], [['pack.ql.0.title', '1. The Journey begins!'], ['pack.ql.0.desc', 'Welcome = hi']]);
+
+    const database = {
+        'questLines:9': {
+            '0:10': questLine(1, 'pack.ql.0.title', { 'id:8': 'tconstruct:tooltables', 'Count:3': 0, 'Damage:2': 0, 'OreDict:8': '' },
+                { '0:10': { 'sizeX:3': 24, 'x:3': 0, 'id:3': 471 }, '1:10': { 'id:3': 472 }, '2:10': { 'id:3': 471 } }),
+            '1:10': questLine(0, 'Raw name', { 'id:8': 'enderutilities:enderpart', 'Damage:2': 17 }, [{ 'id:3': 472 }, { 'id:3': 5 }]),
+            '2:10': questLine(2, 'pack.ql.2.title', null, {})
+        }
+    };
+    const chapters = parseChapters(JSON.stringify(database), lang);
+    assert.deepStrictEqual(chapters, [
+        { index: 0, name: 'Raw name', icon: { id: 'enderutilities:enderpart', meta: 17 }, quests: [472, 5] },
+        { index: 1, name: '1. The Journey begins!', icon: { id: 'tconstruct:tooltables', meta: 0 }, quests: [471, 472] },
+        { index: 2, name: 'pack.ql.2.title', icon: null, quests: [] }
+    ]);
+    // The seeded list is what the reader counts with: quest 472 is in both lines and counts for index 0.
+    const counts = qp.countEvent(parsed([[472, A, START + 1], [471, A, START + 2]]), event({ chapters }));
+    assert.deepStrictEqual(counts.weekChapters[0], { 0: 1, 1: 1 });
+
+    delete database['questLines:9']['2:10']['order:3'];
+    assert.deepStrictEqual(parseChapters(database).map(c => c.name), ['pack.ql.0.title', 'Raw name', 'pack.ql.2.title'],
+        'a missing order falls back to the file order');
+    assert.throws(() => parseChapters({ 'questProgress:9': {} }), /questLines:9/);
 });

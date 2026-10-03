@@ -15,7 +15,7 @@
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 const DEFAULT_WEEK_COUNT = 8;
 // Reward keys the reader sets itself. A milestone key must not take one of them.
-const RESERVED_KEYS = new Set(['founder', 'finisher', 'speedrunner']);
+const RESERVED_KEYS = new Set(['founder', 'finisher', 'speedrunner', 'veteran']);
 const WEEK_KEY = /^week\d+$/;
 // A milestone key goes into Mongo paths (`rewards.<key>`), so no dots and no `$`.
 const MILESTONE_KEY = /^[A-Za-z]\w*$/;
@@ -141,6 +141,65 @@ function finisherQuestId(event) {
     return event.finalQuestId !== null && event.finalQuestId !== '' && Number.isInteger(id) ? id : null;
 }
 
+/**
+ * The event's usable `chapters`: an integer `index` of 0 or more that is free, and a
+ * `quests` list. A bad entry or a second use of one index is left out.
+ * @returns {{index: number, name: string, icon: {id: string, meta: number}|null, quests: number[]}[]} By index, lowest first.
+ */
+function chapterSpecs(event) {
+    if (!Array.isArray(event.chapters)) return [];
+    const specs = [];
+    const seen = new Set();
+    for (const chapter of event.chapters) {
+        const index = chapter && chapter.index;
+        if (!Number.isInteger(index) || index < 0 || seen.has(index) || !Array.isArray(chapter.quests)) continue;
+        seen.add(index);
+        const icon = chapter.icon && typeof chapter.icon.id === 'string' && chapter.icon.id
+            ? { id: chapter.icon.id, meta: Number(chapter.icon.meta) || 0 }
+            : null;
+        specs.push({
+            index,
+            name: typeof chapter.name === 'string' ? chapter.name : '',
+            icon,
+            quests: chapter.quests.map(Number).filter(Number.isInteger)
+        });
+    }
+    return specs.sort((a, b) => a.index - b.index);
+}
+
+/** Quest id to chapter index. A quest in several chapters belongs to the lowest index. */
+function chapterByQuest(chapters) {
+    const byQuest = new Map();
+    for (const chapter of chapters) {
+        for (const questId of chapter.quests) {
+            if (!byQuest.has(questId)) byQuest.set(questId, chapter.index);
+        }
+    }
+    return byQuest;
+}
+
+/**
+ * The chapter with the most completions in week `index`. A tie goes to the lower index.
+ * @param {object[]} weekChapters Per week, completions by chapter index, from `countEvent`.
+ * @returns {{index: number, name: string, icon: object|null}|null} Null when nobody completed a chapter quest that week.
+ */
+function topChapter(event, weekChapters, index) {
+    const counts = (Array.isArray(weekChapters) && weekChapters[index]) || {};
+    const chapters = new Map(chapterSpecs(event).map(chapter => [chapter.index, chapter]));
+    let best = null;
+    let bestCount = 0;
+    for (const [key, value] of Object.entries(counts)) {
+        const chapter = chapters.get(Number(key));
+        const count = Number(value) || 0;
+        if (!chapter || count <= 0) continue;
+        if (count > bestCount || (count === bestCount && chapter.index < best.index)) {
+            best = chapter;
+            bestCount = count;
+        }
+    }
+    return best ? { index: best.index, name: best.name, icon: best.icon } : null;
+}
+
 /** True when finisher number `n` also earns the speedrunner reward: `n <= finisher.firstN`. */
 function earnsSpeedrunner(event, n) {
     const firstN = Number((event.finisher || {}).firstN);
@@ -151,11 +210,14 @@ function earnsSpeedrunner(event, n) {
  * Counts the completions that belong to the event: `startAt <= at < endAt`, uuid not
  * excluded. Each player's count is per uuid, as BQ recorded it.
  * @returns {{players: Map<string, {uuid: string, total: number, weeks: object, firstAt: number, founderAt: number|null,
- *     milestoneAt?: object, finishedAt?: number|null}>, weekCounts: number[], quests: number, schedule: object}}
+ *     milestoneAt?: object, finishedAt?: number|null}>, weekCounts: number[], weekChapters: object[], quests: number,
+ *     schedule: object}}
  *     `founderAt` is the time of the player's `founder.minQuests`-th completion, or null before they reach it.
  *     `milestoneAt` maps each reached milestone key to the time of the completion that reached it.
  *     `finishedAt` is the time of the counted `finalQuestId` completion, or null.
  *     A row has `milestoneAt` only when the event has milestones, and `finishedAt` only with a `finisher`.
+ *     `weekChapters` has one object per week: completions by chapter index, over the same
+ *     completions as `weekCounts`. A quest in no chapter adds to no chapter.
  */
 function countEvent(quests, event) {
     const sched = schedule(event);
@@ -164,16 +226,23 @@ function countEvent(quests, event) {
     const minQuests = event.founder && Number(event.founder.minQuests) > 0 ? Number(event.founder.minQuests) : null;
     const milestones = milestoneSpecs(event);
     const finalQuestId = finisherQuestId(event);
+    const chapterOf = chapterByQuest(chapterSpecs(event));
 
     const times = new Map();
     const finished = new Map();
+    const weekChapters = Array.from({ length: sched.weekCount }, () => ({}));
     for (const quest of quests) {
         const final = finalQuestId !== null && quest.questId === finalQuestId;
+        const chapter = chapterOf.get(quest.questId);
         for (const { uuid, at } of quest.completions) {
             if (at < sched.startAt || at >= sched.endAt || excluded.has(uuid)) continue;
             if (!times.has(uuid)) times.set(uuid, []);
             times.get(uuid).push(at);
             if (final && (!finished.has(uuid) || at < finished.get(uuid))) finished.set(uuid, at);
+            if (chapter !== undefined) {
+                const week = weekChapters[Math.floor((at - sched.startAt) / sched.weekMs)];
+                week[chapter] = (week[chapter] || 0) + 1;
+            }
         }
     }
 
@@ -204,7 +273,7 @@ function countEvent(quests, event) {
         if (finalQuestId !== null) row.finishedAt = finished.has(uuid) ? finished.get(uuid) : null;
         players.set(uuid, row);
     }
-    return { players, weekCounts, quests: total, schedule: sched };
+    return { players, weekCounts, weekChapters, quests: total, schedule: sched };
 }
 
 /**
@@ -324,6 +393,27 @@ function weeklyRecipients(progressDocs, event, index) {
 }
 
 /**
+ * The progress docs that earn the `veteran` reward: at least `veteran.minQuests` in every
+ * week of the event, not excluded. `minQuests` defaults to the weekly minimum. Empty when
+ * the event has no `veteran`.
+ */
+function veteranRecipients(progressDocs, event, sched) {
+    const veteran = event.veteran;
+    if (!veteran || typeof veteran !== 'object') return [];
+    const min = Number(veteran.minQuests) > 0
+        ? Number(veteran.minQuests)
+        : Math.max(Number(event.weeklyMinContribution) || 0, 1);
+    const excluded = new Set((event.excluded || []).map(normalizeUuid));
+    return progressDocs.filter(doc => {
+        if (excluded.has(normalizeUuid(doc.uuid))) return false;
+        for (let i = 0; i < sched.weekCount; i++) {
+            if (Number((doc.weeks || {})[i] || 0) < min) return false;
+        }
+        return true;
+    });
+}
+
+/**
  * Compares a fresh count with the stored progress docs.
  * @returns {{changed: object[], cleared: string[]}} Rows to write, and uuids that no longer
  *     count (now excluded, or the window moved) whose stored numbers must go to zero.
@@ -376,6 +466,8 @@ module.exports = {
     weekEnd,
     isWeekKey,
     milestoneSpecs,
+    chapterSpecs,
+    topChapter,
     finisherQuestId,
     earnsSpeedrunner,
     countEvent,
@@ -387,5 +479,6 @@ module.exports = {
     milestoneCandidates,
     finisherCandidates,
     weeklyRecipients,
+    veteranRecipients,
     diffProgress
 };

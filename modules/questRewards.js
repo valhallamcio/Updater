@@ -4,14 +4,17 @@
  * -----
  * Turns a quest event reward spec into `give_item` params for a 1.12.2 backend.
  * The spec lives on the event doc (`founder.reward`, `weeklyReward`, `milestones[].reward`,
- * `finisher.reward`, `finisher.firstReward`), so staff can change an item without a
- * deploy. Text fields take `{n}` (the founder, milestone or finisher number) and
- * `{week}` (week number, from 1).
+ * `finisher.reward`, `finisher.firstReward`, `veteran.reward`), so staff can change an item
+ * without a deploy. Text fields take `{n}` (the founder, milestone or finisher number),
+ * `{week}` (week number, from 1) and `{chapter}` (the name of the chapter with the most
+ * completions that week). A token with no value stays in a name, and its lore line is left out.
  *
  * Spec shape:
  *   { id, meta?, count?, name?, lore?: [..],
  *     trophy?: { variant?, color?: [r, g, b], displayItem?: { id, meta? }, showsTooltip? },
  *     skullOwner?, nbt? }
+ * A week reward with a chapter passes the chapter icon as `vars.displayItem`. On a
+ * trophy it replaces `trophy.displayItem`. Without it, `trophy.displayItem` stays.
  *
  * Simple Trophies 1.2.2 (`simple_trophies:trophy`) keeps its data at the root of the
  * stack tag: TrophyName, TrophyVariant (classic, neon or gold), TrophyColorRed/Green/Blue
@@ -37,7 +40,10 @@ function clampColor(value, fallback) {
 
 function loreTag(lines, vars) {
     if (!Array.isArray(lines) || lines.length === 0) return undefined;
-    return nbt.list('string', lines.map(line => fill(line, vars)));
+    // A line with a token that has no value is left out, so a week without a chapter
+    // shows no raw `{chapter}`.
+    const filled = lines.map(line => fill(line, vars)).filter(line => !/\{\w+\}/.test(line));
+    return filled.length > 0 ? nbt.list('string', filled) : undefined;
 }
 
 function displayTag(spec, vars, withName) {
@@ -49,7 +55,7 @@ function displayTag(spec, vars, withName) {
 function trophyTag(spec, vars) {
     const trophy = spec.trophy || {};
     const color = Array.isArray(trophy.color) ? trophy.color : [];
-    const shown = trophy.displayItem;
+    const shown = vars.displayItem && vars.displayItem.id ? vars.displayItem : trophy.displayItem;
     return nbt.compound({
         TrophyName: spec.name ? nbt.string(fill(spec.name, vars)) : undefined,
         TrophyVariant: nbt.string(trophy.variant || 'classic'),
@@ -68,7 +74,8 @@ function trophyTag(spec, vars) {
 /**
  * The `give_item` params for one reward, without `overflow`.
  * @param {object} spec The reward spec from the event doc.
- * @param {object} [vars] `{n, week, earnedAt}`. `earnedAt` is epoch ms.
+ * @param {object} [vars] `{n, week, chapter, earnedAt, displayItem}`. `earnedAt` is epoch ms.
+ *     `displayItem` (`{id, meta?}`) replaces a trophy's `trophy.displayItem`.
  * @returns {{id: string, meta?: number, count: number, nbt?: string}} `nbt` is base64 binary NBT.
  */
 function rewardParams(spec, vars = {}) {
