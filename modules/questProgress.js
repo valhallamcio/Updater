@@ -208,7 +208,8 @@ function earnsSpeedrunner(event, n) {
 
 /**
  * Counts the completions that belong to the event: `startAt <= at < endAt`, uuid not
- * excluded. Each player's count is per uuid, as BQ recorded it.
+ * excluded. Each player's count is per uuid, as BQ recorded it. A quest in `ignoredQuests`
+ * (a repeatable trade quest, for example) counts for nothing.
  * @returns {{players: Map<string, {uuid: string, total: number, weeks: object, firstAt: number, founderAt: number|null,
  *     milestoneAt?: object, finishedAt?: number|null}>, weekCounts: number[], weekChapters: object[], quests: number,
  *     schedule: object}}
@@ -227,11 +228,13 @@ function countEvent(quests, event) {
     const milestones = milestoneSpecs(event);
     const finalQuestId = finisherQuestId(event);
     const chapterOf = chapterByQuest(chapterSpecs(event));
+    const ignored = new Set((Array.isArray(event.ignoredQuests) ? event.ignoredQuests : []).map(Number));
 
     const times = new Map();
     const finished = new Map();
     const weekChapters = Array.from({ length: sched.weekCount }, () => ({}));
     for (const quest of quests) {
+        if (ignored.has(quest.questId)) continue;
         const final = finalQuestId !== null && quest.questId === finalQuestId;
         const chapter = chapterOf.get(quest.questId);
         for (const { uuid, at } of quest.completions) {

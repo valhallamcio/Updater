@@ -140,6 +140,15 @@ test('count: an excluded uuid counts for nothing, whatever its case', () => {
     assert.deepStrictEqual(counts.weekCounts, [1, 0, 0]);
 });
 
+test('count: a quest in ignoredQuests counts for nothing', () => {
+    const { quests } = qp.parseQuestProgress({ 'questProgress:9': [questObj(1, [[A, START + 1]]), questObj(1736, [[A, START + 2], [B, START + 3]])] });
+    const counts = qp.countEvent(quests, event({ ignoredQuests: [1736] }));
+    assert.strictEqual(counts.players.get(A).total, 1);
+    assert.ok(!counts.players.has(B), 'a player with only the ignored quest has no row');
+    assert.strictEqual(counts.quests, 1);
+    assert.strictEqual(qp.countEvent(quests, event()).quests, 3, 'without the list it counts');
+});
+
 test('count: founderAt is the time of the minQuests-th completion', () => {
     const { quests } = qp.parseQuestProgress(fixture());
     const counts = qp.countEvent(quests, event());
