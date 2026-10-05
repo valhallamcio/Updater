@@ -10,10 +10,16 @@
  *   { "questProgress:9": { "0:10": { "questID:3": 809,
  *       "completed:9": { "0:10": { "uuid:8": "<dashed uuid>", "timestamp:4": <ms> } } } } }
  * A list can also come as a JSON array. Both forms are read.
+ *
+ * With `teams.enabled` on the event, it also reads BQ's `QuestingParties.json`:
+ *   { "parties:9": { "0:10": { "partyID:3": 0, "properties:10": {..},
+ *       "members:9": { "0:10": { "uuid:8": "<dashed uuid>", "status:8": "OWNER" } } } } }
  */
 
 const WEEK_MS = 7 * 24 * 3600 * 1000;
 const DEFAULT_WEEK_COUNT = 8;
+// How far apart two party members may reach a numbered reward and still share its number.
+const TEAM_WINDOW_MS = 24 * 3600 * 1000;
 // Reward keys the reader sets itself. A milestone key must not take one of them.
 const RESERVED_KEYS = new Set(['founder', 'finisher', 'speedrunner', 'veteran']);
 const WEEK_KEY = /^week\d+$/;
@@ -198,6 +204,80 @@ function topChapter(event, weekChapters, index) {
         }
     }
     return best ? { index: best.index, name: best.name, icon: best.icon } : null;
+}
+
+/**
+ * The event's team rule. `windowMs` is 24 hours when it is missing or not a positive number.
+ * @returns {{windowMs: number}|null} Null unless `teams.enabled` is true.
+ */
+function teamSpec(event) {
+    const teams = event.teams;
+    if (!teams || typeof teams !== 'object' || teams.enabled !== true) return null;
+    const windowMs = Number(teams.windowMs);
+    return { windowMs: Number.isFinite(windowMs) && windowMs > 0 ? windowMs : TEAM_WINDOW_MS };
+}
+
+/**
+ * Reads the party of each player out of a QuestingParties.json. BQ keeps invites
+ * elsewhere, so every member counts. A uuid in two parties stays in the first.
+ * @param {string|object} data The file text, or the parsed JSON.
+ * @returns {Map<string, number>} Normalized uuid to `partyID:3`.
+ */
+function parseParties(data) {
+    const root = typeof data === 'string' ? JSON.parse(data) : data;
+    if (!root || typeof root !== 'object' || !('parties:9' in root)) {
+        throw new Error('No parties:9 key. This is not a BetterQuesting QuestingParties.json');
+    }
+    const partyOf = new Map();
+    for (const party of entries(root['parties:9'])) {
+        const partyId = Number(party && party['partyID:3']);
+        if (!Number.isInteger(partyId)) continue;
+        for (const member of entries(party['members:9'])) {
+            const uuid = normalizeUuid(member && member['uuid:8']);
+            if (uuid && !partyOf.has(uuid)) partyOf.set(uuid, partyId);
+        }
+    }
+    return partyOf;
+}
+
+/** How a progress doc holds the number for reward `key`, and when it reached that reward. */
+function numberedFields(key) {
+    if (key === 'founder') return { number: doc => doc.founderNo, at: doc => toMs(doc.founderAt) };
+    if (key === 'finisher') return { number: doc => doc.finisherNo, at: doc => toMs(doc.finishedAt) };
+    return { number: doc => (doc.milestoneNo || {})[key], at: doc => toMs((doc.milestoneAt || {})[key]) };
+}
+
+/**
+ * The number a candidate shares with a party member for reward `key` ('founder', a
+ * milestone key or 'finisher'). The member must be in the candidate's party in this
+ * pass's file, hold a number for `key`, and have reached `key` within `windowMs` of the
+ * candidate. With several, the one who reached it first wins.
+ * @param {object[]} progressDocs Every progress doc of the event, numbers given this pass included.
+ * @param {object} doc The candidate.
+ * @param {string} key The reward key.
+ * @param {{partyOf: Map<string, number>, windowMs: number}|null} teams Null: nobody shares.
+ * @returns {{n: number, sharedWith: string}|null} The number, and the uuid of its first holder.
+ */
+function teamShare(progressDocs, doc, key, teams) {
+    if (!teams) return null;
+    const uuid = normalizeUuid(doc.uuid);
+    const party = teams.partyOf.get(uuid);
+    const { number, at } = numberedFields(key);
+    const reachedAt = at(doc);
+    if (party === undefined || reachedAt === null) return null;
+    let best = null;
+    for (const mate of progressDocs) {
+        const mateUuid = normalizeUuid(mate.uuid);
+        if (mateUuid === uuid || teams.partyOf.get(mateUuid) !== party) continue;
+        const n = number(mate);
+        const mateAt = at(mate);
+        if (!Number.isInteger(n) || mateAt === null || Math.abs(reachedAt - mateAt) > teams.windowMs) continue;
+        if (!best || mateAt < best.at || (mateAt === best.at && n < best.n)) best = { mate, n, at: mateAt };
+    }
+    if (!best) return null;
+    // A member who shared a number points at its first holder, so a chain keeps that holder.
+    const first = ((best.mate.rewards || {})[key] || {}).sharedWith;
+    return { n: best.n, sharedWith: first || normalizeUuid(best.mate.uuid) };
 }
 
 /** True when finisher number `n` also earns the speedrunner reward: `n <= finisher.firstN`. */
@@ -460,6 +540,7 @@ function sameTimes(a, b) {
 module.exports = {
     WEEK_MS,
     DEFAULT_WEEK_COUNT,
+    TEAM_WINDOW_MS,
     normalizeUuid,
     toMs,
     parseQuestProgress,
@@ -472,6 +553,9 @@ module.exports = {
     chapterSpecs,
     topChapter,
     finisherQuestId,
+    teamSpec,
+    parseParties,
+    teamShare,
     earnsSpeedrunner,
     countEvent,
     finishers,

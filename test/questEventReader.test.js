@@ -22,7 +22,12 @@
  *    and ignore the window and the exclusion list,
  *  - `chapters` join the count key, a closed week keeps its top chapter, and the weekly
  *    trophy shows that chapter's icon and name. Without chapter data the spec stays as it is,
- *  - the close of the LAST week marks `veteran` once, for players with enough in every week.
+ *  - the close of the LAST week marks `veteran` once, for players with enough in every week,
+ *  - with `teams.enabled`, a party member inside `teams.windowMs` takes the founder,
+ *    milestone or finisher number a member already holds, with no `$inc` and `sharedWith`
+ *    on the reward, so a team takes one speedrunner place and every member gets the trophy,
+ *  - a failed or missing parties file numbers everybody alone that pass and stops nothing,
+ *  - without `teams.enabled` the parties file is never read and the numbers stay per player.
  *
  * Every module is faked at its own surface, the way test/cakeDrop.test.js does it. The
  * Mongo fakes apply the real bulkWrite ops from modules/mongo.js to an in-memory store.
@@ -771,4 +776,204 @@ test('veteran: an event without it marks nothing on the last close', async () =>
     await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
     assert.strictEqual(closes.length, 2);
     assert.ok(Object.values(progress).every(d => !d.rewards.veteran));
+});
+
+const F = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+const G = '99999999-9999-4999-8999-999999999999';
+const HOUR = 3600e3;
+const PARTIES = '/world/betterquesting/QuestingParties.json';
+
+let partyReads;   // serverIds the parties file was downloaded from
+
+/** A QuestingParties.json in the compound form, from [partyId, [uuid, ...]] rows. */
+function bqParties(rows) {
+    const parties = {};
+    rows.forEach(([partyId, members], i) => {
+        const list = {};
+        members.forEach((uuid, j) => { list[`${j}:10`] = { 'uuid:8': uuid, 'status:8': j === 0 ? 'OWNER' : 'MEMBER' }; });
+        parties[`${i}:10`] = { 'partyID:3': partyId, 'properties:10': { 'betterquesting:10': { 'name:8': `party ${partyId}` } }, 'members:9': list };
+    });
+    return JSON.stringify({ 'parties:9': parties });
+}
+
+/** Serves the parties file next to the progress file: rows, raw text, or null for a failed download. */
+function setParties(parties) {
+    partyReads = [];
+    const progressDownload = reader.downloadProgressFile;
+    reader.downloadProgressFile = async (serverId, path) => {
+        if (path !== PARTIES) return progressDownload(serverId, path);
+        partyReads.push(serverId);
+        if (parties === null) throw new Error('The panel gave no download link');
+        return typeof parties === 'string' ? parties : bqParties(parties);
+    };
+}
+
+test('teams: the parties file sits next to the progress file', () => {
+    assert.strictEqual(reader.partiesPath(ev), PARTIES);
+    assert.strictEqual(reader.partiesPath({ ...ev, progressPath: '/Season2/betterquesting/QuestProgress.json' }),
+        '/Season2/betterquesting/QuestingParties.json');
+});
+
+test('teams: a team of 3 at place 1 shares finisher #1, so 4 solos fill places 2 to 5 and 7 players get speedrunner', async () => {
+    ev.weekCount = 4;
+    ev.teams = { enabled: true, windowMs: DAY };
+    ev.finisher = { reward: CAKE, firstN: 5, firstReward: CAKE };
+    // A, B and C finish inside 20 hours of each other. E is alone in a party, D, F and G in none.
+    setParties([[3, [A, B.toUpperCase(), C]], [7, [E]]]);
+    setFile('season2', [
+        [809, A, START + DAY], [809, B, START + DAY + 2 * HOUR], [809, C, START + DAY + 20 * HOUR],
+        [809, D, START + 3 * DAY], [809, E, START + 3 * DAY + HOUR], [809, F, START + 4 * DAY], [809, G, START + 5 * DAY]
+    ]);
+    await reader.countPass(OPTIONS, START + 6 * DAY);
+
+    const numbers = Object.fromEntries([A, B, C, D, E, F, G].map(uuid => [uuid, progress[pid(uuid)].finisherNo]));
+    assert.deepStrictEqual(numbers, { [A]: 1, [B]: 1, [C]: 1, [D]: 2, [E]: 3, [F]: 4, [G]: 5 });
+    assert.strictEqual(finisherIncs, 5, 'one $inc per place: the team took one');
+    assert.strictEqual(ev.finisherSeq, 5, 'no number is left unused');
+    assert.deepStrictEqual(partyReads, ['season2']);
+
+    // Speedrunner goes by the number, so every member of the team at place 1 gets it.
+    const speedrunners = Object.values(progress).filter(d => d.rewards.speedrunner);
+    assert.strictEqual(speedrunners.length, 7);
+    assert.deepStrictEqual(progress[pid(B)].rewards.finisher,
+        { state: 'pending', n: 1, earnedAt: new Date(START + DAY + 2 * HOUR), at: new Date(START + 6 * DAY), sharedWith: A });
+    assert.deepStrictEqual(progress[pid(B)].rewards.speedrunner, progress[pid(B)].rewards.finisher);
+    assert.strictEqual(progress[pid(C)].rewards.speedrunner.sharedWith, A);
+    for (const uuid of [A, D, E, F, G]) {
+        assert.ok(!('sharedWith' in progress[pid(uuid)].rewards.finisher), `${uuid} holds its own number`);
+    }
+});
+
+test('teams: founder and milestone numbers are shared inside the window, not outside it or across parties', async () => {
+    ev.weekCount = 4;
+    ev.teams = { enabled: true };   // no windowMs: 24 hours
+    ev.milestones = [{ key: 'm2', quests: 2, reward: CAKE }];
+    // A and B are a team, 2 hours apart. C is in another party, D in none.
+    // E joined A's party but reached 2 quests two days after A and B.
+    setParties([[1, [A, B, E]], [2, [C]]]);
+    setFile('season2', [
+        [1, A, START + 1000], [2, A, START + 2000],
+        [1, B, START + HOUR], [2, B, START + 2 * HOUR],
+        [1, C, START + 3 * HOUR], [2, C, START + 4 * HOUR],
+        [1, D, START + 5 * HOUR], [2, D, START + 6 * HOUR],
+        [1, E, START + 2 * DAY], [2, E, START + 2 * DAY + 1]
+    ]);
+    await reader.countPass(OPTIONS, START + 3 * DAY);
+
+    const expected = { [A]: 1, [B]: 1, [C]: 2, [D]: 3, [E]: 4 };
+    assert.deepStrictEqual(Object.fromEntries(Object.keys(expected).map(u => [u, progress[pid(u)].founderNo])), expected);
+    assert.deepStrictEqual(Object.fromEntries(Object.keys(expected).map(u => [u, progress[pid(u)].milestoneNo.m2])), expected);
+    assert.strictEqual(incs, 4);
+    assert.deepStrictEqual(milestoneIncs, ['m2', 'm2', 'm2', 'm2']);
+    assert.strictEqual(progress[pid(B)].rewards.founder.sharedWith, A);
+    assert.strictEqual(progress[pid(B)].rewards.m2.sharedWith, A);
+    assert.deepStrictEqual(progress[pid(B)].rewards.founder.earnedAt, new Date(START + 2 * HOUR), 'the own time, not the holder\'s');
+    for (const uuid of [A, C, D, E]) {
+        assert.ok(!('sharedWith' in progress[pid(uuid)].rewards.founder), uuid);
+        assert.ok(!('sharedWith' in progress[pid(uuid)].rewards.m2), uuid);
+    }
+});
+
+test('teams: a member numbered on an earlier pass counts, and a chain names the first holder', async () => {
+    ev.weekCount = 4;
+    ev.teams = { enabled: true, windowMs: DAY };
+    ev.finisher = { reward: CAKE, firstN: 1, firstReward: CAKE };
+    setParties([[1, [A, B, C]]]);
+    setFile('season2', [[809, A, START + DAY]]);
+    await reader.countPass(OPTIONS, START + 2 * DAY);
+    assert.strictEqual(progress[pid(A)].finisherNo, 1);
+
+    // B is 10 hours after A. C is 30 hours after A, but 20 hours after B.
+    setFile('season2', [[809, A, START + DAY], [809, B, START + DAY + 10 * HOUR], [809, C, START + 2 * DAY + 6 * HOUR]],
+        '2026-10-13T00:00:00+02:00');
+    await reader.countPass(OPTIONS, START + 3 * DAY);
+    assert.strictEqual(progress[pid(B)].finisherNo, 1);
+    assert.strictEqual(progress[pid(C)].finisherNo, 1);
+    assert.strictEqual(progress[pid(B)].rewards.finisher.sharedWith, A);
+    assert.strictEqual(progress[pid(C)].rewards.finisher.sharedWith, A, 'C shares through B, and A is the first holder');
+    assert.strictEqual(progress[pid(C)].rewards.speedrunner.n, 1);
+    assert.strictEqual(finisherIncs, 1);
+});
+
+test('teams: a shared number whose write matches nothing takes nothing from the sequence', async () => {
+    ev.weekCount = 4;
+    ev.teams = { enabled: true, windowMs: DAY };
+    ev.finisher = { reward: CAKE, firstN: 5, firstReward: CAKE };
+    setParties([[1, [A, B]]]);
+    // B's doc gets a number from somewhere else between the read and the write.
+    const setFinisher = mongo.setQuestEventFinisherNo;
+    let refused = 0;
+    mongo.setQuestEventFinisherNo = async (id, uuid, finisherNo, rewards) => {
+        if (uuid === B && refused++ === 0) return { matchedCount: 0, modifiedCount: 0 };
+        return setFinisher(id, uuid, finisherNo, rewards);
+    };
+    setFile('season2', [[809, A, START + DAY], [809, B, START + DAY + HOUR]]);
+    await reader.countPass(OPTIONS, START + 2 * DAY);
+    assert.strictEqual(progress[pid(B)].finisherNo, undefined);
+    assert.strictEqual(finisherIncs, 1);
+    assert.strictEqual(ev.finisherSeq, 1, 'the refused share wasted no number');
+
+    await reader.countPass(OPTIONS, START + 2 * DAY + 1);
+    assert.strictEqual(progress[pid(B)].finisherNo, 1);
+    assert.strictEqual(finisherIncs, 1);
+});
+
+for (const [what, parties] of [['a failed download', null], ['a file that is not JSON', 'not json'], ['a file with no parties:9', '{}']]) {
+    test(`teams: ${what} numbers everybody alone that pass, and rewards are still marked and sent`, async () => {
+        opsOn = true;
+        ev.weekCount = 4;
+        ev.teams = { enabled: true, windowMs: DAY };
+        ev.finisher = { reward: CAKE, firstN: 5, firstReward: CAKE };
+        setParties(parties);
+        setFile('season2', [[1, A, START + 1000], [809, A, START + DAY], [1, B, START + 2000], [809, B, START + DAY + HOUR]]);
+        await reader.countPass(OPTIONS, START + 2 * DAY);
+
+        assert.deepStrictEqual(partyReads, ['season2']);
+        assert.strictEqual(progress[pid(A)].finisherNo, 1);
+        assert.strictEqual(progress[pid(B)].finisherNo, 2);
+        assert.strictEqual(progress[pid(A)].founderNo, 1);
+        assert.strictEqual(progress[pid(B)].founderNo, 2);
+        assert.ok(!('sharedWith' in progress[pid(B)].rewards.finisher));
+        assert.deepStrictEqual(created.map(c => c.op.idempotencyKey).sort(), [A, B].flatMap(u =>
+            ['founder', 'finisher', 'speedrunner'].map(k => `qe:dj2r-s2:${k}:${u}`)).sort());
+    });
+}
+
+test('teams disabled: the parties file is never read, numbers stay per player, and the count key stays', async () => {
+    ev.weekCount = 4;
+    ev.finisher = { reward: CAKE, firstN: 5, firstReward: CAKE };
+    const sched = questProgress.schedule(ev);
+    const key = reader.countKey(ev, sched);
+    ev.teams = { enabled: false, windowMs: DAY };
+    assert.strictEqual(reader.countKey(ev, sched), key);
+    ev.teams.enabled = true;
+    assert.strictEqual(reader.countKey(ev, sched), key, 'the team rule changes no count');
+    ev.teams.enabled = false;
+
+    setParties([[1, [A, B]]]);
+    setFile('season2', [[809, A, START + DAY], [809, B, START + DAY + HOUR]]);
+    await reader.countPass(OPTIONS, START + 2 * DAY);
+    assert.deepStrictEqual(partyReads, []);
+    assert.strictEqual(progress[pid(A)].finisherNo, 1);
+    assert.strictEqual(progress[pid(B)].finisherNo, 2);
+    assert.strictEqual(finisherIncs, 2);
+    assert.ok(!('sharedWith' in progress[pid(B)].rewards.finisher));
+});
+
+test('teams: a pass with nobody waiting for a number reads no parties file', async () => {
+    ev.teams = { enabled: true, windowMs: DAY };
+    setParties([[1, [A, B]]]);
+    setFile('season2', [[1, A, START + 1000], [1, B, START + 2000]]);
+    await reader.countPass(OPTIONS, START + DAY);
+    assert.deepStrictEqual(partyReads, [], 'one quest each: short of minQuests 2, and no milestones or finisher');
+
+    setFile('season2', [[1, A, START + 1000], [2, A, START + 2000], [1, B, START + 3000], [2, B, START + 4000]],
+        '2026-10-11T00:00:00+02:00');
+    await reader.countPass(OPTIONS, START + DAY + 1);
+    assert.deepStrictEqual(partyReads, ['season2']);
+    assert.strictEqual(progress[pid(B)].founderNo, 1);
+    assert.strictEqual(progress[pid(B)].rewards.founder.sharedWith, A);
+
+    await reader.countPass(OPTIONS, START + DAY + 2);
+    assert.deepStrictEqual(partyReads, ['season2'], 'everybody has a number now');
 });

@@ -21,6 +21,10 @@
  *    chapters counts for the lowest index only,
  *  - the top chapter of a week has the most completions, and a tie goes to the lower index,
  *  - a veteran did `veteran.minQuests` (default: the weekly minimum) in EVERY week,
+ *  - teams need `teams.enabled === true`, and the window falls back to 24 hours,
+ *  - the parties file is read in both forms, with uuids as the progress file has them,
+ *  - a candidate shares a number only with a member of its own party who holds one for
+ *    the same reward, reached within the window, and the share names the first holder,
  *  - the chapter seed reads the BQ quest lines in book order, with lang names and icons.
  *
  * The fixture is a few quests in the real file's shape. The 19 MB file never enters the repo.
@@ -433,6 +437,59 @@ test('veterans: minQuests in every week, the weekly minimum by default, exclusio
     assert.deepStrictEqual(got({ weeklyMinContribution: 2, veteran: { ...veteran, minQuests: 3 } }), ['e']);
     assert.deepStrictEqual(got({ weeklyMinContribution: 0, veteran }), [A, B, 'e'], 'a minimum of 0 means 1');
     assert.deepStrictEqual(got({ weeklyMinContribution: 2 }), [], 'no veteran on the event');
+});
+
+test('teams: only enabled === true turns them on, and a missing or bad window is 24 hours', () => {
+    assert.strictEqual(qp.teamSpec(event()), null);
+    assert.strictEqual(qp.teamSpec(event({ teams: { enabled: false, windowMs: DAY } })), null);
+    assert.strictEqual(qp.teamSpec(event({ teams: { enabled: 'true' } })), null);
+    assert.deepStrictEqual(qp.teamSpec(event({ teams: { enabled: true } })), { windowMs: DAY });
+    for (const windowMs of [0, -5, 'abc', null, Infinity]) {
+        assert.deepStrictEqual(qp.teamSpec(event({ teams: { enabled: true, windowMs } })), { windowMs: DAY }, String(windowMs));
+    }
+    assert.deepStrictEqual(qp.teamSpec(event({ teams: { enabled: true, windowMs: 3600e3 } })), { windowMs: 3600e3 });
+});
+
+test('parties: both forms, uuids normalized, a party with no integer id skipped, the first party kept', () => {
+    const partyOf = qp.parseParties(JSON.stringify({
+        'parties:9': {
+            '0:10': {
+                'partyID:3': 0,
+                'properties:10': { 'betterquesting:10': { 'name:8': 'evilintent' } },
+                'members:9': { '0:10': { 'uuid:8': ` ${A.toUpperCase()} `, 'status:8': 'OWNER' }, '1:10': { 'uuid:8': B, 'status:8': 'MEMBER' } }
+            },
+            '1:10': { 'partyID:3': 4, 'members:9': [{ 'uuid:8': C, 'status:8': 'OWNER' }, { 'uuid:8': B, 'status:8': 'ADMIN' }] },
+            '2:10': { 'partyID:3': 'x', 'members:9': [{ 'uuid:8': D, 'status:8': 'OWNER' }] },
+            '3:10': { 'partyID:3': 5 }
+        }
+    }));
+    assert.deepStrictEqual([...partyOf], [[A, 0], [B, 0], [C, 4]]);
+    assert.deepStrictEqual([...qp.parseParties({ 'parties:9': [] })], []);
+    assert.throws(() => qp.parseParties({ 'questProgress:9': {} }), /parties:9/);
+});
+
+test('team share: same party, a number for the same reward, inside the window, the first holder named', () => {
+    const teams = { partyOf: new Map([[A, 1], [B, 1], [C, 1], [D, 2]]), windowMs: DAY };
+    const at = (ms) => new Date(START + ms);
+    const docs = [
+        { uuid: A, finisherNo: 3, finishedAt: at(0), founderNo: 1, founderAt: at(0), milestoneNo: { m2: 2 }, milestoneAt: { m2: at(0) }, rewards: {} },
+        { uuid: B, finisherNo: 3, finishedAt: at(DAY), rewards: { finisher: { n: 3, sharedWith: A } } },
+        { uuid: D, finisherNo: 1, finishedAt: at(10) }
+    ];
+    const candidate = (extra) => ({ uuid: C, ...extra });
+
+    assert.deepStrictEqual(qp.teamShare(docs, candidate({ finishedAt: at(DAY) }), 'finisher', teams), { n: 3, sharedWith: A },
+        'exactly windowMs after A still shares, and A is the earlier holder');
+    assert.deepStrictEqual(qp.teamShare(docs, candidate({ finishedAt: at(2 * DAY) }), 'finisher', teams), { n: 3, sharedWith: A },
+        'out of A\'s window but inside B\'s: B shared from A, so A stays the first holder');
+    assert.strictEqual(qp.teamShare(docs, candidate({ finishedAt: at(2 * DAY + 1) }), 'finisher', teams), null, 'outside every window');
+    assert.deepStrictEqual(qp.teamShare(docs, candidate({ founderAt: at(5) }), 'founder', teams), { n: 1, sharedWith: A });
+    assert.deepStrictEqual(qp.teamShare(docs, candidate({ milestoneAt: { m2: at(5) } }), 'm2', teams), { n: 2, sharedWith: A });
+    assert.strictEqual(qp.teamShare(docs, candidate({ milestoneAt: { m3: at(5) } }), 'm3', teams), null, 'nobody holds m3');
+    assert.strictEqual(qp.teamShare(docs, { uuid: 'e', finishedAt: at(5) }, 'finisher', teams), null, 'not in a party');
+    assert.strictEqual(qp.teamShare(docs, { uuid: D.toUpperCase(), finishedAt: at(5) }, 'finisher', teams), null,
+        'D holds a number itself and is alone in party 2');
+    assert.strictEqual(qp.teamShare(docs, candidate({ finishedAt: at(5) }), 'finisher', null), null, 'no teams this pass');
 });
 
 /** A quest line in the shape the season 2 QuestDatabase.json has. */

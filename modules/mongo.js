@@ -1646,9 +1646,9 @@ module.exports = {
     /**
      * Moves a flag out of `open`, and only while it is still open with the action the
      * clicker saw. A second click matches nothing. So does a click on a card the proxy
-     * raised from review to muted after it was drawn.
+     * raised from review to warned or muted after it was drawn.
      * @param {*} id The flag _id.
-     * @param {string} action The `action` the card showed ('muted' or 'review').
+     * @param {string} action The `action` the card showed ('muted', 'warned' or 'review').
      * @param {string} status 'banned', 'unmuted', 'kept', 'muted' or 'dismissed'.
      * @param {string} decidedBy Discord id of whoever clicked.
      * @param {string} decidedName Their username.

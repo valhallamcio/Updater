@@ -2,19 +2,22 @@
  * File: chatFlags.js
  * Project: valhalla-updater
  * -----
- * The staff half of Bifrost's chat guard. A message that hits the hard word list, a hate
- * symbol or the Jev block threshold mutes the player for good, and the proxy writes a doc
- * to bifrost.chat_flags. A lower Jev score writes a doc with no mute, for review. This
- * posts one card per open flag into the staff channel, with buttons on it.
+ * The staff half of Bifrost's chat guard. A message that hits the hard word list or a hate
+ * symbol mutes the player for good, and the proxy writes a doc to bifrost.chat_flags. A
+ * block from the AI filter (source `jev`, the model in `model`) warns the player first
+ * (`action: 'warned'`), then gives timed mutes (`muteMinutes`). A lower AI score writes a
+ * doc with no mute, for review. This posts one card per open flag into the staff channel,
+ * with buttons on it.
  *
  * The proxy keeps one open doc per player. While it is open, the proxy can add context
- * lines and raise `action` from review to muted. Every pass compares each open card with
- * the doc and edits the card when the doc changed.
+ * lines and raise `action` from review to warned to muted. Every pass compares each open
+ * card with the doc and edits the card when the doc changed.
  *
  * A click works like a link request. The flag leaves `open` first, on a filter that only
  * matches while it is still open. The console command goes to Bifrost after that. A second
  * clicker matches nothing, is told who got there first, and sends nothing. Bifrost's
- * console does not strip a leading slash, so the commands go without one.
+ * console does not strip a leading slash, so the commands go without one. Every command
+ * ends with `--by <clicker>`, and Bifrost takes that as the staff name.
  *
  * A staff /unmute in game or on the Bifrost console closes the open muted flag on the proxy
  * side, with `decidedIn: 'game'`. The next pass takes the buttons off that card once.
@@ -40,14 +43,20 @@ const LOG = 'ChatFlags';
 const PREFIX = 'chatflag:';
 const BATCH = 10;
 const SYNC_BATCH = 50;
-const COLOUR = { muted: 0xe74c3c, review: 0xe67e22, decided: 0x95a5a6 };
+const COLOUR = { muted: 0xe74c3c, warned: 0xf1c40f, review: 0xe67e22, decided: 0x95a5a6 };
 const NO_MENTIONS = { parse: [] };
 
-// The buttons on each kind of card, in the order staff see them.
+// The buttons on each kind of card (see `cardKind`), in the order staff see them.
+// Bifrost replaces an active mute with the new one, so a mute with no duration on a
+// timed mute makes it permanent.
 const BUTTONS = {
     muted: ['ban', 'unmute', 'keep'],
+    timed: ['mute', 'ban', 'unmute', 'keep'],
+    warned: ['mute', 'ban', 'dismiss'],
     review: ['mute', 'ban', 'dismiss']
 };
+// Labels that differ from the CHOICES label on one kind of card.
+const LABELS = { timed: { mute: 'Mute for good' } };
 const CHOICES = {
     ban: { status: 'banned', label: 'Ban', style: ButtonStyle.Danger, command: 'ban' },
     unmute: { status: 'unmuted', label: 'Unmute', style: ButtonStyle.Secondary, command: 'unmute' },
@@ -62,11 +71,13 @@ const DECIDED = {
     muted: 'Muted',
     dismissed: 'Dismissed'
 };
-const SOURCE = { hardlist: 'Hard word list', symbol: 'Hate symbol', jev: 'Jev classifier' };
+const SOURCE = { hardlist: 'Hard word list', symbol: 'Hate symbol', jev: 'AI filter' };
 const SCORES = ['hate', 'harass', 'threat', 'selfharm'];
 
 // Bifrost's console splits a line on whitespace, and a newline starts a new command.
 const SAFE_NAME = /^[^\s\u0000-\u001f\u007f]+$/;
+// The characters Bifrost takes in a `--by` staff name.
+const BY_NAME = /[^A-Za-z0-9_.-]/g;
 
 // One pass at a time: a slow channel must not have the next interval posting the same
 // flags again behind it.
@@ -145,12 +156,57 @@ function formatScores(scores) {
 }
 
 /**
+ * The length of a timed mute.
+ * @param {object} flag The flag doc.
+ * @returns {number|null} Minutes, or null when the mute is for good.
+ */
+function muteMinutes(flag) {
+    const minutes = flag.muteMinutes;
+    return typeof minutes === 'number' && Number.isFinite(minutes) && minutes > 0 ? minutes : null;
+}
+
+/**
+ * Minutes as staff read them: minutes below an hour, hours from an hour up.
+ * @param {number} minutes A positive number.
+ * @returns {string} For example `30 min`, `4 h` or `1 h 30 min`.
+ */
+function formatMinutes(minutes) {
+    const total = Math.max(1, Math.round(minutes));
+    if (total < 60) return `${total} min`;
+    const rest = total % 60;
+    return `${Math.floor(total / 60)} h${rest ? ` ${rest} min` : ''}`;
+}
+
+/**
+ * The kind of card a flag gets.
+ * @param {object} flag The flag doc.
+ * @returns {string} 'muted' (for good), 'timed', 'warned' or 'review'.
+ */
+function cardKind(flag) {
+    if (flag.action === 'muted') return muteMinutes(flag) === null ? 'muted' : 'timed';
+    if (flag.action === 'warned') return 'warned';
+    return 'review';
+}
+
+/**
  * The buttons a flag's card carries.
- * @param {string} action The flag's `action`.
+ * @param {object} flag The flag doc.
  * @returns {string[]} Choice keys.
  */
-function buttonsFor(action) {
-    return BUTTONS[action] || BUTTONS.review;
+function buttonsFor(flag) {
+    return BUTTONS[cardKind(flag)];
+}
+
+/**
+ * Where the flag came from, for the Source field.
+ * @param {object} flag The flag doc.
+ * @returns {string} The label.
+ */
+function sourceLabel(flag) {
+    const label = SOURCE[flag.source];
+    if (!label) return fit(cleanText(flag.source || 'unknown'), 64);
+    if (flag.source === 'jev' && flag.model) return `${label} (${fit(cleanText(flag.model), 64)})`;
+    return label;
 }
 
 module.exports = {
@@ -352,7 +408,7 @@ module.exports = {
             await interaction.editReply(this.alreadyHandled(flag));
             return;
         }
-        if (!buttonsFor(flag.action).includes(key)) {
+        if (!buttonsFor(flag).includes(key)) {
             await this.refreshMessage(interaction.message, flag);
             await interaction.editReply('⚠️ This flag changed after the card went up. The card shows the current choices now.');
             return;
@@ -415,7 +471,9 @@ module.exports = {
 
     /**
      * The console line a choice sends to Bifrost. No leading slash: the console matches
-     * the first word against command names as it is.
+     * the first word against command names as it is. The line ends with `--by <name>`
+     * when the clicker's name has characters Bifrost takes. Bifrost strips it and shows
+     * that name as the staff member.
      * @param {string} key The choice ('ban', 'unmute', 'keep', 'mute' or 'dismiss').
      * @param {object} flag The flag doc.
      * @param {string} byName Discord username of whoever clicked.
@@ -425,10 +483,12 @@ module.exports = {
         const choice = CHOICES[key];
         if (!choice || !choice.command) return null;
         const target = String(flag.username);
-        if (choice.command === 'unmute') return `unmute ${target}`;
+        const staff = String(byName == null ? '' : byName).replace(BY_NAME, '').slice(0, 32);
+        const by = staff ? ` --by ${staff}` : '';
+        if (choice.command === 'unmute') return `unmute ${target}${by}`;
         // No duration word, so the punishment is permanent. The reason starts with
         // "chatguard", which Bifrost can never read as a duration.
-        return `${choice.command} ${target} chatguard flag ${flag._id} (${oneLine(flag.source)}) by ${oneLine(byName)}`;
+        return `${choice.command} ${target} chatguard flag ${flag._id} (${oneLine(flag.source)}) by ${oneLine(byName)}${by}`;
     },
 
     /**
@@ -522,17 +582,26 @@ module.exports = {
      * @returns {EmbedBuilder} The embed.
      */
     buildEmbed: function (flag, decision) {
-        const muted = flag.action === 'muted';
+        const kind = cardKind(flag);
+        const title = kind === 'muted' || kind === 'timed'
+            ? 'Chat flag: muted automatically'
+            : kind === 'warned' ? 'Chat flag: warned automatically' : 'Chat flag: needs review';
+        const action = {
+            muted: 'Muted for good',
+            timed: `Muted ${formatMinutes(muteMinutes(flag))}`,
+            warned: 'Warning only, no mute',
+            review: 'Review only, no mute'
+        }[kind];
         const embed = new EmbedBuilder()
-            .setTitle(muted ? 'Chat flag: muted automatically' : 'Chat flag: needs review')
-            .setColor(decision ? COLOUR.decided : (muted ? COLOUR.muted : COLOUR.review))
+            .setTitle(title)
+            .setColor(decision ? COLOUR.decided : COLOUR[kind === 'timed' ? 'muted' : kind])
             .setDescription(this.contextText(flag))
             .addFields(
                 { name: 'Player', value: fit(cleanText(flag.username || 'unknown'), 256), inline: true },
                 { name: 'UUID', value: `\`${fit(oneLine(flag.uuid) || 'unknown', 64)}\``, inline: true },
                 { name: 'Server', value: fit(cleanText(flag.server || 'unknown'), 256), inline: true },
-                { name: 'Source', value: SOURCE[flag.source] || fit(cleanText(flag.source || 'unknown'), 64), inline: true },
-                { name: 'Action', value: muted ? 'Muted for good' : 'Review only, no mute', inline: true },
+                { name: 'Source', value: sourceLabel(flag), inline: true },
+                { name: 'Action', value: action, inline: true },
                 { name: 'Scores', value: formatScores(flag.scores), inline: true },
                 { name: 'Message', value: fit(cleanText(flag.message), 1024) || 'None' }
             )
@@ -590,10 +659,11 @@ module.exports = {
      */
     buildComponents: function (flag) {
         const id = String(flag._id);
-        return [new ActionRowBuilder().addComponents(buttonsFor(flag.action).map(key =>
+        const labels = LABELS[cardKind(flag)] || {};
+        return [new ActionRowBuilder().addComponents(buttonsFor(flag).map(key =>
             new ButtonBuilder()
                 .setCustomId(`${PREFIX}${key}:${id}`)
-                .setLabel(CHOICES[key].label)
+                .setLabel(labels[key] || CHOICES[key].label)
                 .setStyle(CHOICES[key].style)))];
     },
 
@@ -604,7 +674,7 @@ module.exports = {
      */
     cardHash: function (flag) {
         return crypto.createHash('sha1')
-            .update(JSON.stringify({ embed: this.buildEmbed(flag).toJSON(), buttons: buttonsFor(flag.action) }))
+            .update(JSON.stringify({ embed: this.buildEmbed(flag).toJSON(), buttons: buttonsFor(flag) }))
             .digest('hex');
     },
 

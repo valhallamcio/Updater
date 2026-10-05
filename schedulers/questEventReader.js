@@ -17,6 +17,10 @@
  *   4. It gives milestone numbers (`$inc` on `milestoneSeq.<key>`, once per player per
  *      milestone) and finisher numbers (`$inc` on `finisherSeq`) the same way. The first
  *      `finisher.firstN` finishers also get the `speedrunner` reward.
+ *      With `teams.enabled`, steps 3 and 4 first read QuestingParties.json from the same
+ *      folder. A BetterQuesting party shares quest progress, so a player whose party member
+ *      already holds a number for the same reward, reached within `teams.windowMs`, takes
+ *      that number with no `$inc`. The reward records the first holder in `sharedWith`.
  *   5. It closes each finished week once, and marks the weekly reward for every
  *      player who did enough that week, when the community met the target. The week
  *      keeps its top chapter, and the weekly trophy shows that chapter's icon. The close
@@ -43,6 +47,8 @@ const questProgress = require('../modules/questProgress');
 const questRewards = require('../modules/questRewards');
 
 const PROGRESS_PATH = '/world/betterquesting/QuestProgress.json';
+// BQ saves the parties in the same folder as the progress file.
+const PARTIES_FILE = 'QuestingParties.json';
 // A reward lands while the player is offline, so the op waits for their next login.
 const GIVE_EXPIRES_MS = 14 * 24 * 3600 * 1000;
 const DOWNLOAD_TIMEOUT_MS = 180000;
@@ -115,6 +121,12 @@ function sameTotals(a, b) {
     return JSON.stringify(a || null) === JSON.stringify(b || null);
 }
 
+/** The event server's QuestingParties.json: next to the progress file. */
+function partiesPath(event) {
+    const progressPath = event.progressPath || PROGRESS_PATH;
+    return `${progressPath.slice(0, progressPath.lastIndexOf('/') + 1)}${PARTIES_FILE}`;
+}
+
 module.exports = {
     name: 'questEventReader',
     defaultConfig: {
@@ -185,9 +197,10 @@ module.exports = {
             // No week closes and no number goes out on a pass that could not read the file.
             if (counts) {
                 const progress = await mongo.getQuestEventProgress(event._id);
-                await this.assignFounders(event, sched, progress, now);
-                await this.assignMilestones(event, sched, progress, now);
-                await this.assignFinishers(event, sched, progress, now);
+                const teams = await this.readTeams(event, sched, progress);
+                await this.assignFounders(event, sched, progress, now, teams);
+                await this.assignMilestones(event, sched, progress, now, teams);
+                await this.assignFinishers(event, sched, progress, now, teams);
                 await this.closeWeeks(event, sched, progress, counts, options, now);
             }
         }
@@ -254,26 +267,66 @@ module.exports = {
     },
 
     /**
-     * Gives the next founder number to each player who earned one, in the order they
-     * reached `minQuests`. The number comes from an atomic `$inc`, and the progress write
-     * matches only while the doc has no number. A lost race wastes a number and never
-     * gives one player two.
+     * The parties on the event server, for the numbers of one pass. Read only with
+     * `teams.enabled` and while somebody waits for a founder, milestone or finisher number.
+     * A missing or bad file means no teams this pass. It is logged and stops nothing.
+     * @returns {Promise<{partyOf: Map<string, number>, windowMs: number}|null>} Null: nobody shares.
      */
-    assignFounders: async function (event, sched, progress, now) {
+    readTeams: async function (event, sched, progress) {
+        const spec = questProgress.teamSpec(event);
+        if (!spec) return null;
+        const waiting = questProgress.founderCandidates(progress, event, sched).length > 0
+            || questProgress.milestoneSpecs(event).some(m => questProgress.milestoneCandidates(progress, event, sched, m).length > 0)
+            || questProgress.finisherCandidates(progress, event, sched).length > 0;
+        if (!waiting) return null;
+        const path = partiesPath(event);
+        try {
+            const partyOf = questProgress.parseParties(await this.downloadProgressFile(event.serverId, path));
+            return { partyOf, windowMs: spec.windowMs };
+        } catch (error) {
+            sessionLogger.warn('QuestEventReader', `Event ${event._id}: could not read ${path} on ${event.serverId}, no teams this pass (${error.message})`);
+            return null;
+        }
+    },
+
+    /**
+     * The number a candidate gets for reward `key`: a party member's number under the team
+     * rule, else a new one from `next` (the `$inc`). A shared number takes nothing from the
+     * sequence, so a write that matches nothing wastes no number.
+     * @param {() => Promise<number|null>} next Takes the next number of the sequence.
+     * @returns {Promise<{n: number, sharedWith?: string}|null>} Null when `next` gave no number.
+     */
+    numberFor: async function (progress, doc, key, teams, next) {
+        const share = questProgress.teamShare(progress, doc, key, teams);
+        if (share) return share;
+        const n = await next();
+        return Number.isInteger(n) ? { n } : null;
+    },
+
+    /**
+     * Gives the next founder number to each player who earned one, in the order they
+     * reached `minQuests`. The number comes from an atomic `$inc`, or from a party member
+     * under the team rule. The progress write matches only while the doc has no number.
+     * A lost race wastes a new number and never gives one player two.
+     */
+    assignFounders: async function (event, sched, progress, now, teams = null) {
         for (const doc of questProgress.founderCandidates(progress, event, sched)) {
-            const founderNo = await mongo.nextFounderNo(event._id);
-            if (!Number.isInteger(founderNo)) {
+            const number = await this.numberFor(progress, doc, 'founder', teams, () => mongo.nextFounderNo(event._id));
+            if (!number) {
                 sessionLogger.warn('QuestEventReader', `Event ${event._id}: no founder number came back, stopping`);
                 return;
             }
+            const founderNo = number.n;
             const reward = { state: 'pending', n: founderNo, earnedAt: new Date(questProgress.toMs(doc.founderAt)), at: new Date(now) };
+            if (number.sharedWith) reward.sharedWith = number.sharedWith;
             const result = await mongo.setQuestEventFounderNo(event._id, doc.uuid, founderNo, reward);
             if (!result || result.matchedCount === 0) {
-                sessionLogger.warn('QuestEventReader', `Event ${event._id}: founder #${founderNo} is unused, ${doc.uuid} already has a number`);
+                sessionLogger.warn('QuestEventReader', `Event ${event._id}: founder #${founderNo} ${number.sharedWith ? 'is not shared' : 'is unused'}, ${doc.uuid} already has a number`);
                 continue;
             }
             doc.founderNo = founderNo;
-            sessionLogger.info('QuestEventReader', `Event ${event._id}: founder #${founderNo} goes to ${doc.uuid}`);
+            doc.rewards = { ...(doc.rewards || {}), founder: reward };
+            sessionLogger.info('QuestEventReader', `Event ${event._id}: founder #${founderNo} goes to ${doc.uuid}${number.sharedWith ? ` (shared with ${number.sharedWith})` : ''}`);
         }
     },
 
@@ -282,23 +335,26 @@ module.exports = {
      * (`milestoneSeq.<key>`), in the order players reached `quests`. There is no window.
      * The pending reward goes under the milestone key.
      */
-    assignMilestones: async function (event, sched, progress, now) {
+    assignMilestones: async function (event, sched, progress, now, teams = null) {
         for (const milestone of questProgress.milestoneSpecs(event)) {
             const { key } = milestone;
             for (const doc of questProgress.milestoneCandidates(progress, event, sched, milestone)) {
-                const milestoneNo = await mongo.nextMilestoneNo(event._id, key);
-                if (!Number.isInteger(milestoneNo)) {
+                const number = await this.numberFor(progress, doc, key, teams, () => mongo.nextMilestoneNo(event._id, key));
+                if (!number) {
                     sessionLogger.warn('QuestEventReader', `Event ${event._id}: no ${key} number came back, stopping`);
                     return;
                 }
+                const milestoneNo = number.n;
                 const reward = { state: 'pending', n: milestoneNo, earnedAt: new Date(questProgress.toMs(doc.milestoneAt[key])), at: new Date(now) };
+                if (number.sharedWith) reward.sharedWith = number.sharedWith;
                 const result = await mongo.setQuestEventMilestoneNo(event._id, doc.uuid, key, milestoneNo, reward);
                 if (!result || result.matchedCount === 0) {
-                    sessionLogger.warn('QuestEventReader', `Event ${event._id}: ${key} #${milestoneNo} is unused, ${doc.uuid} already has a number`);
+                    sessionLogger.warn('QuestEventReader', `Event ${event._id}: ${key} #${milestoneNo} ${number.sharedWith ? 'is not shared' : 'is unused'}, ${doc.uuid} already has a number`);
                     continue;
                 }
                 doc.milestoneNo = { ...(doc.milestoneNo || {}), [key]: milestoneNo };
-                sessionLogger.info('QuestEventReader', `Event ${event._id}: ${key} #${milestoneNo} goes to ${doc.uuid}`);
+                doc.rewards = { ...(doc.rewards || {}), [key]: reward };
+                sessionLogger.info('QuestEventReader', `Event ${event._id}: ${key} #${milestoneNo} goes to ${doc.uuid}${number.sharedWith ? ` (shared with ${number.sharedWith})` : ''}`);
             }
         }
     },
@@ -306,25 +362,30 @@ module.exports = {
     /**
      * Gives finisher numbers the founder way (`finisherSeq`), in the order players
      * completed `finalQuestId`. A number up to `finisher.firstN` also marks the
-     * `speedrunner` reward, in the same write as the number.
+     * `speedrunner` reward, in the same write as the number. The check goes by the
+     * number, so a team that shares one number takes one speedrunner place, and every
+     * member gets the reward.
      */
-    assignFinishers: async function (event, sched, progress, now) {
+    assignFinishers: async function (event, sched, progress, now, teams = null) {
         for (const doc of questProgress.finisherCandidates(progress, event, sched)) {
-            const finisherNo = await mongo.nextFinisherNo(event._id);
-            if (!Number.isInteger(finisherNo)) {
+            const number = await this.numberFor(progress, doc, 'finisher', teams, () => mongo.nextFinisherNo(event._id));
+            if (!number) {
                 sessionLogger.warn('QuestEventReader', `Event ${event._id}: no finisher number came back, stopping`);
                 return;
             }
+            const finisherNo = number.n;
             const reward = { state: 'pending', n: finisherNo, earnedAt: new Date(questProgress.toMs(doc.finishedAt)), at: new Date(now) };
+            if (number.sharedWith) reward.sharedWith = number.sharedWith;
             const rewards = { finisher: reward };
             if (questProgress.earnsSpeedrunner(event, finisherNo)) rewards.speedrunner = { ...reward };
             const result = await mongo.setQuestEventFinisherNo(event._id, doc.uuid, finisherNo, rewards);
             if (!result || result.matchedCount === 0) {
-                sessionLogger.warn('QuestEventReader', `Event ${event._id}: finisher #${finisherNo} is unused, ${doc.uuid} already has a number`);
+                sessionLogger.warn('QuestEventReader', `Event ${event._id}: finisher #${finisherNo} ${number.sharedWith ? 'is not shared' : 'is unused'}, ${doc.uuid} already has a number`);
                 continue;
             }
             doc.finisherNo = finisherNo;
-            sessionLogger.info('QuestEventReader', `Event ${event._id}: finisher #${finisherNo} goes to ${doc.uuid}${rewards.speedrunner ? ' (speedrunner)' : ''}`);
+            doc.rewards = { ...(doc.rewards || {}), ...rewards };
+            sessionLogger.info('QuestEventReader', `Event ${event._id}: finisher #${finisherNo} goes to ${doc.uuid}${rewards.speedrunner ? ' (speedrunner)' : ''}${number.sharedWith ? ` (shared with ${number.sharedWith})` : ''}`);
         }
     },
 
@@ -564,6 +625,7 @@ module.exports = {
 };
 
 module.exports.PROGRESS_PATH = PROGRESS_PATH;
+module.exports.partiesPath = partiesPath;
 module.exports.GIVE_EXPIRES_MS = GIVE_EXPIRES_MS;
 module.exports.rewardKeys = rewardKeys;
 module.exports.countKey = countKey;

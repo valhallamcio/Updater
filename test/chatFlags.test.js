@@ -9,11 +9,14 @@
  *    while it is open with the action the clicker saw, so a double click sends one command,
  *  - the loser of that race is told who won and sends nothing,
  *  - each button sends the exact console line Bifrost's punishments plugin reads, with no
- *    leading slash, because Bifrost's console does not strip one,
+ *    leading slash, because Bifrost's console does not strip one, and with `--by <clicker>`
+ *    at the end, cut to the characters Bifrost takes,
+ *  - a warned card offers the review buttons, a timed mute adds Mute for good, and a mute
+ *    for good keeps Ban, Unmute and Keep muted,
  *  - a command that does not reach Bifrost is shown to the clicker and on the card, and
  *    the flag stays decided,
  *  - player text cannot format the card or mention anybody,
- *  - the card follows the proxy when it adds context or raises review to muted,
+ *  - the card follows the proxy when it adds context or raises review to warned to muted,
  *  - a card the proxy closed on an in-game /unmute loses its buttons once, and a card
  *    closed by a button is left alone,
  *  - somebody without the staff role is refused before any of it.
@@ -223,7 +226,7 @@ test('an open flag is posted once, with the player, the scores and the context o
     const review = sent[1].embeds[0].toJSON();
     assert.strictEqual(review.title, 'Chat flag: needs review');
     assert.strictEqual(fields(review).get('Scores'), 'hate 61%, harass 20%, threat 3%, selfharm 0%');
-    assert.strictEqual(fields(review).get('Source'), 'Jev classifier');
+    assert.strictEqual(fields(review).get('Source'), 'AI filter');
     assert.deepStrictEqual(buttonIds(sent[1]), ['chatflag:mute:flag-2', 'chatflag:ban:flag-2', 'chatflag:dismiss:flag-2']);
 
     for (const payload of sent) {
@@ -267,11 +270,11 @@ test('player text cannot format the card or mention anybody', async () => {
 
 // Each button: the status it leaves behind and the exact line Bifrost gets.
 const CHOICES = [
-    { flag: 'flag-1', button: 'ban', status: 'banned', command: 'ban Griefer chatguard flag flag-1 (hardlist) by mod' },
-    { flag: 'flag-1', button: 'unmute', status: 'unmuted', command: 'unmute Griefer' },
+    { flag: 'flag-1', button: 'ban', status: 'banned', command: 'ban Griefer chatguard flag flag-1 (hardlist) by mod --by mod' },
+    { flag: 'flag-1', button: 'unmute', status: 'unmuted', command: 'unmute Griefer --by mod' },
     { flag: 'flag-1', button: 'keep', status: 'kept', command: null },
-    { flag: 'flag-2', button: 'mute', status: 'muted', command: 'mute Reviewed chatguard flag flag-2 (jev) by mod' },
-    { flag: 'flag-2', button: 'ban', status: 'banned', command: 'ban Reviewed chatguard flag flag-2 (jev) by mod' },
+    { flag: 'flag-2', button: 'mute', status: 'muted', command: 'mute Reviewed chatguard flag flag-2 (jev) by mod --by mod' },
+    { flag: 'flag-2', button: 'ban', status: 'banned', command: 'ban Reviewed chatguard flag flag-2 (jev) by mod --by mod' },
     { flag: 'flag-2', button: 'dismiss', status: 'dismissed', command: null }
 ];
 
@@ -424,6 +427,140 @@ test('a click on a card the proxy changed decides nothing and redraws the card',
     assert.deepStrictEqual(writes, []);
     assert.match(it.replies[0], /changed/);
     assert.deepStrictEqual(buttonIds(it.message.edits[0]), ['chatflag:ban:flag-2', 'chatflag:unmute:flag-2', 'chatflag:keep:flag-2']);
+});
+
+/** The labels on a payload's button row. */
+function buttonLabels(payload) {
+    return payload.components[0].toJSON().components.map(b => b.label);
+}
+
+const TIMED_IDS = ['chatflag:mute:flag-2', 'chatflag:ban:flag-2', 'chatflag:unmute:flag-2', 'chatflag:keep:flag-2'];
+
+test('Source: the AI filter with its model when the flag has one, the other sources as before', () => {
+    const source = (flag) => fields(chatFlags.buildEmbed(flag).toJSON()).get('Source');
+    assert.strictEqual(source({ ...flags['flag-2'], model: 'clef-flash' }), 'AI filter (clef-flash)');
+    assert.strictEqual(source(flags['flag-2']), 'AI filter');
+    assert.strictEqual(source({ ...flags['flag-2'], model: '' }), 'AI filter');
+    assert.strictEqual(source({ ...flags['flag-2'], model: '**big**' }), 'AI filter (\\*\\*big\\*\\*)');
+    assert.strictEqual(source(flags['flag-1']), 'Hard word list');
+    assert.strictEqual(source({ ...flags['flag-1'], source: 'symbol', model: 'clef-flash' }), 'Hate symbol',
+        'only the AI filter shows a model');
+});
+
+test('a warned card: the warned title, a warning with no mute, and the review buttons', async () => {
+    delete flags['flag-1'];
+    Object.assign(flags['flag-2'], { action: 'warned', model: 'clef-flash' });
+    await chatFlags.postOpenFlags(CONFIG, { channel: channel() });
+
+    const embed = sent[0].embeds[0].toJSON();
+    assert.strictEqual(embed.title, 'Chat flag: warned automatically');
+    assert.strictEqual(embed.color, 0xf1c40f);
+    assert.strictEqual(fields(embed).get('Action'), 'Warning only, no mute');
+    assert.strictEqual(fields(embed).get('Source'), 'AI filter (clef-flash)');
+    assert.deepStrictEqual(buttonIds(sent[0]), ['chatflag:mute:flag-2', 'chatflag:ban:flag-2', 'chatflag:dismiss:flag-2']);
+    assert.deepStrictEqual(buttonLabels(sent[0]), ['Mute', 'Ban', 'Dismiss']);
+});
+
+test('a timed mute: the muted title, the length on Action, and Mute for good before the muted buttons', async () => {
+    delete flags['flag-1'];
+    Object.assign(flags['flag-2'], { action: 'muted', muteMinutes: 30, model: 'clef-flash' });
+    await chatFlags.postOpenFlags(CONFIG, { channel: channel() });
+
+    const embed = sent[0].embeds[0].toJSON();
+    assert.strictEqual(embed.title, 'Chat flag: muted automatically');
+    assert.strictEqual(embed.color, 0xe74c3c);
+    assert.strictEqual(fields(embed).get('Action'), 'Muted 30 min');
+    assert.deepStrictEqual(buttonIds(sent[0]), TIMED_IDS);
+    assert.deepStrictEqual(buttonLabels(sent[0]), ['Mute for good', 'Ban', 'Unmute', 'Keep muted']);
+});
+
+test('the Action field of a timed mute gives hours from 60 minutes up', () => {
+    const action = (muteMinutes) => fields(chatFlags.buildEmbed({ ...flags['flag-2'], action: 'muted', muteMinutes }).toJSON())
+        .get('Action');
+    assert.strictEqual(action(1), 'Muted 1 min');
+    assert.strictEqual(action(59), 'Muted 59 min');
+    assert.strictEqual(action(60), 'Muted 1 h');
+    assert.strictEqual(action(90), 'Muted 1 h 30 min');
+    assert.strictEqual(action(240), 'Muted 4 h');
+});
+
+test('a mute for good keeps its title, Action and buttons, with muteMinutes null or absent', () => {
+    for (const muteMinutes of [null, undefined]) {
+        const flag = { ...flags['flag-1'], muteMinutes };
+        const embed = chatFlags.buildEmbed(flag).toJSON();
+        assert.strictEqual(embed.title, 'Chat flag: muted automatically');
+        assert.strictEqual(fields(embed).get('Action'), 'Muted for good');
+        const row = { components: chatFlags.buildComponents(flag) };
+        assert.deepStrictEqual(buttonIds(row), ['chatflag:ban:flag-1', 'chatflag:unmute:flag-1', 'chatflag:keep:flag-1']);
+        assert.deepStrictEqual(buttonLabels(row), ['Ban', 'Unmute', 'Keep muted']);
+    }
+});
+
+for (const [kind, change] of [['warned', { action: 'warned' }], ['timed', { action: 'muted', muteMinutes: 30 }]]) {
+    test(`Mute on a ${kind} card claims the flag first, then sends a mute with no duration`, async () => {
+        Object.assign(flags['flag-2'], change);
+        const it = click('mute', 'flag-2');
+        await chatFlags.handleButton(it, CONFIG);
+
+        assert.strictEqual(flags['flag-2'].status, 'muted');
+        assert.deepStrictEqual(writes, ['claim', 'command']);
+        assert.deepStrictEqual(commands,
+            [{ serverId: 'bifrost-ptero', command: 'mute Reviewed chatguard flag flag-2 (jev) by mod --by mod' }]);
+        assert.deepStrictEqual(it.message.edits[0].components, []);
+    });
+}
+
+test('--by carries the clicker cut to [A-Za-z0-9_.-]{1,32}, and goes away when nothing is left', () => {
+    const flag = flags['flag-1'];
+    assert.strictEqual(chatFlags.buildCommand('unmute', flag, 'alp.derps_2-x'), 'unmute Griefer --by alp.derps_2-x');
+    assert.strictEqual(chatFlags.buildCommand('unmute', flag, 'Mod Name! <@1>\n'), 'unmute Griefer --by ModName1');
+    assert.strictEqual(chatFlags.buildCommand('unmute', flag, 'a'.repeat(40)), `unmute Griefer --by ${'a'.repeat(32)}`);
+    assert.strictEqual(chatFlags.buildCommand('unmute', flag, 'ユーザー'), 'unmute Griefer');
+    assert.strictEqual(chatFlags.buildCommand('unmute', flag, ''), 'unmute Griefer');
+    assert.strictEqual(chatFlags.buildCommand('ban', flag, 'Mod Name'),
+        'ban Griefer chatguard flag flag-1 (hardlist) by Mod Name --by ModName', 'the reason keeps the name as it was');
+    assert.strictEqual(chatFlags.buildCommand('mute', flag, 'ユーザー'), 'mute Griefer chatguard flag flag-1 (hardlist) by ユーザー');
+    assert.strictEqual(chatFlags.buildCommand('keep', flag, 'mod'), null);
+});
+
+test('the card follows the proxy from review to warned to a timed mute to a mute for good', async () => {
+    delete flags['flag-1'];
+    const ch = channel();
+    await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    const card = messages.get('msg-1');
+
+    for (const change of [
+        { action: 'warned' },
+        { action: 'muted', muteMinutes: 30 },
+        { muteMinutes: 240 },
+        { muteMinutes: null }
+    ]) {
+        Object.assign(flags['flag-2'], change);
+        await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    }
+
+    const drawn = card.edits.map(edit => {
+        const embed = edit.embeds[0].toJSON();
+        return [embed.title, fields(embed).get('Action'), buttonIds(edit).map(id => id.split(':')[1]).join(',')];
+    });
+    assert.deepStrictEqual(drawn, [
+        ['Chat flag: warned automatically', 'Warning only, no mute', 'mute,ban,dismiss'],
+        ['Chat flag: muted automatically', 'Muted 30 min', 'mute,ban,unmute,keep'],
+        ['Chat flag: muted automatically', 'Muted 4 h', 'mute,ban,unmute,keep'],
+        ['Chat flag: muted automatically', 'Muted for good', 'ban,unmute,keep']
+    ]);
+    assert.strictEqual(sent.length, 1, 'edits, never a second card');
+});
+
+test('a dismiss on a warned card the proxy raised to a timed mute decides nothing and redraws the card', async () => {
+    Object.assign(flags['flag-2'], { action: 'muted', muteMinutes: 30 });   // the card still shows the warned buttons
+    const it = click('dismiss', 'flag-2');
+    await chatFlags.handleButton(it, CONFIG);
+
+    assert.strictEqual(flags['flag-2'].status, 'open');
+    assert.deepStrictEqual(writes, []);
+    assert.match(it.replies[0], /changed/);
+    assert.deepStrictEqual(buttonIds(it.message.edits[0]), TIMED_IDS);
 });
 
 test('a click that lands while the sync pass redraws the card leaves the card closed', async () => {
