@@ -90,6 +90,9 @@ function generateConfigFiles() {
             // (checkConfig below treats null and "" as unfilled and stops the bot)
             "verifiedRoleId": false
         },
+        // 26.x servers with the management protocol on: "<serverId>": { "url", "secretEnv" }
+        // (see modules/managementClient.js). Empty = every server uses the console path.
+        "management": {},
         "scheduler": {}
     };
 

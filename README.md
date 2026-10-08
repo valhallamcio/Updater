@@ -267,6 +267,24 @@ skips the whole pass rather than stripping the guild.
 enough `playtime.<tag>` (milliseconds on the player doc) to be worth its ping role. **Nothing is
 assigned** — pack roles stay opt-in through the role assigner buttons.
 
+## Server Management Protocol (26.x servers)
+
+Minecraft 1.21.9+ servers can serve JSON-RPC over a websocket (`management-server-*` in
+`server.properties`). `modules/managementClient.js` is the client. Turn it on per server in
+`config/config.json`:
+
+```json
+"management": { "<serverId>": { "url": "ws://10.0.0.3:<port>", "secretEnv": "NOVA_MANAGEMENT_SECRET" } }
+```
+
+The secret (`management-server-secret`, 40 letters and digits) goes in `.env` under the name in
+`secretEnv`. For `wss://` with a self-signed keystore, `caFile` names the PEM cert to trust.
+
+The reboot scheduler uses it for the pre-stop save: `minecraft:server/save` with `flush: true`
+answers once the world is on disk, so the 90 s flush wait is skipped. A server without an entry
+keeps `save-all` and the wait. An error or a save slower than the wait falls back to the same
+path, with one warning per server per run.
+
 ## Schedulers
 
 | Scheduler | Description |

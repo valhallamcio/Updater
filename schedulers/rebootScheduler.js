@@ -4,6 +4,7 @@ const pterodactyl = require("../modules/pterodactyl");
 const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");
 const rebootAlerts = require("../modules/rebootAlerts");
+const managementClient = require("../modules/managementClient");
 const { EmbedBuilder } = require("discord.js");
 const sessionLogger = require("../modules/sessionLogger");
 
@@ -28,6 +29,9 @@ module.exports = {
     // Open countdown docs (serverId -> { startedAt, id: Promise<insertedId|null> }), so the
     // stop step can stamp the doc it started and a retry inside the same minute can't double-write.
     rebootEventState: new Map(),
+
+    // serverIds whose management-protocol save fell back to save-all; the warning is logged once per run.
+    managementFallbackLogged: new Set(),
 
     // Start send timings (startServerWithMonitoring). Wings can drop a start without an API error.
     // A start sent while Wings still holds the stop lock is refused. A start whose container create
@@ -1242,8 +1246,9 @@ module.exports = {
         // Hard guarantee for EVERY reboot path (daily batch, scheduled, vote): flush the world and
         // give it time to finish BEFORE any stop/kill. save-all is async on the backend, so the
         // wait — not the command — is what lets a slow modded save (PRI-class worlds) reach disk.
+        // A server with a management entry confirms its save over the protocol and skips the wait.
         const saveWaitMs = (ac.preStopSaveWaitSeconds || 0) * 1000;
-        if (saveWaitMs > 0) {
+        if (saveWaitMs > 0 && !(await this.saveViaManagement(server, saveWaitMs))) {
             try {
                 await pterodactyl.sendCommand(server.serverId, 'save-all');
             } catch (error) {
@@ -1301,6 +1306,29 @@ module.exports = {
         }
 
         throw new Error('Failed to stop server after multiple attempts');
+    },
+
+    /**
+     * Pre-stop save over the server management protocol, for a server with a `management` entry
+     * in config.json. The reply comes once the save is on disk, so no flush wait is needed.
+     * Returns false when the server has no entry, and on any error or a save slower than
+     * timeoutMs (today's wait budget). The caller then runs save-all and the wait.
+     */
+    saveViaManagement: async function (server, timeoutMs) {
+        try {
+            const entry = managementClient.entryFor(server.serverId);
+            if (!entry) return false;
+            await managementClient.saveWorld(entry, timeoutMs);
+        } catch (error) {
+            if (!this.managementFallbackLogged.has(server.serverId)) {
+                this.managementFallbackLogged.add(server.serverId);
+                sessionLogger.warn('RebootScheduler',
+                    `[${server.name}] management save failed (${error.message}); using save-all and the flush wait. Not logged again this run.`);
+            }
+            return false;
+        }
+        sessionLogger.info('RebootScheduler', `[${server.name}] world saved over the management protocol; no flush wait`);
+        return true;
     },
 
     /**
