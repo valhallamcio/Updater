@@ -39,7 +39,7 @@ function axiosError(status, code) {
 
 /**
  * A stand-in for the Yggdrasil sync routes. calls records every request in order.
- * opts: mode, frozen, freezeReason, instances(state), down, missing, putFails, beforeReseed(state).
+ * opts: mode, frozen, freezeReason, instances(state), down, missing, putFails, beforeReseed(state), movesStuck.
  */
 function fakeYggdrasil(opts = {}) {
     const calls = [];
@@ -74,7 +74,8 @@ function fakeYggdrasil(opts = {}) {
             calls.push(`POST ${url} ${body.serverId}`);
             if (opts.beforeReseed) opts.beforeReseed(state);
             if (!state.frozen) throw axiosError(409, 'not_frozen');
-            return { data: { data: { movesClosed: 1, trusted: 4, disownsQueued: 2 } } };
+            const stuck = opts.movesStuck || [];
+            return { data: { data: { group: 'evol', serverId: body.serverId, movesAborted: ['m1'], movesStuck: stuck, trusted: 4, disownsQueued: 2, disownBatches: 1 } } };
         }
     };
     return { http, calls, state };
@@ -269,7 +270,19 @@ test('restore: freeze, then reseed each restored instance once it is live, then 
     assert.ok(fake.calls.indexOf('shutdown bbbb2222') < firstReseed);
     assert.strictEqual(fake.calls.slice(firstReseed).filter(c => c.startsWith('GET')).length, 1, 'one readiness poll between the reseeds and the unfreeze');
     assert.match(p.text(), /start the restored instances from the panel/);
-    assert.match(p.text(), /Reseeded `aaaa1111`: 4 players trusted, 1 moves closed, 2 disowns queued\./);
+    assert.match(p.text(), /Reseeded `aaaa1111`: 4 players trusted, 1 moves aborted, 2 disowns queued\./);
+    assert.doesNotMatch(p.text(), /are stuck and need staff/);
+    assert.match(p.text(), /Moves are open again/);
+});
+
+test('restore: a reseed that leaves stuck moves names them for staff and still unfreezes', async () => {
+    const fake = fakeYggdrasil({ movesStuck: ['m7', 'm9'] });
+    const { sync } = makeSync(fake);
+    const p = progress();
+    const panel = { shutdown: async (sid) => { fake.calls.push(`shutdown ${sid}`); } };
+    const handle = await updateManager._internals.freezeAndShutdown({ tag: 'evol' }, IDS, { reason: 'restore evol x', restore: true }, p.report, panel, sync);
+    assert.strictEqual(await sync.reseedAndRelease(handle, IDS, { report: p.report }), true);
+    assert.match(p.text(), /2 move\(s\) on `aaaa1111` are stuck and need staff \(\/instance sync <player>\): m7, m9\./);
     assert.match(p.text(), /Moves are open again/);
 });
 

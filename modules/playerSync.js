@@ -163,8 +163,9 @@ function createPlayerSync(deps = {}) {
 
     /**
      * POST /sync/:group/reseed {serverId}: the instance's disk becomes the truth for the players it owns.
-     * @returns {Promise<object>} { movesClosed, trusted, disownsQueued }.
-     * @throws error.code 'not_frozen' when the group is not frozen.
+     * @returns {Promise<object>} { group, serverId, movesAborted: [moveId], movesStuck: [moveId], trusted,
+     *   disownsQueued, disownBatches }. Idempotent.
+     * @throws error.code 'not_frozen' when the group is not frozen, 'not_member' when the server is not in it.
      */
     async function reseed(group, serverId) {
         try {
@@ -414,7 +415,13 @@ function createPlayerSync(deps = {}) {
                     return false;
                 }
                 log.info('PlayerSync', `${handle.label}: reseeded ${sid} in ${handle.group}: ${JSON.stringify(result)}`);
-                await say(`\n- Reseeded \`${sid}\`: ${count(result?.trusted)} players trusted, ${count(result?.movesClosed)} moves closed, ${count(result?.disownsQueued)} disowns queued.`);
+                const aborted = Array.isArray(result?.movesAborted) ? result.movesAborted.length : 0;
+                const stuck = Array.isArray(result?.movesStuck) ? result.movesStuck : [];
+                await say(`\n- Reseeded \`${sid}\`: ${count(result?.trusted)} players trusted, ${aborted} moves aborted, ${count(result?.disownsQueued)} disowns queued.`);
+                // A stuck move stays stuck after the unfreeze. Staff release it per player.
+                if (stuck.length > 0) {
+                    await say(`\n- **Player sync: ${stuck.length} move(s) on \`${sid}\` are stuck and need staff (/instance sync <player>): ${stuck.join(', ')}.**`);
+                }
             }
             return await openMoves(handle, say, wait);
         } catch (error) {
