@@ -46,6 +46,7 @@ const {
 const manifest = require('../modules/manifest');
 const perInstanceFiles = require('../modules/perInstanceFiles');
 const notices = require('../modules/notices');
+const playerSync = require('../modules/playerSync');
 const sessionLogger = require('../modules/sessionLogger');
 const {
     active,
@@ -240,6 +241,23 @@ async function startInstances(allServerIds, skip = []) {
         if (failures[i]) notStarted.push(sid);
     });
     return notStarted;
+}
+
+/**
+ * Pauses player moves of the tag's sync group, then stops every instance. The freeze comes
+ * first, so no move can start toward an instance that is about to stop. A tag with no synced
+ * group only stops, as before (see modules/playerSync).
+ * @param {Object} freezeOpts { reason, restore } for playerSync.freezeGroup.
+ * @param {function} report Appends a line to the progress message. Never throws.
+ * @param {Object} client Panel client, injectable for tests.
+ * @param {Object} sync Player sync client, injectable for tests.
+ * @returns {Object} The freeze handle for playerSync.releaseFreeze or reseedAndRelease.
+ */
+async function freezeAndShutdown(pack, allServerIds, freezeOpts, report, client = pterodactyl, sync = playerSync) {
+    const freeze = await sync.freezeGroup(allServerIds, { label: pack.tag, report, ...freezeOpts });
+    await report(`\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`);
+    for (const sid of allServerIds) await client.shutdown(sid);
+    return freeze;
 }
 
 /**
@@ -517,6 +535,7 @@ module.exports = {
         awaitDecompressed,
         verifyBooted,
         startInstances,
+        freezeAndShutdown,
         BOOT_WATCH_TIMEOUT_MS,
         BOOT_WATCH_POLL_MS,
         BOOT_WATCH_MAX_FLAPS,
@@ -544,6 +563,10 @@ module.exports = {
 
         let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await editProgress(interaction, progressLog);
+        const report = async (text) => {
+            progressLog += text;
+            await editProgress(interaction, progressLog);
+        };
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
@@ -635,9 +658,8 @@ module.exports = {
             toCompressList.push(file);
         });
 
-        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+        progressLog += ` Done!`;
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
         const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`;
@@ -656,6 +678,10 @@ module.exports = {
                 progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
                 await editProgress(interaction, progressLog);
             }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
             return;
         }
 
@@ -716,6 +742,7 @@ module.exports = {
             const safeToRetry = failedInstances.filter(sid => !wipedInstances.includes(sid));
             progressLog += ` Done!\n\n**WARNING: ${failedInstances.join(', ')} failed to deploy and were NOT started. The database was left unchanged.${safeToRetry.length > 0 ? ` ${safeToRetry.join(', ')} still have their files, so the update can be run again. Backups are in \`./vault/${pack.tag}/instances/\`.` : ""}**${wipedWarning(wipedInstances, pack.tag)}`;
             await editProgress(interaction, progressLog);
+            await playerSync.releaseFreeze(syncFreeze, { report, stayReason: `${failedInstances.join(', ')} failed to deploy` });
             return;
         }
 
@@ -726,6 +753,12 @@ module.exports = {
             fileID: pack.newestFileID,
             newestFileID: pack.newestFileID,
             requiresUpdate: false
+        });
+
+        // Runs after the database write, so its wait can never cost the version update.
+        await playerSync.releaseFreeze(syncFreeze, {
+            report,
+            stayReason: notStarted.length > 0 ? `${notStarted.join(', ')} did not start` : null
         });
 
         //TODO ai summary ???
@@ -777,6 +810,10 @@ module.exports = {
 
         let progressLog = `Update sequence started for **${pack.name}** (${pack.modpackVersion} -> ${newVersionNumber}).`;
         await editProgress(interaction, progressLog);
+        const report = async (text) => {
+            progressLog += text;
+            await editProgress(interaction, progressLog);
+        };
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
@@ -812,9 +849,8 @@ module.exports = {
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+        progressLog += ` Done!`;
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
         const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${pack.fileID}.tar.gz`;
@@ -833,6 +869,10 @@ module.exports = {
                 progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
                 await editProgress(interaction, progressLog);
             }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
             return;
         }
 
@@ -900,6 +940,7 @@ module.exports = {
             const safeToRetry = failedInstances.filter(sid => !wipedInstances.includes(sid));
             progressLog += ` Done!\n\n**WARNING: ${failedInstances.join(', ')} failed to deploy and were NOT started. The database was left unchanged.${safeToRetry.length > 0 ? ` ${safeToRetry.join(', ')} still have their files, so the update can be run again. Backups are in \`./vault/${pack.tag}/instances/\`.` : ""}**${wipedWarning(wipedInstances, pack.tag)}`;
             await editProgress(interaction, progressLog);
+            await playerSync.releaseFreeze(syncFreeze, { report, stayReason: `${failedInstances.join(', ')} failed to deploy` });
             return;
         }
 
@@ -910,6 +951,12 @@ module.exports = {
             fileID: pack.newestFileID,
             newestFileID: pack.newestFileID,
             requiresUpdate: false
+        });
+
+        // Runs after the database write, so its wait can never cost the version update.
+        await playerSync.releaseFreeze(syncFreeze, {
+            report,
+            stayReason: notStarted.length > 0 ? `${notStarted.join(', ')} did not start` : null
         });
 
         //TODO ai summary ???
@@ -955,6 +1002,10 @@ module.exports = {
 
         let progressLog = `Restore sequence started for **${pack.name}** (${pack.modpackVersion} -> ${restoredPackData[1]}).`;
         await editProgress(interaction, progressLog);
+        const report = async (text) => {
+            progressLog += text;
+            await editProgress(interaction, progressLog);
+        };
 
         // Each instance goes back to its OWN backup where one exists. Backups taken before
         // per-instance updates shipped are a single shared archive holding whichever instance
@@ -990,9 +1041,7 @@ module.exports = {
         }
         progressLog += ` Done!`;
 
-        progressLog += `\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `restore ${pack.tag} ${backup}`, restore: true }, report);
 
         const backupDir = `./${pack.tag}/backup`;
         const failedInstances = [];
@@ -1042,6 +1091,7 @@ module.exports = {
         if (failedInstances.length > 0) {
             progressLog += `\n\n**WARNING: ${failedInstances.join(', ')} could not be restored. The database was left unchanged.**${wipedWarning(wipedInstances, pack.tag)}`;
             await editProgress(interaction, progressLog);
+            await playerSync.reseedAndRelease(syncFreeze, allServerIds, { report, stayReason: `${failedInstances.join(', ')} could not be restored` });
             return;
         }
 
@@ -1053,6 +1103,9 @@ module.exports = {
             fileID: restoredPackData[2],
             requiresUpdate: true
         });
+
+        // Runs after the database write: it waits for staff to start the instances, then reseeds them.
+        await playerSync.reseedAndRelease(syncFreeze, allServerIds, { report });
 
     },
 
@@ -1116,6 +1169,10 @@ module.exports = {
         const alert = alertScheduledUpdate.replace("[NEWVERSION]", newestVersion);
         let progressLog = `Update sequence started for **${pack.name}** (${currentVersion} -> ${newestVersion}).`;
         await editProgress(interaction, progressLog);
+        const report = async (text) => {
+            progressLog += text;
+            await editProgress(interaction, progressLog);
+        };
         
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
           // Clear working directory
@@ -1170,9 +1227,8 @@ module.exports = {
             toCompressList.push(file);
         });
         
-        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+        progressLog += ` Done!`;
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
         const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
@@ -1191,6 +1247,10 @@ module.exports = {
                 progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
                 await editProgress(interaction, progressLog);
             }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
             return;
         }
 
@@ -1312,6 +1372,7 @@ module.exports = {
             const safeToRetry = failedInstances.filter(sid => !wipedInstances.includes(sid));
             progressLog += ` Done!\n\n**WARNING: ${failedInstances.join(', ')} failed to deploy and were NOT started. The database was left unchanged.${safeToRetry.length > 0 ? ` ${safeToRetry.join(', ')} still have their files, so the update can be run again. Backups are in \`./vault/${pack.tag}/instances/\`.` : ""}**${wipedWarning(wipedInstances, pack.tag)}`;
             await editProgress(interaction, progressLog);
+            await playerSync.releaseFreeze(syncFreeze, { report, stayReason: `${failedInstances.join(', ')} failed to deploy` });
             return;
         }
 
@@ -1321,6 +1382,12 @@ module.exports = {
         await yggdrasil.updateServer(pack.tag, {
             modpack_version: newestVersion,
             requiresUpdate: false
+        });
+
+        // Runs after the database write, so its wait can never cost the version update.
+        await playerSync.releaseFreeze(syncFreeze, {
+            report,
+            stayReason: notStarted.length > 0 ? `${notStarted.join(', ')} did not start` : null
         });
 
         // Use consistent webhook structure
@@ -1410,6 +1477,10 @@ module.exports = {
         const alert = alertScheduledUpdate.replace("[NEWVERSION]", newestVersion);
         let progressLog = `Update sequence started for **${pack.name}** (${currentVersion} -> ${newestVersion}).`;
         await editProgress(interaction, progressLog);
+        const report = async (text) => {
+            progressLog += text;
+            await editProgress(interaction, progressLog);
+        };
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
         // Clear working directory
@@ -1465,9 +1536,8 @@ module.exports = {
             toCompressList.push(file);
         });
 
-        progressLog += ` Done!\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-        for (const sid of allServerIds) await pterodactyl.shutdown(sid);
+        progressLog += ` Done!`;
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
         const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
@@ -1486,6 +1556,10 @@ module.exports = {
                 progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
                 await editProgress(interaction, progressLog);
             }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
             return;
         }
 
@@ -1598,6 +1672,7 @@ module.exports = {
             const safeToRetry = failedInstances.filter(sid => !wipedInstances.includes(sid));
             progressLog += ` Done!\n\n**WARNING: ${failedInstances.join(', ')} failed to deploy and were NOT started. The database was left unchanged.${safeToRetry.length > 0 ? ` ${safeToRetry.join(', ')} still have their files, so the update can be run again. Backups are in \`./vault/${pack.tag}/instances/\`, per-server files in \`./vault/${pack.tag}/per-server/\`.` : ""}**${wipedWarning(wipedInstances, pack.tag)}`;
             await editProgress(interaction, progressLog);
+            await playerSync.releaseFreeze(syncFreeze, { report, stayReason: `${failedInstances.join(', ')} failed to deploy` });
             return;
         }
 
@@ -1606,6 +1681,12 @@ module.exports = {
         await yggdrasil.updateServer(pack.tag, {
             modpack_version: newestVersion,
             requiresUpdate: false
+        });
+
+        // Runs after the database write, so its wait can never cost the version update.
+        await playerSync.releaseFreeze(syncFreeze, {
+            report,
+            stayReason: notStarted.length > 0 ? `${notStarted.join(', ')} did not start` : null
         });
 
         const changelogUrl = newRelease.htmlUrl;

@@ -309,6 +309,8 @@ function isConnected() {
 
 module.exports = {
     SERVER_LIST_MAX_AGE_MS,
+    // The API client itself, for modules/playerSync (base URL, API key, default timeout).
+    apiClient: client,
     getPlayers,
     getPlayersDetailed,
     getServers,

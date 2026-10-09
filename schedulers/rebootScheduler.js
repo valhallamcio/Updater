@@ -23,8 +23,12 @@ module.exports = {
         "apiMaxRetries": 3, // NEW: Max API call retries
         "nodeRebootDelay": 5000, // NEW: Delay between nodes
         "serverRebootDelay": 3000, // NEW: Delay between servers
-        "rebootEvents": true // Write every countdown into valhallamc.reboot_events (the proxy renders it)
+        "rebootEvents": true, // Write every countdown into valhallamc.reboot_events (the proxy renders it)
+        "syncGroupStaggerMinutes": 15 // Instances of one synced group: the next one starts this long after the one before is back up
     },
+
+    // Player sync client (modules/playerSync). A test puts a fake here.
+    playerSync: require("../modules/playerSync"),
 
     // Open countdown docs (serverId -> { startedAt, id: Promise<insertedId|null> }), so the
     // stop step can stamp the doc it started and a retry inside the same minute can't double-write.
@@ -564,18 +568,23 @@ module.exports = {
             serverNodeMapping.set(server.serverId, realNodes[nodeIndex].id);
         });
         
+        // The batches run the first instance of each synced group. The others follow one at a
+        // time once the one before is back up, so players can switch to a running instance.
+        const { queue, followers } = await this.planSyncGroupStagger(this.state.rebootQueue);
+        const staggered = [];
+
         // Process in smaller, manageable batches
         const batchSize = Math.min(
             config.maxBatchSize || 12,
             realNodes.length * (config.maxConcurrentReboots || 4)
         );
         
-        const totalBatches = Math.ceil(this.state.rebootQueue.length / batchSize);
+        const totalBatches = Math.ceil(queue.length / batchSize);
         
         for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
             const batchStart = batchIndex * batchSize;
-            const batchEnd = Math.min(batchStart + batchSize, this.state.rebootQueue.length);
-            const currentBatch = this.state.rebootQueue.slice(batchStart, batchEnd);
+            const batchEnd = Math.min(batchStart + batchSize, queue.length);
+            const currentBatch = queue.slice(batchStart, batchEnd);
             
             sessionLogger.info('RebootScheduler', 
                 `Processing batch ${batchIndex + 1}/${totalBatches} (${currentBatch.length} servers)`);
@@ -588,13 +597,17 @@ module.exports = {
                 const serverIndex = currentBatch.indexOf(server);
                 await functions.sleep(serverIndex * (config.serverRebootDelay || 3000));
                 
+                let result;
                 try {
-                    return await this.executeFullServerReboot(server, nodeId);
+                    result = await this.executeFullServerReboot(server, nodeId);
                 } catch (error) {
                     sessionLogger.error('RebootScheduler', 
                         `[${server.name}] Unhandled error: ${error.message}`);
-                    return { success: false, reason: error.message };
+                    result = { success: false, reason: error.message };
                 }
+                const rest = followers.get(server.serverId);
+                if (rest) staggered.push(this.rebootSyncFollowers(server, result, rest, serverNodeMapping));
+                return result;
             });
             
             // Wait for batch completion
@@ -617,10 +630,93 @@ module.exports = {
             }
         }
         
+        if (staggered.length > 0) {
+            sessionLogger.info('RebootScheduler', `Waiting for the staggered reboots of ${staggered.length} sync group(s)`);
+            await Promise.allSettled(staggered);
+        }
+
         sessionLogger.info('RebootScheduler', 
             `Reboot queue processing completed. API calls made: ${this.state.apiCallCount}`);
         
         await this.completeRebootSequence();
+    },
+
+    /** Gap between two instances of one synced group: config syncGroupStaggerMinutes, default 15. */
+    syncStaggerMs: function () {
+        const minutes = this.runtimeConfig?.syncGroupStaggerMinutes;
+        return (typeof minutes === 'number' && minutes >= 0 ? minutes : 15) * 60000;
+    },
+
+    /**
+     * Splits the reboot queue so that the instances of one synced group reboot one after another.
+     * Only a group that passes the player sync gate (two or more queued instances share a
+     * non-empty group, and Yggdrasil answers mode shadow or live) is split. Every other server
+     * keeps today's timing, and a gate error keeps today's timing too.
+     * @param {Array} servers The queue.
+     * @returns {Promise<{queue: Array, followers: Map}>} queue: what the batches run.
+     *   followers: serverId of a group's first instance -> the instances after it, in order.
+     */
+    planSyncGroupStagger: async function (servers) {
+        const followers = new Map();
+        let groups;
+        try {
+            groups = await this.playerSync.activeGroupsAmong(servers, 'Daily reboot');
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `Sync group check failed (${error.message}), normal timing for every server`);
+            return { queue: servers, followers };
+        }
+
+        const held = new Set();
+        for (const [group, [first, ...rest]] of groups) {
+            followers.set(first.serverId, rest);
+            rest.forEach(server => held.add(server.serverId));
+            sessionLogger.info('RebootScheduler',
+                `Sync group ${group}: ${first.name} reboots with its batch. ${rest.map(s => s.name).join(', ')} follow one at a time, ${this.syncStaggerMs() / 60000} min after the one before is back up`);
+        }
+        return { queue: servers.filter(server => !held.has(server.serverId)), followers };
+    },
+
+    /**
+     * Reboots the other instances of a synced group, one at a time. Each one starts its warning
+     * window syncStaggerMs after the one before is back up. An instance that is not back up stops
+     * the chain, so the group never has all of its instances down.
+     * @param {object} first The instance the batch rebooted.
+     * @param {object} firstResult Its executeFullServerReboot result.
+     * @param {Array} rest The instances that follow, in order.
+     * @param {Map} nodeOf serverId -> nodeId.
+     */
+    rebootSyncFollowers: async function (first, firstResult, rest, nodeOf) {
+        let previous = first;
+        let previousResult = firstResult;
+        for (let i = 0; i < rest.length; i++) {
+            const server = rest[i];
+            const notRun = rest.slice(i);
+            if (!previousResult || !previousResult.success) {
+                sessionLogger.warn('RebootScheduler',
+                    `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because ${previous.name} is not back up (${previousResult ? previousResult.reason : 'no result'})`);
+                this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + notRun.length;
+                this.state.todayStats.totalServers = Math.max(0, (this.state.todayStats.totalServers || 0) - notRun.length);
+                return;
+            }
+
+            const staggerMs = this.syncStaggerMs();
+            sessionLogger.info('RebootScheduler',
+                `[${server.name}] Sync group: reboot starts in ${staggerMs / 60000} min (${previous.name} is back up)`);
+            await functions.sleep(staggerMs);
+            if (!this.state.isRebootInProgress) {
+                sessionLogger.warn('RebootScheduler',
+                    `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because the reboot sequence ended`);
+                return;
+            }
+
+            try {
+                previousResult = await this.executeFullServerReboot(server, nodeOf.get(server.serverId));
+            } catch (error) {
+                sessionLogger.error('RebootScheduler', `[${server.name}] Unhandled error: ${error.message}`);
+                previousResult = { success: false, reason: error.message };
+            }
+            previous = server;
+        }
     },
 
     /**
