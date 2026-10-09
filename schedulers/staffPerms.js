@@ -15,6 +15,11 @@ const yggdrasil = require("../modules/yggdrasil");
 const pterodactyl = require("../modules/pterodactyl");
 const sessionLogger = require("../modules/sessionLogger");
 
+// The panel throttles subuser writes: on 2026-10-08 ten creates went through in 5 s,
+// then every create got 429 "Too Many Attempts" and three staff were never added.
+const RETRY_WAIT_MS = 65000;
+const MAX_ATTEMPTS = 3;
+
 module.exports = {
     name: "staffPerms",
     defaultConfig: {
@@ -47,6 +52,26 @@ module.exports = {
         setInterval(() => this.givePerms(options), options.interval * 60 * 60 * 1000);
     },
 
+    /**
+     * Runs one panel call and tries again when it fails. The pterodactyl module logs the
+     * error and returns undefined, so an empty result is a failure.
+     * @param {string} label What the call does, for the log.
+     * @param {Function} call Returns the panel response.
+     * @returns The response, or null after MAX_ATTEMPTS failures.
+     */
+    withRetry: async function (label, call) {
+        for (let attempt = 1; ; attempt++) {
+            const result = await call();
+            if (result) return result;
+            if (attempt >= MAX_ATTEMPTS) {
+                sessionLogger.error('StaffPerms', `${label} failed ${MAX_ATTEMPTS} times. Skipped until the next run.`);
+                return null;
+            }
+            sessionLogger.warn('StaffPerms', `${label} failed (attempt ${attempt} of ${MAX_ATTEMPTS}). Next try in ${RETRY_WAIT_MS / 1000} s.`);
+            await functions.sleep(RETRY_WAIT_MS);
+        }
+    },
+
     givePerms: async function (options) {
 
         sessionLogger.info('StaffPerms', "Checking staff permissions...");
@@ -54,7 +79,8 @@ module.exports = {
 
         for (let server of servers) {
             //console.log(`Checking server ${server.name}`);
-            const subUsers = await pterodactyl.listUsers(server.serverId);
+            const subUsers = await this.withRetry(`Subuser list for ${server.name}`, () => pterodactyl.listUsers(server.serverId));
+            if (!subUsers) continue;
             //console.log(subUsers.data);
             for (let staffMail of options.staffMailList) {
 
@@ -66,9 +92,9 @@ module.exports = {
                         continue;
                     } else {
                         sessionLogger.info('StaffPerms', `User ${staffMail} has missing permissions for server ${server.name}! Updating...`);
-                        await pterodactyl.updateSubUser(server.serverId, user.attributes.uuid, {
+                        await this.withRetry(`Update of ${staffMail} on ${server.name}`, () => pterodactyl.updateSubUser(server.serverId, user.attributes.uuid, {
                             "permissions": options.staffPermissions
-                        });
+                        }));
                         await functions.sleep(1000);
                     }
                     continue;
@@ -82,7 +108,7 @@ module.exports = {
                     "permissions": options.staffPermissions
                 };
 
-                await pterodactyl.createSubUser(server.serverId, userBody);
+                await this.withRetry(`Add of ${staffMail} to ${server.name}`, () => pterodactyl.createSubUser(server.serverId, userBody));
 
             }
         }
