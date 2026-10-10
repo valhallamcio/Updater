@@ -203,7 +203,7 @@ module.exports = {
 
         const config = {
             onUploadProgress: (progressEvent) => {
-                progressBar.tick(progressEvent.loaded);
+                progressBar.tick(progressEvent.bytes);
             }
         };
 
@@ -215,7 +215,14 @@ module.exports = {
                 ...config,
                 headers: {
                     ...formData.getHeaders()
-                }
+                },
+                // With redirects on, axios sends through follow-redirects, which keeps every
+                // byte of the body in memory so it can send it again. A 2.1 GB merged zip got
+                // the updater OOM-killed that way. Plain http/https streams the file instead.
+                // A redirect now fails the upload, and the remote size check catches that.
+                maxRedirects: 0,
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity
             });
             sessionLogger.info('Downloader', `${fileName} uploaded successfully`);
         } catch (error) {
