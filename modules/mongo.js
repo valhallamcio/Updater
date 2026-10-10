@@ -344,26 +344,42 @@ module.exports = {
     },
 
     /**
+     * The conditional update behind claimScheduleJob. Mongo applies the filter and the $set
+     * as one step, so of two claims on a oneTime job only one can match.
+     * @param {string} jobId Schedule job ID.
+     * @param {boolean} [once] True for a oneTime job.
+     * @param {string|null} [firedOn] Pterodactyl id of the instance the job runs on.
+     * @returns {{filter: object, update: object}}
+     */
+    scheduleJobClaim: function (jobId, once = false, firedOn = null) {
+        const filter = { _id: jobId, active: true };
+        if (once) filter.startedAt = { $exists: false };
+        const set = { startedAt: new Date() };
+        if (firedOn) set.firedOn = String(firedOn);
+        return { filter, update: { $set: set } };
+    },
+
+    /**
      * Marks a job as started, only while it is still active. The matched count
      * is the answer: zero means somebody cancelled it first and it must not run.
      * A oneTime job is claimed once only, so a restart between its run and its
-     * deactivation never runs it again.
+     * deactivation never runs it again, and two instances of one tag never both run it.
      * @param {string} jobId Schedule job ID.
      * @param {boolean} [once] True for a oneTime job.
+     * @param {string|null} [firedOn] Pterodactyl id of the instance the job runs on.
      * @returns {Promise<object>} The updateOne result (`matchedCount`).
      */
-    claimScheduleJob: async function (jobId, once = false) {
+    claimScheduleJob: async function (jobId, once = false, firedOn = null) {
         if (!mainClientConnected) {
             await mongoClient.connect();
             mainClientConnected = true;
         }
 
-        const filter = { _id: jobId, active: true };
-        if (once) filter.startedAt = { $exists: false };
+        const { filter, update } = module.exports.scheduleJobClaim(jobId, once, firedOn);
         return mongoClient
             .db(mongoDBName)
             .collection('schedule_jobs')
-            .updateOne(filter, { $set: { startedAt: new Date() } });
+            .updateOne(filter, update);
     },
 
     /**

@@ -7,7 +7,8 @@
  *
  * Instanced servers share a tag but have distinct serverIds (e.g. pri -> "Project Infinity 0.1"
  * + "Project Innfinity #2"). A tag target reboots every instance; picking a specific instance
- * from autocomplete (value = serverId) reboots just that one.
+ * from autocomplete (value = serverId) reboots just that one. A tag whose instances share a
+ * synced player sync group reboots them one at a time (scheduledRebootScheduler.runJob).
  *
  * Writes a one-shot job to schedule_jobs (type: scheduled_reboot); scheduledRebootScheduler
  * fires it and rebootScheduler renders the alerts. Staff-only.
@@ -17,6 +18,7 @@ const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
 const rebootAlerts = require('../../modules/rebootAlerts');
+const rebootScheduler = require('../../schedulers/rebootScheduler');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -152,7 +154,26 @@ module.exports = {
         if (minutes > warnWindow) {
             embed.addFields({ name: 'Note', value: `Players are warned only for the final ${warnWindow} min.`, inline: false });
         }
+        const stagger = await this.staggerNote(instances, instanceServerId);
+        if (stagger) embed.addFields({ name: 'Player sync', value: stagger, inline: false });
 
         await interaction.editReply({ embeds: [embed] });
+    },
+
+    /**
+     * Tells staff when the instances will reboot one at a time. The job checks the same gate
+     * again when it fires. Never throws.
+     * @returns {Promise<string|null>}
+     */
+    async staggerNote(instances, instanceServerId) {
+        if (instanceServerId || instances.length < 2) return null;
+        try {
+            const groups = await rebootScheduler.playerSync.activeGroupsAmong(instances, '/reboot');
+            if (groups.size === 0) return null;
+            return `Sync group ${[...groups.keys()].map(g => `\`${g}\``).join(', ')}: the instances reboot one at a time. ` +
+                `Each one starts ${rebootScheduler.syncStaggerMs() / 60000} min after the one before is back up.`;
+        } catch (_) {
+            return null;
+        }
     },
 };

@@ -98,7 +98,8 @@ falling back to a legacy shared archive with the per-server snapshot laid over t
 | `/servers-live` | Create an auto-updating server status embed |
 | `/online` | Show online players across all servers |
 | `/stats` | Show server performance stats |
-| `/execute <server> <command>` | Execute a console command on a server |
+| `/execute <server> <command>` | Execute a console command on a server. A tag runs on every instance and reports each one; an instance choice runs on that one only |
+| `/sync-group <status\|freeze\|unfreeze> <group>` | Read a player sync group, or pause and open moves between its instances. `unfreeze` refuses while an instance is down or on another pack unless `force:true` |
 | `/schedule-reboot` | Manage automatic reboots (status, force, enable, disable, history, abort, cleanup) |
 | `/schedule-execute` | Manually execute scheduled operations or run commands across servers |
 | `/schedule-player` | Configure player-triggered commands (create, list, disable, delete) |

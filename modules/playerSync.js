@@ -40,6 +40,11 @@ function configuredWaitMs() {
     return DEFAULT_UNFREEZE_WAIT_MINUTES * 60000;
 }
 
+/** True when VU froze the group for an update or a restore. */
+function isUpdaterFreeze(reason) {
+    return VU_REASON.test(reason || '');
+}
+
 function formatWait(ms) {
     return ms >= 60000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`;
 }
@@ -314,7 +319,7 @@ function createPlayerSync(deps = {}) {
     /** Reports loudly that the group stays frozen. Never throws. */
     async function stayFrozen(handle, reason, say, next = '') {
         log.error('PlayerSync', `${handle.label}: moves stay frozen for ${handle.group}: ${reason}`);
-        await say(`\n\n**Moves stay frozen for \`${handle.group}\`: ${reason}. ${next}Unfreeze with a staff action (PUT /v1/biforesting/sync/${handle.group} with {"frozen": false}) once every instance is up on one pack.**`);
+        await say(`\n\n**Moves stay frozen for \`${handle.group}\`: ${reason}. ${next}Unfreeze with a staff action (\`/sync-group unfreeze group:${handle.group}\`) once every instance is up on one pack.**`);
     }
 
     /** Waits for every instance on one fingerprint, then unfreezes. Never throws. */
@@ -449,6 +454,7 @@ module.exports = {
     createPlayerSync,
     sharedGroup,
     unfreezeBlocker,
+    isUpdaterFreeze,
     ACTIVE_MODES,
     DEFAULT_UNFREEZE_WAIT_MINUTES
 };

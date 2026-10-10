@@ -44,6 +44,39 @@ function sameServer(a, b) {
     return String(a.name || '').trim() === String(b.name || '').trim();
 }
 
+/** How many instances share the tag. */
+function instanceCount(servers, tag) {
+    return servers.filter(s => s.tag === tag).length;
+}
+
+/**
+ * The instance of a tag the player stands on now.
+ * @param {object|null} detailed `getPlayersDetailed()` rows by tag.
+ * @param {object[]} servers Yggdrasil's server rows.
+ * @param {string} tag The pack's tag.
+ * @param {string} playerId Username.
+ * @returns {object|null} The instance row, or null when the player is not on the tag or the row
+ *   does not name one of its instances.
+ */
+function standingInstance(detailed, servers, tag, playerId) {
+    const rows = (detailed && detailed[tag]) || [];
+    const row = rows.find(r => String(r.username || '').toLowerCase() === String(playerId).toLowerCase());
+    if (!row || !row.instance) return null;
+    const standing = findServer(servers, row.instance);
+    if (!standing || !standing.byInstance || standing.server.tag !== tag) return null;
+    return standing.server;
+}
+
+/**
+ * The identifiers a job fires on. `instanceServerId` pins the job to one instance.
+ * @param {object} trigger The player_trigger job.
+ * @returns {string[]}
+ */
+function triggerIds(trigger) {
+    if (trigger.instanceServerId) return [String(trigger.instanceServerId)];
+    return Array.isArray(trigger.serverNames) ? trigger.serverNames : [];
+}
+
 module.exports = {
     name: 'playerEventScheduler',
     defaultConfig: {
@@ -108,35 +141,49 @@ module.exports = {
             // A job addressed to ONE instance (by name or id) only fires while the
             // player stands on that instance. The console path cannot see a
             // failed `give`, so a player who hopped to the sibling instance would
-            // get nothing and the job would still count as run.
-            const needsInstances = activeTriggers.some(t =>
-                (t.serverNames || []).some(id => (findServer(servers, id) || {}).byInstance));
+            // get nothing and the job would still count as run. A job addressed to
+            // a tag with several instances fires on the instance the player stands on.
+            const needsInstances = activeTriggers.some(t => triggerIds(t).some(id => {
+                const found = findServer(servers, id);
+                return Boolean(found) && (found.byInstance || instanceCount(servers, found.server.tag) > 1);
+            }));
             const detailed = needsInstances ? await yggdrasil.getPlayersDetailed() : null;
 
             for (const trigger of activeTriggers) {
-                const { playerId, serverNames, commands, onJoin, lastSeenServers = [] } = trigger;
+                const { playerId, onJoin, lastSeenServers = [] } = trigger;
 
-                // Track current servers (by their stored identifier) where the player is online.
+                // Track current servers (by their stored identifier) where the player is online,
+                // and the instance each one runs on.
                 const currentServers = [];
-                for (const serverName of serverNames) {
+                const runOn = new Map();
+                for (const serverName of triggerIds(trigger)) {
                     const found = findServer(servers, serverName);
                     const tag = found ? found.server.tag : serverName;
                     const online = playersData[tag];
                     if (!online || !online.some(u => u.toLowerCase() === String(playerId).toLowerCase())) continue;
-                    if (found && found.byInstance && !this.onInstance(detailed, servers, tag, playerId, found.server)) continue;
+                    let target = serverName;
+                    if (found && found.byInstance) {
+                        if (!this.onInstance(detailed, servers, tag, playerId, found.server)) continue;
+                    } else if (found && instanceCount(servers, tag) > 1) {
+                        // Never guess the instance: wait until Yggdrasil names it.
+                        const standing = standingInstance(detailed, servers, tag, playerId);
+                        if (!standing || !standing.serverId) continue;
+                        target = standing.serverId;
+                    }
                     currentServers.push(serverName);
+                    runOn.set(serverName, target);
                 }
-                
+
                 const wasOnline = lastSeenServers.length > 0;
                 const isOnline = currentServers.length > 0;
-                
+
                 if (isOnline) {
                     if (onJoin) {
                         // OnJoin mode: execute EVERY time player goes from offline → online
                         if (!wasOnline) {
                             // Player just came online - execute trigger
                             for (const serverName of currentServers) {
-                                await this.executePlayerTrigger(trigger, serverName);
+                                await this.executePlayerTrigger(trigger, runOn.get(serverName));
                                 break; // Only execute once per join
                             }
                         }
@@ -144,7 +191,7 @@ module.exports = {
                     } else {
                         // Normal mode: execute continuously while online (every check)
                         for (const serverName of currentServers) {
-                            await this.executePlayerTrigger(trigger, serverName);
+                            await this.executePlayerTrigger(trigger, runOn.get(serverName));
                             break; // Only execute once per check cycle
                         }
                     }
@@ -194,13 +241,20 @@ module.exports = {
             const server = found ? found.server : null;
 
             if (!server) return;
+            // A tag with several instances names no one instance. Its first row is not the
+            // instance the player is on, so the caller must name the instance.
+            if (!found.byInstance && instanceCount(servers, server.tag) > 1) {
+                sessionLogger.warn('PlayerEventScheduler', `Player trigger ${key}: ${serverName} has ${instanceCount(servers, server.tag)} instances and no instance was named, skipping`);
+                return;
+            }
 
             // The proxy's cake bank cancels a job nobody ran inside its refund
             // window. This claim and that cancel both filter on `active`, so
             // exactly one of them wins, and a job that lost is never run. A
             // oneTime job is also claimed once only: a restart between the run
-            // and the deactivation must not run it a second time.
-            const claim = await mongo.claimScheduleJob(trigger._id, Boolean(trigger.oneTime));
+            // and the deactivation must not run it a second time, and two
+            // instances of one tag cannot both run it.
+            const claim = await mongo.claimScheduleJob(trigger._id, Boolean(trigger.oneTime), server.serverId || null);
             if (claim && claim.matchedCount === 0) {
                 sessionLogger.info('PlayerEventScheduler', `Player trigger ${key} was cancelled before it ran, skipping`);
                 return;
@@ -451,3 +505,6 @@ module.exports = {
 
 module.exports.findServer = findServer;
 module.exports.sameServer = sameServer;
+module.exports.instanceCount = instanceCount;
+module.exports.standingInstance = standingInstance;
+module.exports.triggerIds = triggerIds;

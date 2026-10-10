@@ -4,6 +4,7 @@ const {
 } = require('discord.js');
 const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
+const serverTargets = require('../../modules/serverTargets');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -72,23 +73,11 @@ module.exports = {
                 usernames.map(u => ({ name: u, value: u })),
             );
         } else if (focusedOption.name === 'servers') {
-            const focusedValue = focusedOption.value;
-            const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
-            const choices = ["all"];
-
-            for (const server of serverList) {
-                if (!server.excludeFromServerList) {
-                    choices.push(server.name.trim());
-                }
-            }
-
-            const filtered = choices.filter(choice => choice.toLowerCase().includes(focusedValue.toLowerCase()));
-            await interaction.respond(
-                filtered.slice(0, 25).map(choice => ({
-                    name: choice,
-                    value: choice
-                })),
-            );
+            // A tag of several instances fires once, on the instance the player is on.
+            // An instance choice pins the job to that one instance.
+            const serverList = (await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS))
+                .filter(server => !server.excludeFromServerList);
+            await interaction.respond(serverTargets.autocompleteChoices(serverList, focusedOption.value, ['all']));
         } else if (focusedOption.name === 'trigger_id') {
             const focusedValue = focusedOption.value;
             const triggers = await mongo.getActiveScheduleJobs('player_trigger');
@@ -96,7 +85,8 @@ module.exports = {
 
             for (const trigger of triggers) {
                 const shortId = trigger._id.toString().substring(0, 8);
-                const displayName = `${shortId}... | ${trigger.playerId} → ${trigger.serverNames.slice(0, 2).join(', ')}${trigger.serverNames.length > 2 ? '...' : ''}`;
+                const names = trigger.serverNames || [];
+                const displayName = `${shortId}... | ${trigger.playerId} → ${names.slice(0, 2).join(', ')}${names.length > 2 ? '...' : ''}`;
                 choices.push({
                     name: displayName,
                     value: trigger._id.toString()
@@ -161,15 +151,8 @@ module.exports = {
         const allServers = await yggdrasil.getServers();
         const validServers = [];
         for (const serverName of serverNames) {
-            // Try exact match first, then case-insensitive, then tag match
-            const server = allServers.find(s => 
-                s.name.trim() === serverName.trim() ||
-                s.name.trim().toLowerCase() === serverName.trim().toLowerCase() ||
-                s.tag === serverName.toLowerCase()
-            );
-            if (server) {
-                validServers.push(server.name.trim()); // Use actual server name, trimmed
-            }
+            const id = this.storedIdentifier(allServers, serverName);
+            if (id && !validServers.includes(id)) validServers.push(id);
         }
         
         if (validServers.length === 0) {
@@ -214,12 +197,36 @@ module.exports = {
                 { name: 'Player', value: playerId, inline: true },
                 { name: 'One-time', value: oneTime ? 'Yes' : 'No', inline: true },
                 { name: 'On Join Only', value: onJoin ? 'Yes' : 'No', inline: true },
-                { name: 'Servers', value: validServers.join(', '), inline: false },
+                { name: 'Servers', value: this.describeTargets(allServers, validServers).slice(0, 1024), inline: false },
                 { name: 'Commands', value: commands.join('\n'), inline: false }
             )
             .setTimestamp();
-        
+
         await interaction.editReply({ embeds: [embed] });
+    },
+
+    /**
+     * What a job stores for one typed server. A tag with several instances is stored as the
+     * tag: the job then fires once, on the instance the player is on. A name or a Pterodactyl
+     * id stays pinned to that one instance.
+     * @param {Array} servers Server docs from Yggdrasil.
+     * @param {string} typed One entry of the servers option.
+     * @returns {string|null} The identifier to store, or null when nothing matches.
+     */
+    storedIdentifier(servers, typed) {
+        const { servers: matched, by } = serverTargets.resolveTargets(servers, typed);
+        if (matched.length === 0) return null;
+        if (by === 'tag') return matched.length > 1 ? matched[0].tag : matched[0].name.trim();
+        if (by === 'id') return matched[0].serverId;
+        return matched[0].name.trim();
+    },
+
+    /** The Servers field: a multi-instance tag says that it fires once on one instance. */
+    describeTargets(servers, ids) {
+        return ids.map(id => {
+            const count = serverTargets.instancesOfTag(servers, id).length;
+            return count > 1 ? `${id} (any of ${count} instances, fires once, on the one the player is on)` : id;
+        }).join(', ');
     },
 
     async listPlayerTriggers(interaction) {

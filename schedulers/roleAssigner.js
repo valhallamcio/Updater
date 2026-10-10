@@ -36,6 +36,54 @@ const {
     ButtonStyle
 } = require('discord.js');
 
+/**
+ * The label of a pack with several instances: the shortest instance name, then the first in
+ * alphabetical order. It does not depend on the order Yggdrasil lists the instances in.
+ */
+function packLabel(rows) {
+    const names = rows.map(r => String(r.name || '').trim()).filter(Boolean);
+    if (names.length === 0) return rows[0].tag;
+    return names.sort((a, b) => a.length - b.length || a.localeCompare(b))[0];
+}
+
+/**
+ * One role button per pack. The instances of a tag share one Discord role, so they share
+ * one button, and the role id comes from all of them together.
+ * @param {Array} servers Server docs, with the mention and Bifrost rows put in front.
+ * @returns {{packs: Array, conflicts: Array}} packs: one row per tag in first-seen order, with
+ *   the role id the instances carry ('' when none has one). conflicts: { tag, roleIds } for a
+ *   tag whose instances carry different role ids. Such a tag gets no button and no new role.
+ */
+function packButtons(servers) {
+    const byTag = new Map();
+    for (const server of servers) {
+        if (!server || !server.tag) continue;
+        if (!byTag.has(server.tag)) byTag.set(server.tag, []);
+        byTag.get(server.tag).push(server);
+    }
+
+    const packs = [];
+    const conflicts = [];
+    for (const [tag, rows] of byTag) {
+        const roleIds = [...new Set(rows.map(r => r.discordRoleId).filter(Boolean))];
+        if (roleIds.length > 1) {
+            conflicts.push({ tag, roleIds });
+            continue;
+        }
+        // Pack data for the emoji. The instances run one pack, so any row that has it will do.
+        const data = rows.find(r => r.modpackID) || {};
+        packs.push({
+            tag,
+            name: rows.length === 1 ? rows[0].name : packLabel(rows),
+            discordRoleId: roleIds[0] || '',
+            hostname: data.hostname,
+            modpackID: data.modpackID,
+            platform: data.platform
+        });
+    }
+    return { packs, conflicts };
+}
+
 module.exports = {
     name: "roleAssigner",
     defaultConfig: {
@@ -58,6 +106,8 @@ module.exports = {
         const client = await getClient();
         // Hash of the button rows last written. A rebuild that lands on the same rows edits nothing.
         let lastPayloadHash = null;
+        // Role id conflicts already logged, so the 1 min rebuild does not repeat them.
+        const loggedConflicts = new Set();
 
         client.on("interactionCreate", async interaction => {
             if (interaction.isButton() && interaction.message.channelId === options.roleChannelId) {
@@ -65,11 +115,18 @@ module.exports = {
                     let serverList = await yggdrasil.getServers();
                     serverList = await addMentionButton(serverList);
                     serverList = await addBifrostButton(serverList);
-                    let server = serverList.find(server => server.tag === interaction.customId);
+                    let server = packButtons(serverList).packs.find(pack => pack.tag === interaction.customId);
                     let replyMessage = "Something went wrong!";
                     //console.log(interaction);
                     const guildMember = await interaction.guild.members.fetch(interaction.user.id);
-                    const role = interaction.guild.roles.cache.find(role => role.id === server.discordRoleId);
+                    const role = server && server.discordRoleId
+                        ? interaction.guild.roles.cache.find(role => role.id === server.discordRoleId)
+                        : null;
+                    if (!role) {
+                        sessionLogger.warn('RoleAssigner', `No role for button ${interaction.customId}`);
+                        await interaction.reply({ content: "This role is not available right now.", ephemeral: true });
+                        return;
+                    }
 
                     if (guildMember.roles.cache.has(role.id)) {
                         await guildMember.roles.remove(role);
@@ -117,15 +174,17 @@ module.exports = {
             let serverListFull = await addMentionButton(serverList);
             serverListFull = await addBifrostButton(serverListFull);
 
-            const seen = new Set();
-            const deduped = serverListFull.filter(server => {
-                if (seen.has(server.tag)) return false;
-                seen.add(server.tag);
-                return true;
-            });
+            // One row per tag. The role id comes from every instance, never from the first one.
+            const { packs, conflicts } = packButtons(serverListFull);
+            for (const { tag, roleIds } of conflicts) {
+                const key = `${tag}:${roleIds.join(',')}`;
+                if (loggedConflicts.has(key)) continue;
+                loggedConflicts.add(key);
+                sessionLogger.warn('RoleAssigner', `The instances of ${tag} carry different role ids (${roleIds.join(', ')}). No button for ${tag} until they match.`);
+            }
 
-            serverList = deduped.filter(server => server.discordRoleId != "" && server.discordRoleId);
-            const serverListMissing = deduped.filter(server => !server.discordRoleId || server.discordRoleId === "");
+            serverList = packs.filter(server => server.discordRoleId);
+            const serverListMissing = packs.filter(server => !server.discordRoleId);
             await generateNewRoles(serverListMissing);
         
             const webhook = await getWebhook(options.roleChannelId);
@@ -295,3 +354,5 @@ module.exports = {
     }
 
 };
+
+module.exports.packButtons = packButtons;

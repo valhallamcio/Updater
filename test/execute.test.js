@@ -66,3 +66,99 @@ test('op never created: the error reaches the caller, which uses the console', a
     yggdrasil.runOp = async () => { throw new Error('ECONNREFUSED'); };
     await assert.rejects(runViaLink('ptero-1', 'say hi'), /ECONNREFUSED/);
 });
+
+// ---------------------------------------------------------------------------
+// Instances: a tag runs on every instance and the reply reports each one
+// ---------------------------------------------------------------------------
+
+const executeCommand = require('../discord/commands/execute');
+const { runOnInstance, formatReport } = executeCommand;
+
+const EVOL = [
+    { tag: 'evol', name: 'Evolution', serverId: 'e7575fc9' },
+    { tag: 'evol', name: 'Evolution #2', serverId: '505d921b' },
+    { tag: 'evol', name: 'Evolution #3', serverId: 'e2f5e517' }
+];
+const SERVERS = [...EVOL, { tag: 'gtnh', name: 'GT New Horizons', serverId: 'aaaa0001' }];
+
+function fakeInteraction(server, command) {
+    const out = { replies: [], edits: [], followUps: [] };
+    out.interaction = {
+        options: { getString: name => (name === 'server' ? server : command) },
+        deferred: false,
+        replied: false,
+        async reply(text) { out.replies.push(text); this.replied = true; },
+        async deferReply() { this.deferred = true; },
+        async editReply(text) { out.edits.push(text); },
+        async followUp(payload) { out.followUps.push(payload); }
+    };
+    return out;
+}
+
+/** runOnInstance stand-in that answers with the instance id. */
+function fakeRun(ran) {
+    return async (server, command) => {
+        ran.push(server.serverId);
+        return { server, via: 'link', output: `${command} on ${server.serverId}`, error: null, timedOut: false };
+    };
+}
+
+test('execute: a tag runs on every instance, and the reply has a section per instance', async () => {
+    const ran = [];
+    const fake = fakeInteraction('evol', 'list');
+    await executeCommand.execute(fake.interaction, { servers: SERVERS, run: fakeRun(ran) });
+
+    assert.deepStrictEqual(ran, ['e7575fc9', '505d921b', 'e2f5e517']);
+    assert.strictEqual(fake.edits.length, 1);
+    const [reply] = fake.edits;
+    assert.match(reply, /to \*\*3 instances\*\* of `evol`/);
+    for (const s of EVOL) {
+        assert.ok(reply.includes(`**${s.name}** (\`${s.serverId}\`)`), `${s.name} has its own section`);
+        assert.ok(reply.includes(`list on ${s.serverId}`), `${s.name} shows its own output`);
+    }
+});
+
+test('execute: an instance id runs on that instance only', async () => {
+    const ran = [];
+    const fake = fakeInteraction('505d921b', 'list');
+    await executeCommand.execute(fake.interaction, { servers: SERVERS, run: fakeRun(ran) });
+    assert.deepStrictEqual(ran, ['505d921b']);
+    assert.match(fake.edits[0], /^Sent `list` to \*\*Evolution #2\*\* via link/);
+});
+
+test('execute: an ambiguous cut name runs nowhere', async () => {
+    const ran = [];
+    const fake = fakeInteraction('Evolution...', 'stop');
+    await executeCommand.execute(fake.interaction, { servers: SERVERS, run: fakeRun(ran) });
+    assert.deepStrictEqual(ran, []);
+    assert.match(fake.replies[0], /matches 3 instances/);
+});
+
+test('formatReport: long outputs go into one attachment with a header per instance', () => {
+    const results = EVOL.map(server => ({ server, via: 'console', output: 'x'.repeat(900), error: null, timedOut: false }));
+    results[1] = { server: EVOL[1], via: 'console', output: '', error: null, timedOut: true };
+    const report = formatReport('list', results);
+
+    assert.ok(report.content.length <= 1900);
+    assert.match(report.content, /\*\*Evolution #2\*\* \(`505d921b`\): ⚠️/);
+    assert.match(report.content, /\*\*Evolution\*\* \(`e7575fc9`\): \*output in the attachment\*/);
+    for (const s of EVOL) assert.ok(report.attachment.includes(`=== ${s.name} (${s.serverId}) ===`));
+});
+
+test('runOnInstance: no link session goes to the console, and its errors are reported, not thrown', async () => {
+    const sentTo = [];
+    const deps = {
+        getLinkSession: async () => null,
+        runViaLink: async () => { throw new Error('must not be called'); },
+        sendAdvancedCommand: async (id) => { sentTo.push(id); return 'done'; }
+    };
+    const ok = await runOnInstance(EVOL[2], 'list', deps);
+    assert.deepStrictEqual(sentTo, ['e2f5e517']);
+    assert.deepStrictEqual([ok.via, ok.output, ok.error], ['console', 'done', null]);
+
+    const failed = await runOnInstance(EVOL[2], 'list', { ...deps, sendAdvancedCommand: async () => { throw new Error('socket closed'); } });
+    assert.strictEqual(failed.error, 'socket closed');
+
+    const slow = await runOnInstance(EVOL[2], 'list', { ...deps, consoleTimeoutMs: 5, sendAdvancedCommand: () => new Promise(() => {}) });
+    assert.strictEqual(slow.timedOut, true);
+});

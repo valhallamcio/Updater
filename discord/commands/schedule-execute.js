@@ -5,6 +5,8 @@ const {
 const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
 const pterodactyl = require('../../modules/pterodactyl');
+const serverTargets = require('../../modules/serverTargets');
+const playerEvents = require('../../schedulers/playerEventScheduler');
 const { sleep } = require('../../modules/functions');
 
 module.exports = {
@@ -60,31 +62,13 @@ module.exports = {
 
     async autocomplete(interaction) {
         const focusedOption = interaction.options.getFocused(true);
-        
+
         if (focusedOption.name === 'servers' || focusedOption.name === 'server') {
-            const focusedValue = focusedOption.value;
-            const serverList = await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS);
-            const choices = focusedOption.name === 'servers' ? ["all"] : [];
-
-            for (const server of serverList) {
-                if (!server.excludeFromServerList) {
-                    // Trim and ensure server name doesn't exceed Discord's 25-character limit
-                    let serverName = server.name.trim();
-                    if (serverName.length > 20) {
-                        serverName = serverName.substring(0, 20) + "..."; // 20 + 3 = 23 chars (safely under 25)
-                    }
-                    choices.push(serverName);
-                }
-            }
-
-            const filtered = choices.filter(choice => choice.toLowerCase().includes(focusedValue.toLowerCase()));
-            // Discord has a maximum of 25 autocomplete choices - already limited but adding comment for clarity
-            await interaction.respond(
-                filtered.slice(0, 25).map(choice => ({
-                    name: choice,
-                    value: choice
-                })),
-            );
+            // A tag runs on every instance of the pack. An instance choice runs on that one only.
+            const serverList = (await yggdrasil.getServers(yggdrasil.SERVER_LIST_MAX_AGE_MS))
+                .filter(server => !server.excludeFromServerList);
+            const extra = focusedOption.name === 'servers' ? ['all'] : [];
+            await interaction.respond(serverTargets.autocompleteChoices(serverList, focusedOption.value, extra));
         }
     },
 
@@ -113,72 +97,92 @@ module.exports = {
         }
     },
 
-    async executePlayerTrigger(interaction) {
+    /**
+     * The instances a player trigger runs on. A trigger fires at most once per tag: on a tag with
+     * several instances it runs on the one the player stands on, and on none when the player is
+     * on none of them. A name or a Pterodactyl id names one instance.
+     * @param {object} trigger The player_trigger job.
+     * @param {string|null} serverOverride The server option.
+     * @param {Array} allServers Server docs from Yggdrasil.
+     * @param {Function} getDetailed Returns `getPlayersDetailed()` rows by tag.
+     * @returns {Promise<{servers: Array, skipped: Array<string>}>}
+     */
+    async playerTriggerTargets(trigger, serverOverride, allServers, getDetailed) {
+        const ids = serverOverride ? [serverOverride] : playerEvents.triggerIds(trigger);
+        const servers = [];
+        const skipped = [];
+        let detailed = null;
+        for (const id of ids) {
+            const found = serverTargets.resolveTargets(allServers, id);
+            if (found.servers.length === 0) {
+                skipped.push(`❓ ${id}: ${found.error || 'not found'}`);
+                continue;
+            }
+            let server = found.servers.length === 1 ? found.servers[0] : null;
+            if (!server) {
+                detailed = detailed || await getDetailed();
+                server = playerEvents.standingInstance(detailed, allServers, found.servers[0].tag, trigger.playerId);
+                if (!server) {
+                    skipped.push(`⏸️ ${id}: ${trigger.playerId} is not on any of its ${found.servers.length} instances`);
+                    continue;
+                }
+            }
+            if (!servers.some(s => s.serverId === server.serverId)) servers.push(server);
+        }
+        return { servers, skipped };
+    },
+
+    async executePlayerTrigger(interaction, deps = {}) {
         const triggerId = interaction.options.getString('trigger_id');
         const serverOverride = interaction.options.getString('server');
-        
+        const db = deps.mongo || mongo;
+        const ygg = deps.yggdrasil || yggdrasil;
+        const panel = deps.pterodactyl || pterodactyl;
+        const pause = deps.sleep || sleep;
+
         try {
             // Get the trigger
-            const { ObjectId } = require('mongodb');
-            const allJobs = await mongo.getAllScheduleJobs();
+            const allJobs = await db.getAllScheduleJobs();
             const trigger = allJobs.find(job => job._id.toString() === triggerId && job.type === 'player_trigger');
-            
+
             if (!trigger) {
                 await interaction.editReply('❌ Player trigger not found!');
                 return;
             }
-            
+
             if (!trigger.active) {
                 await interaction.editReply('❌ This trigger is disabled!');
                 return;
             }
-            
-            // Determine servers to execute on
-            let serverNames = trigger.serverNames;
-            if (serverOverride) {
-                serverNames = [serverOverride];
-            }
-            
-            // Get server data
-            const allServers = await yggdrasil.getServers();
-            const serversToExecute = [];
-            
-            for (const serverName of serverNames) {
-                let server = allServers.find(s => 
-                    s.name.trim() === serverName.trim() ||
-                    s.name.trim().toLowerCase() === serverName.trim().toLowerCase() ||
-                    s.tag === serverName.toLowerCase()
-                );
-                
-                // If not found and name ends with "...", try matching by prefix (for truncated names)
-                if (!server && serverName.endsWith('...')) {
-                    const prefix = serverName.substring(0, serverName.length - 3);
-                    server = allServers.find(s =>
-                        s.name.trim().startsWith(prefix) ||
-                        (s.tag && s.tag.toLowerCase().startsWith(prefix.toLowerCase()))
-                    );
-                }
-                
-                if (server) {
-                    serversToExecute.push(server);
-                }
-            }
-            
+
+            const allServers = await ygg.getServers();
+            const { servers: serversToExecute, skipped } = await this.playerTriggerTargets(
+                trigger, serverOverride, allServers, () => ygg.getPlayersDetailed());
+
             if (serversToExecute.length === 0) {
-                await interaction.editReply('❌ No valid servers found for execution!');
+                await interaction.editReply(['❌ No valid servers found for execution!', ...skipped].join('\n').slice(0, 2000));
                 return;
             }
-            
+
+            // The same claim the scheduler takes. A oneTime trigger that the scheduler or another
+            // staff member already ran, or that the proxy cancelled, does not run again.
+            const firedOn = serversToExecute.length === 1 ? serversToExecute[0].serverId : null;
+            const claim = await db.claimScheduleJob(trigger._id, Boolean(trigger.oneTime), firedOn);
+            if (claim && claim.matchedCount === 0) {
+                await interaction.editReply('❌ This trigger already ran or was cancelled. Nothing was sent.');
+                return;
+            }
+
             // Execute commands
             let successCount = 0;
             let failCount = 0;
             const results = [];
-            
+
             for (const server of serversToExecute) {
                 try {
                     for (const command of trigger.commands) {
-                        await pterodactyl.sendCommand(server.serverId, command);
-                        await sleep(1000); // 1 second delay between commands
+                        await panel.sendCommand(server.serverId, command);
+                        await pause(1000); // 1 second delay between commands
                     }
                     successCount++;
                     results.push(`✅ ${server.name}: Success`);
@@ -187,25 +191,26 @@ module.exports = {
                     results.push(`❌ ${server.name}: Failed - ${error.message}`);
                 }
             }
-            
+            results.push(...skipped);
+
             // Mark as executed if one-time
             if (trigger.oneTime) {
-                await mongo.deactivateScheduleJob(new ObjectId(triggerId));
+                await db.deactivateScheduleJob(trigger._id);
             }
-            
+
             const embed = new EmbedBuilder()
-                .setColor(failCount === 0 ? 0x00ff00 : 0xffa500)
+                .setColor(failCount === 0 && skipped.length === 0 ? 0x00ff00 : 0xffa500)
                 .setTitle('⚡ Player Trigger Executed')
                 .addFields(
                     { name: 'Trigger ID', value: triggerId, inline: true },
                     { name: 'Player', value: trigger.playerId, inline: true },
                     { name: 'Executed By', value: interaction.user.username, inline: true },
                     { name: 'Success Rate', value: `${successCount}/${serversToExecute.length}`, inline: true },
-                    { name: 'Commands', value: trigger.commands.join('\n'), inline: false },
-                    { name: 'Results', value: results.slice(0, 10).join('\n'), inline: false }
+                    { name: 'Commands', value: trigger.commands.join('\n').slice(0, 1024), inline: false },
+                    { name: 'Results', value: results.slice(0, 10).join('\n').slice(0, 1024), inline: false }
                 )
                 .setTimestamp();
-            
+
             if (results.length > 10) {
                 embed.setFooter({ text: `Showing 10 of ${results.length} results` });
             }
@@ -218,46 +223,44 @@ module.exports = {
         }
     },
 
-    async executeServerCommand(interaction) {
+    /**
+     * The instances a comma-separated server list names. A tag gives every instance of the
+     * pack. An instance is listed once even when two entries name it.
+     * @returns {{servers: Array, unknown: Array<string>}}
+     */
+    serverCommandTargets(allServers, serversInput) {
+        if (serversInput.toLowerCase() === 'all') {
+            return { servers: allServers.filter(s => !s.excludeFromServerList), unknown: [] };
+        }
+        const servers = [];
+        const unknown = [];
+        for (const serverName of serversInput.split(',').map(s => s.trim()).filter(Boolean)) {
+            const found = serverTargets.resolveTargets(allServers, serverName);
+            if (found.servers.length === 0) unknown.push(`❓ ${serverName}: ${found.error || 'not found'}`);
+            for (const server of found.servers) {
+                if (!servers.some(s => s.serverId === server.serverId)) servers.push(server);
+            }
+        }
+        return { servers, unknown };
+    },
+
+    async executeServerCommand(interaction, deps = {}) {
         const serversInput = interaction.options.getString('servers');
         const command = interaction.options.getString('command');
         const delay = (interaction.options.getInteger('delay') || 1) * 1000;
-        
+        const ygg = deps.yggdrasil || yggdrasil;
+        const panel = deps.pterodactyl || pterodactyl;
+        const pause = deps.sleep || sleep;
+
         // Parse servers
-        const allServers = await yggdrasil.getServers();
-        let serversToExecute = [];
-        
-        if (serversInput.toLowerCase() === 'all') {
-            serversToExecute = allServers.filter(s => !s.excludeFromServerList);
-        } else {
-            const serverNames = serversInput.split(',').map(s => s.trim());
-            for (const serverName of serverNames) {
-                let server = allServers.find(s => 
-                    s.name.trim() === serverName.trim() ||
-                    s.name.trim().toLowerCase() === serverName.trim().toLowerCase() ||
-                    s.tag === serverName.toLowerCase()
-                );
-                
-                // If not found and name ends with "...", try matching by prefix (for truncated names)
-                if (!server && serverName.endsWith('...')) {
-                    const prefix = serverName.substring(0, serverName.length - 3);
-                    server = allServers.find(s =>
-                        s.name.trim().startsWith(prefix) ||
-                        (s.tag && s.tag.toLowerCase().startsWith(prefix.toLowerCase()))
-                    );
-                }
-                
-                if (server) {
-                    serversToExecute.push(server);
-                }
-            }
-        }
-        
+        const allServers = await ygg.getServers();
+        const { servers: serversToExecute, unknown } = this.serverCommandTargets(allServers, serversInput);
+
         if (serversToExecute.length === 0) {
-            await interaction.editReply('❌ No valid servers found!');
+            await interaction.editReply(['❌ No valid servers found!', ...unknown].join('\n').slice(0, 2000));
             return;
         }
-        
+
         // Execute command with progress tracking
         let successCount = 0;
         let failCount = 0;
@@ -280,83 +283,72 @@ module.exports = {
             const server = serversToExecute[i];
             
             try {
-                await pterodactyl.sendCommand(server.serverId, command);
+                await panel.sendCommand(server.serverId, command);
                 successCount++;
                 results.push(`✅ ${server.name}`);
             } catch (error) {
                 failCount++;
                 results.push(`❌ ${server.name}: ${error.message}`);
             }
-            
+
             // Update progress every 5 servers or at the end
             if ((i + 1) % 5 === 0 || i === serversToExecute.length - 1) {
                 const progress = Math.round(((i + 1) / serversToExecute.length) * 100);
                 embed.data.fields[2].value = `${progress}%`;
                 embed.data.fields[3].value = `${successCount} success, ${failCount} failed`;
-                
+
                 try {
                     await interaction.editReply({ embeds: [embed] });
                 } catch (editError) {
                     // Ignore edit errors
                 }
             }
-            
+
             if (delay > 0 && i < serversToExecute.length - 1) {
-                await sleep(delay);
+                await pause(delay);
             }
         }
-        
+        results.push(...unknown);
+
         // Final result
         const finalEmbed = new EmbedBuilder()
-            .setColor(failCount === 0 ? 0x00ff00 : 0xffa500)
+            .setColor(failCount === 0 && unknown.length === 0 ? 0x00ff00 : 0xffa500)
             .setTitle('✅ Server Command Execution Complete')
             .addFields(
                 { name: 'Command', value: command, inline: false },
                 { name: 'Success Rate', value: `${successCount}/${serversToExecute.length}`, inline: true },
                 { name: 'Executed By', value: interaction.user.username, inline: true },
                 { name: 'Delay Between Commands', value: `${delay / 1000}s`, inline: true },
-                { name: 'Results', value: results.slice(0, 20).join('\n'), inline: false }
+                { name: 'Results', value: results.slice(0, 20).join('\n').slice(0, 1024), inline: false }
             )
             .setTimestamp();
-        
+
         if (results.length > 20) {
             finalEmbed.setFooter({ text: `Showing 20 of ${results.length} results` });
         }
-        
+
         await interaction.editReply({ embeds: [finalEmbed] });
     },
 
     async testRebootWarnings(interaction) {
         const serverName = interaction.options.getString('server');
         const confirmed = interaction.options.getBoolean('confirm');
-        
+
         if (!confirmed) {
             await interaction.editReply('❌ You must confirm to run test warnings!');
             return;
         }
-        
-        // Find the server
+
+        // A tag tests every instance of the pack. An instance choice tests that one only.
         const allServers = await yggdrasil.getServers();
-        let server = allServers.find(s => 
-            s.name.trim() === serverName.trim() ||
-            s.name.trim().toLowerCase() === serverName.trim().toLowerCase() ||
-            s.tag === serverName.toLowerCase()
-        );
-        
-        // If not found and name ends with "...", try matching by prefix (for truncated names)
-        if (!server && serverName.endsWith('...')) {
-            const prefix = serverName.substring(0, serverName.length - 3);
-            server = allServers.find(s =>
-                s.name.trim().startsWith(prefix) ||
-                (s.tag && s.tag.toLowerCase().startsWith(prefix.toLowerCase()))
-            );
-        }
-        
-        if (!server) {
-            await interaction.editReply('❌ Server not found!');
+        const { servers: targets, error } = serverTargets.resolveTargets(allServers, serverName);
+
+        if (targets.length === 0) {
+            await interaction.editReply(`❌ ${error || 'Server not found!'}`);
             return;
         }
-        
+        const label = targets.map(s => s.name).join(', ').slice(0, 1024);
+
         // Test warnings (shorter delays for testing)
         const testWarnings = [
             { command: 'say [TEST] REBOOT WARNING TEST - 30 SECONDS', delay: 5000 },
@@ -370,7 +362,7 @@ module.exports = {
             .setColor(0xffa500)
             .setTitle('🧪 Testing Reboot Warnings')
             .addFields(
-                { name: 'Server', value: server.name, inline: true },
+                { name: 'Server', value: label, inline: true },
                 { name: 'Warnings', value: testWarnings.length.toString(), inline: true },
                 { name: 'Status', value: 'Starting...', inline: true }
             )
@@ -382,8 +374,10 @@ module.exports = {
             for (let i = 0; i < testWarnings.length; i++) {
                 const warning = testWarnings[i];
                 
-                await pterodactyl.sendCommand(server.serverId, warning.command);
-                
+                for (const target of targets) {
+                    await pterodactyl.sendCommand(target.serverId, warning.command);
+                }
+
                 // Update progress
                 embed.data.fields[2].value = `Warning ${i + 1}/${testWarnings.length}`;
                 try {
@@ -402,7 +396,7 @@ module.exports = {
                 .setColor(0x00ff00)
                 .setTitle('✅ Reboot Warning Test Complete')
                 .addFields(
-                    { name: 'Server', value: server.name, inline: true },
+                    { name: 'Server', value: label, inline: true },
                     { name: 'Warnings Sent', value: testWarnings.length.toString(), inline: true },
                     { name: 'Status', value: 'All warnings sent successfully', inline: true }
                 )

@@ -19,6 +19,7 @@ const {
 } = require('discord.js');
 const sessionLogger = require('../../modules/sessionLogger');
 const yggdrasil = require('../../modules/yggdrasil');
+const serverTargets = require('../../modules/serverTargets');
 const {
     sendCommand
 } = require('../../modules/pterodactyl');
@@ -91,15 +92,107 @@ async function getCachedServers() {
     return servers;
 }
 
+const TIMED_OUT = 'Command execution timed out';
+
+/**
+ * Runs one command on one instance: over the link when it is linked, else on the console.
+ * Never throws.
+ * @param {object} server The instance.
+ * @param {string} command Console line.
+ * @param {object} deps Injectable for tests: getLinkSession, runViaLink, sendAdvancedCommand, consoleTimeoutMs.
+ * @returns {Promise<{server: object, via: string, output: string, error: string|null, timedOut: boolean}>}
+ */
+async function runOnInstance(server, command, deps = {}) {
+    const getLinkSession = deps.getLinkSession || (id => yggdrasil.getLinkSession(id));
+    const viaLink = deps.runViaLink || runViaLink;
+    const viaConsole = deps.sendAdvancedCommand || sendAdvancedCommand;
+    const consoleTimeoutMs = deps.consoleTimeoutMs != null ? deps.consoleTimeoutMs : 15000;
+
+    // via-link path (biforesting v2): durable op with real captured output.
+    // Falls back to the pterosocket console scrape when not linked / op fails.
+    try {
+        const session = await getLinkSession(server.serverId);
+        if (session) {
+            const output = await viaLink(server.serverId, command);
+            if (output !== null) return { server, via: 'link', output, error: null, timedOut: false };
+            sessionLogger.warn('Execute', `Link op never reached ${server.name}, falling back to console`);
+        }
+    } catch (linkErr) {
+        sessionLogger.warn('Execute', `Link path failed on ${server.name} (${linkErr.message}), falling back to console`);
+    }
+
+    let timer = null;
+    try {
+        const output = await Promise.race([
+            viaConsole(server.serverId, command),
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(TIMED_OUT)), consoleTimeoutMs);
+            })
+        ]);
+        return { server, via: 'console', output: output || '', error: null, timedOut: false };
+    } catch (error) {
+        if (error.message === TIMED_OUT) return { server, via: 'console', output: '', error: null, timedOut: true };
+        sessionLogger.error('Execute', `Error executing command on ${server.name}:`, error);
+        return { server, via: 'console', output: '', error: error.message, timedOut: false };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** The text for one instance's result, without its output. */
+function resultStatus(result) {
+    if (result.error) return `❌ **Error executing command:** ${result.error}`;
+    if (result.timedOut) return "⚠️ **Command is taking longer than expected to complete.** The command was sent, but we couldn't wait for the full response.";
+    if (!result.output) return '**The server did not respond!**';
+    return null;
+}
+
+/**
+ * The reply for one or more instances. Each instance gets its own section.
+ * @param {string} command The console line.
+ * @param {Array} results From runOnInstance, one per instance.
+ * @param {number} limit Longest reply before the outputs go into an attachment.
+ * @returns {{content: string, attachment: string|null}}
+ */
+function formatReport(command, results, limit = 1900) {
+    if (results.length === 1) {
+        const [result] = results;
+        const verb = result.error ? 'Attempted to send' : 'Sent';
+        const head = result.via === 'link'
+            ? `${verb} \`${command}\` to **${result.server.name}** via link... 🔗`
+            : `${verb} \`${command}\` to **${result.server.name}**... 🚀`;
+        const status = resultStatus(result);
+        if (status) return { content: `${head}\n${status}`, attachment: null };
+        if (result.output.length < limit) return { content: `${head}\n\`\`\`${result.output}\`\`\``, attachment: null };
+        return { content: `${head}\n*Response is too long, sending as attachment...*`, attachment: result.output };
+    }
+
+    const tags = [...new Set(results.map(r => r.server.tag).filter(Boolean))];
+    const where = tags.length === 1 ? ` of \`${tags[0]}\`` : '';
+    const head = `Sent \`${command}\` to **${results.length} instances**${where} 🚀`;
+    const label = r => `**${r.server.name}** (\`${r.server.serverId}\`)${r.via === 'link' ? ' 🔗' : ''}`;
+
+    const full = results.map(r => `\n${label(r)}\n${resultStatus(r) || `\`\`\`${r.output}\`\`\``}`).join('');
+    if (head.length + full.length <= limit) return { content: head + full, attachment: null };
+
+    const short = results.map(r => `\n${label(r)}: ${resultStatus(r) || '*output in the attachment*'}`).join('');
+    const attachment = results
+        .map(r => `=== ${r.server.name} (${r.server.serverId}) ===\n${r.output || resultStatus(r) || ''}`)
+        .join('\n\n');
+    return { content: `${head}${short}`.slice(0, 2000), attachment };
+}
+
 module.exports = {
     runViaLink,
+    runOnInstance,
+    formatReport,
     data: new SlashCommandBuilder()
         .setName('execute')
         .setDescription('Execute a command on the server!')
         .setDefaultMemberPermissions(1099511627776)
         .addStringOption(option =>
             option.setName('server')
-            .setDescription('Name of the server to execute the command on')
+            .setDescription('A tag runs on every instance. Pick one instance to run on it alone.')
             .setRequired(true)
             .setAutocomplete(true))
         .addStringOption(option =>
@@ -108,42 +201,19 @@ module.exports = {
             .setRequired(true))
         .setDMPermission(false),
     async autocomplete(interaction) {
-        const focusedValue = interaction.options.getFocused();
         const serverList = await getCachedServers();
-        const choices = ["all", "Bifrost"]; // Include special options
-
-        // Process server names to ensure they don't exceed Discord's 25-character limit
-        for (const server of serverList) {
-            // Trim any trailing spaces
-            let serverName = server.name.trim();
-            
-            // If name is too long, truncate to stay under Discord's 25-character limit
-            if (serverName.length > 20) {
-                serverName = serverName.substring(0, 20) + "..."; // 20 + 3 = 23 chars (safely under 25)
-            }
-            
-            choices.push(serverName);
-        }
-
-        // Filter choices to show matches as user types (more flexible than just startsWith)
-        const filtered = choices.filter(choice => 
-            choice.toLowerCase().includes(focusedValue.toLowerCase())
-        );
-        // Discord has a maximum of 25 autocomplete choices
-        const limitedChoices = filtered.slice(0, 25);
-        await interaction.respond(
-            limitedChoices.map(choice => ({
-                name: choice,
-                value: choice
-            })),
-        );
+        await interaction.respond(serverTargets.autocompleteChoices(serverList, interaction.options.getFocused(), ['all', 'Bifrost']));
     },
 
-    async execute(interaction) {
+    /**
+     * @param {object} interaction The slash command.
+     * @param {object} deps Injectable for tests: servers (the server list), run (runOnInstance).
+     */
+    async execute(interaction, deps = {}) {
         const query = interaction.options.getString('server');
         const command = interaction.options.getString('command');
 
-        const serverList = await getCachedServers();
+        const serverList = deps.servers || await getCachedServers();
         if (query === 'all') {
             for (const server of serverList) {
                 sendCommand(server.serverId, command);
@@ -156,85 +226,28 @@ module.exports = {
             await interaction.reply(`Sent \`${command}\` to **Bifrost**! 🚀`);
 
         } else {
-            // Handle truncated server names in the query
-            // First try exact match, then try matching the beginning of the name
-            let server = serverList.find(server =>
-                server.name.trim() === query.trim() ||
-                server.tag === query.toLowerCase()
-            );
-            
-            // If not found and query ends with "...", try matching by prefix
-            if (!server && query.endsWith('...')) {
-                const prefix = query.substring(0, query.length - 3);
-                server = serverList.find(server =>
-                    server.name.startsWith(prefix) ||
-                    (server.tag && server.tag.toLowerCase().startsWith(prefix.toLowerCase()))
-                );
-            }
-            
-            if (!server) {
-                await interaction.reply('Server not found! Please try again with a valid server name.');
+            // A tag names every instance of the pack. An id or an instance name names one.
+            const { servers: targets, error } = serverTargets.resolveTargets(serverList, query);
+            if (targets.length === 0) {
+                await interaction.reply(error || 'Server not found! Please try again with a valid server name.');
                 return;
             }
 
             try {
                 // Defer the reply to give more time for processing
                 await interaction.deferReply();
-                
-                // Prepare initial message
-                let reply = `Sending \`${command}\` to **${server.name}**... 🚀`;
 
-                try {
-                    // via-link path (biforesting v2): durable op with real captured output.
-                    // Falls back to the pterosocket console scrape when not linked / op fails.
-                    let response = null;
-                    try {
-                        const session = await yggdrasil.getLinkSession(server.serverId);
-                        if (session) {
-                            response = await runViaLink(server.serverId, command);
-                            if (response !== null) {
-                                reply = `Sending \`${command}\` to **${server.name}** via link... 🔗`;
-                            } else {
-                                sessionLogger.warn('Execute', `Link op never reached ${server.name}, falling back to console`);
-                            }
-                        }
-                    } catch (linkErr) {
-                        sessionLogger.warn('Execute', `Link path failed on ${server.name} (${linkErr.message}), falling back to console`);
-                    }
-
-                    // Execute the command with a timeout
-                    if (response === null) response = await Promise.race([
-                        sendAdvancedCommand(server.serverId, command),
-                        new Promise((_, reject) =>
-                            setTimeout(() => reject(new Error('Command execution timed out')), 15000)
-                        )
-                    ]);
-                    
-                    // Update reply based on response
-                    if (!response || response === "") {
-                        await interaction.editReply(reply.replace('Sending', 'Sent') + "\n**The server did not respond!**");
-                    } else if (response.length < 1900) {
-                        await interaction.editReply(reply.replace('Sending', 'Sent') + "\n```" + response + "```");
-                    } else {
-                        await interaction.editReply(reply.replace('Sending', 'Sent') + "\n*Response is too long, sending as attachment...*");
-                        const buffer = Buffer.from(response, 'utf-8');
-                        const attachment = new AttachmentBuilder(buffer, {
-                            name: 'command_response.txt'
-                        });
-                        await interaction.followUp({
-                            files: [attachment]
-                        });
-                    }
-                } catch (error) {
-                    // Handle timeout or other errors
-                    if (error.message === 'Command execution timed out') {
-                        await interaction.editReply(reply.replace('Sending', 'Sent') +
-                            "\n⚠️ **Command is taking longer than expected to complete.** The command was sent, but we couldn't wait for the full response.");
-                    } else {
-                        sessionLogger.error('Execute', `Error executing command on ${server.name}:`, error);
-                        await interaction.editReply(reply.replace('Sending', 'Attempted to send') +
-                            `\n❌ **Error executing command:** ${error.message}`);
-                    }
+                const run = deps.run || runOnInstance;
+                const results = await Promise.all(targets.map(server => run(server, command)));
+                const report = formatReport(command, results);
+                await interaction.editReply(report.content);
+                if (report.attachment !== null) {
+                    const attachment = new AttachmentBuilder(Buffer.from(report.attachment, 'utf-8'), {
+                        name: 'command_response.txt'
+                    });
+                    await interaction.followUp({
+                        files: [attachment]
+                    });
                 }
             } catch (error) {
                 // Handle interaction errors

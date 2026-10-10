@@ -623,3 +623,113 @@ test('waitOp puts the op id on its timeout, so the caller can cancel that exact 
         yggdrasil.getOp = saved.getOp;
     }
 });
+
+// ---------------------------------------------------------------------------
+// A tag with several instances (evol): the job fires once, on the instance the
+// player stands on, and the Mongo claim keeps a second instance from firing it
+// ---------------------------------------------------------------------------
+
+const realScheduleJobClaim = mongo.scheduleJobClaim;
+const EVOL = [
+    { tag: 'evol', name: 'Evolution', serverId: 'e7575fc9' },
+    { tag: 'evol', name: 'Evolution #2', serverId: '505d921b' },
+    { tag: 'evol', name: 'Evolution #3', serverId: 'e2f5e517' }
+];
+
+/** Alp online on evol, standing on `instance` (a name or an id; null = the row names none). */
+function evolRig(instance, job) {
+    yggdrasil.getServers = async () => [SERVER, ...EVOL];
+    yggdrasil.getPlayers = async () => ({ evol: ['Alp'] });
+    yggdrasil.getPlayersDetailed = async () => ({
+        evol: [{ username: 'Alp', server: 'Evolution', ...(instance ? { instance } : {}), ping: 20 }]
+    });
+    mongo.getActiveScheduleJobs = async () => [job];
+    yggdrasil.runOp = async (server, op) => {
+        ops.push(server);
+        return { state: 'completed', result: { data: { output: `ran ${op.params.command}` } } };
+    };
+}
+
+const evolJob = (extra = {}) => ({ _id: 'job-evol', playerId: 'Alp', serverNames: ['evol'], commands: ['give Alp minecraft:cake 1'], onJoin: false, oneTime: true, ...extra });
+
+test('evol: a tag job fires on the instance the player stands on, never on the first instance', async () => {
+    const claimArgs = [];
+    mongo.claimScheduleJob = async (...args) => { claimArgs.push(args); return { matchedCount: 1, modifiedCount: 1 }; };
+    evolRig('Evolution #3', evolJob());
+
+    await scheduler.checkPlayerTriggers();
+
+    assert.deepStrictEqual(ops, ['e2f5e517'], 'the give went to evol #3 only');
+    assert.deepStrictEqual(claimArgs, [['job-evol', true, 'e2f5e517']], 'one oneTime claim, stamped with the instance');
+    assert.deepStrictEqual(deactivated, ['job-evol']);
+});
+
+test('evol: a player row that names no instance makes the job wait, with no claim and no run', async () => {
+    evolRig(null, evolJob());
+    await scheduler.checkPlayerTriggers();
+    assert.deepStrictEqual(ops, []);
+    assert.deepStrictEqual(claims, []);
+    assert.deepStrictEqual(sent, []);
+});
+
+test('evol: executePlayerTrigger refuses a bare tag of several instances', async () => {
+    evolRig('Evolution #2', evolJob());
+    await scheduler.executePlayerTrigger(evolJob(), 'evol');
+    assert.deepStrictEqual(claims, [], 'no claim, so the job stays armed');
+    assert.deepStrictEqual(ops, []);
+    assert.deepStrictEqual(sent, []);
+});
+
+test('evol: instanceServerId pins the job to that instance', async () => {
+    const job = evolJob({ instanceServerId: '505d921b' });
+    evolRig('Evolution #3', job);
+    await scheduler.checkPlayerTriggers();
+    assert.deepStrictEqual(ops, [], 'not while the player is on evol #3');
+
+    evolRig('505d921b', job);
+    await scheduler.checkPlayerTriggers();
+    assert.deepStrictEqual(ops, ['505d921b']);
+});
+
+test('evol: the oneTime claim is a conditional update, so a second instance cannot fire the job', async () => {
+    // One job doc. The claim applies the real filter the way Mongo does: match, then set, in one step.
+    const doc = { _id: 'job-evol', active: true };
+    mongo.claimScheduleJob = async (id, once, firedOn) => {
+        const { filter, update } = realScheduleJobClaim(id, once, firedOn);
+        const matched = doc._id === filter._id && doc.active === filter.active &&
+            (!filter.startedAt || doc.startedAt === undefined);
+        if (matched) Object.assign(doc, update.$set);
+        return { matchedCount: matched ? 1 : 0, modifiedCount: matched ? 1 : 0 };
+    };
+    // The deactivation is lost (a restart between run and deactivation), so only the claim stands guard.
+    mongo.deactivateScheduleJob = async () => {};
+    evolRig('Evolution', evolJob());
+
+    await scheduler.executePlayerTrigger(evolJob(), 'e7575fc9');
+    await scheduler.executePlayerTrigger(evolJob(), '505d921b');
+
+    assert.deepStrictEqual(ops, ['e7575fc9'], 'the give ran once, on the instance that claimed first');
+    assert.strictEqual(doc.firedOn, 'e7575fc9');
+});
+
+test('scheduleJobClaim: oneTime adds startedAt-absent to the filter and records the instance', () => {
+    const once = realScheduleJobClaim('j1', true, 'e2f5e517');
+    assert.deepStrictEqual(once.filter, { _id: 'j1', active: true, startedAt: { $exists: false } });
+    assert.strictEqual(once.update.$set.firedOn, 'e2f5e517');
+    assert.ok(once.update.$set.startedAt instanceof Date);
+
+    const repeat = realScheduleJobClaim('j2', false);
+    assert.deepStrictEqual(repeat.filter, { _id: 'j2', active: true });
+    assert.ok(!('firedOn' in repeat.update.$set));
+});
+
+test('schedule-player: a typed tag of several instances is stored as the tag', () => {
+    const schedulePlayer = require('../discord/commands/schedule-player');
+    const servers = [SERVER, ...EVOL];
+    assert.strictEqual(schedulePlayer.storedIdentifier(servers, 'evol'), 'evol', 'all instances, fires once');
+    assert.strictEqual(schedulePlayer.storedIdentifier(servers, 'gtnh'), 'GT New Horizons', 'one instance: the name, as before');
+    assert.strictEqual(schedulePlayer.storedIdentifier(servers, 'Evolution #2'), 'Evolution #2');
+    assert.strictEqual(schedulePlayer.storedIdentifier(servers, '505d921b'), '505d921b');
+    assert.strictEqual(schedulePlayer.storedIdentifier(servers, 'nowhere'), null);
+    assert.match(schedulePlayer.describeTargets(servers, ['evol']), /any of 3 instances, fires once/);
+});

@@ -58,6 +58,7 @@ module.exports = {
         failedServers: new Set(), // NEW: Track failed servers
         completedServers: new Set(), // NEW: Track completed servers
         cancelRequested: new Set(), // serverIds whose in-progress warning window should abort before stop
+        staggerWaiting: new Set(), // serverIds of synced instances that wait for the one before them
         apiCallCount: 0, // NEW: Track API calls
         lastApiCall: 0, // NEW: Rate limiting
         lastCheckedDate: null, // Track current date for daily reset
@@ -653,14 +654,15 @@ module.exports = {
      * non-empty group, and Yggdrasil answers mode shadow or live) is split. Every other server
      * keeps today's timing, and a gate error keeps today's timing too.
      * @param {Array} servers The queue.
+     * @param {string} [label] Names the run in the log.
      * @returns {Promise<{queue: Array, followers: Map}>} queue: what the batches run.
      *   followers: serverId of a group's first instance -> the instances after it, in order.
      */
-    planSyncGroupStagger: async function (servers) {
+    planSyncGroupStagger: async function (servers, label = 'Daily reboot') {
         const followers = new Map();
         let groups;
         try {
-            groups = await this.playerSync.activeGroupsAmong(servers, 'Daily reboot');
+            groups = await this.playerSync.activeGroupsAmong(servers, label);
         } catch (error) {
             sessionLogger.warn('RebootScheduler', `Sync group check failed (${error.message}), normal timing for every server`);
             return { queue: servers, followers };
@@ -679,43 +681,74 @@ module.exports = {
     /**
      * Reboots the other instances of a synced group, one at a time. Each one starts its warning
      * window syncStaggerMs after the one before is back up. An instance that is not back up stops
-     * the chain, so the group never has all of its instances down.
+     * the chain, so the group never has all of its instances down. A cancel for a waiting
+     * instance stops the chain too.
      * @param {object} first The instance the batch rebooted.
      * @param {object} firstResult Its executeFullServerReboot result.
      * @param {Array} rest The instances that follow, in order.
      * @param {Map} nodeOf serverId -> nodeId.
+     * @param {object} [opts] { scheduled, rebootOpts }. scheduled: a staff or vote reboot, which
+     *   does not touch the daily stats. rebootOpts goes to executeFullServerReboot.
+     * @returns {Promise<Array<{s: object, r: object}>>} One entry per instance in rest. An instance
+     *   that did not run has success false and the reason.
      */
-    rebootSyncFollowers: async function (first, firstResult, rest, nodeOf) {
-        let previous = first;
-        let previousResult = firstResult;
-        for (let i = 0; i < rest.length; i++) {
-            const server = rest[i];
-            const notRun = rest.slice(i);
-            if (!previousResult || !previousResult.success) {
-                sessionLogger.warn('RebootScheduler',
-                    `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because ${previous.name} is not back up (${previousResult ? previousResult.reason : 'no result'})`);
-                this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + notRun.length;
-                this.state.todayStats.totalServers = Math.max(0, (this.state.todayStats.totalServers || 0) - notRun.length);
-                return;
-            }
+    rebootSyncFollowers: async function (first, firstResult, rest, nodeOf, opts = {}) {
+        const results = [];
+        const skip = (notRun, reason) => {
+            notRun.forEach(s => this.state.staggerWaiting.delete(s.serverId));
+            results.push(...notRun.map(s => ({ s, r: { success: false, reason } })));
+        };
+        rest.forEach(s => this.state.staggerWaiting.add(s.serverId));
+        try {
+            let previous = first;
+            let previousResult = firstResult;
+            for (let i = 0; i < rest.length; i++) {
+                const server = rest[i];
+                const notRun = rest.slice(i);
+                if (!previousResult || !previousResult.success) {
+                    sessionLogger.warn('RebootScheduler',
+                        `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because ${previous.name} is not back up (${previousResult ? previousResult.reason : 'no result'})`);
+                    if (!opts.scheduled) {
+                        this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + notRun.length;
+                        this.state.todayStats.totalServers = Math.max(0, (this.state.todayStats.totalServers || 0) - notRun.length);
+                    }
+                    skip(notRun, `not rebooted: ${previous.name} is not back up`);
+                    return results;
+                }
 
-            const staggerMs = this.syncStaggerMs();
-            sessionLogger.info('RebootScheduler',
-                `[${server.name}] Sync group: reboot starts in ${staggerMs / 60000} min (${previous.name} is back up)`);
-            await functions.sleep(staggerMs);
-            if (!this.state.isRebootInProgress) {
-                sessionLogger.warn('RebootScheduler',
-                    `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because the reboot sequence ended`);
-                return;
-            }
+                const staggerMs = this.syncStaggerMs();
+                sessionLogger.info('RebootScheduler',
+                    `[${server.name}] Sync group: reboot starts in ${staggerMs / 60000} min (${previous.name} is back up)`);
+                await functions.sleep(staggerMs);
+                // The warning window clears a cancel request when it starts, so a cancel for a
+                // waiting instance is read here.
+                if (this.state.cancelRequested.has(server.serverId)) {
+                    sessionLogger.warn('RebootScheduler',
+                        `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because staff cancelled the reboot`);
+                    notRun.forEach(s => this.state.cancelRequested.delete(s.serverId));
+                    skip(notRun, 'cancelled');
+                    return results;
+                }
+                if (!opts.scheduled && !this.state.isRebootInProgress) {
+                    sessionLogger.warn('RebootScheduler',
+                        `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because the reboot sequence ended`);
+                    skip(notRun, 'not rebooted: the reboot sequence ended');
+                    return results;
+                }
 
-            try {
-                previousResult = await this.executeFullServerReboot(server, nodeOf.get(server.serverId));
-            } catch (error) {
-                sessionLogger.error('RebootScheduler', `[${server.name}] Unhandled error: ${error.message}`);
-                previousResult = { success: false, reason: error.message };
+                this.state.staggerWaiting.delete(server.serverId);
+                try {
+                    previousResult = await this.executeFullServerReboot(server, nodeOf.get(server.serverId), opts.rebootOpts || {});
+                } catch (error) {
+                    sessionLogger.error('RebootScheduler', `[${server.name}] Unhandled error: ${error.message}`);
+                    previousResult = { success: false, reason: error.message };
+                }
+                results.push({ s: server, r: previousResult });
+                previous = server;
             }
-            previous = server;
+            return results;
+        } finally {
+            rest.forEach(s => this.state.staggerWaiting.delete(s.serverId));
         }
     },
 
@@ -1187,10 +1220,10 @@ module.exports = {
     /**
      * Request cancellation of an in-progress (or about-to-run) warning window for a server.
      * The warning loop checks this each iteration and aborts before the server is stopped.
-     * @returns {boolean} true if the server currently has an active reboot.
+     * @returns {boolean} true if the server currently has an active reboot, or waits in a sync group stagger.
      */
     cancelServerReboot: function (serverId) {
-        const active = this.state.activeReboots.has(serverId);
+        const active = this.state.activeReboots.has(serverId) || this.state.staggerWaiting.has(serverId);
         this.state.cancelRequested.add(serverId);
         // Stamp the countdown doc regardless: the abort below only reaches a warning window
         // this process is running, while the proxy is showing a bar for any open doc.

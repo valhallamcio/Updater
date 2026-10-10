@@ -11,6 +11,9 @@
  * fires immediately) and "reboot later" (idles until the last warnWindow minutes).
  *
  * Jobs are one-shot: deactivated the moment they fire, so a VU restart can't double-reboot.
+ *
+ * A tag job (no instanceServerId) whose instances share a synced player sync group reboots
+ * them one at a time, like the daily batch (rebootScheduler.planSyncGroupStagger).
  */
 
 const mongo = require('../modules/mongo');
@@ -58,11 +61,19 @@ module.exports = {
         }
     },
 
-    runJob: async function (job) {
-        // One-shot: deactivate before doing anything so a crash/restart can't re-run it.
-        await mongo.deactivateScheduleJob(job._id).catch(() => {});
+    /**
+     * @param {object} job The scheduled_reboot doc.
+     * @param {object} [deps] Injectable for tests: mongo, yggdrasil, rebootScheduler.
+     */
+    runJob: async function (job, deps = {}) {
+        const db = deps.mongo || mongo;
+        const ygg = deps.yggdrasil || yggdrasil;
+        const rs = deps.rebootScheduler || rebootScheduler;
 
-        const servers = await yggdrasil.getServers();
+        // One-shot: deactivate before doing anything so a crash/restart can't re-run it.
+        await db.deactivateScheduleJob(job._id).catch(() => {});
+
+        const servers = await ygg.getServers();
         // instanceServerId set => one specific instance; otherwise reboot EVERY instance of the tag
         // (instanced servers share a tag but have distinct serverIds). Resolved at fire time so
         // instance count changes are picked up.
@@ -81,40 +92,63 @@ module.exports = {
         const label = instances.length > 1
             ? `${job.serverTag} (${instances.length} instances)`
             : (instances[0].name || job.serverTag);
+
+        // A tag whose instances share a synced group reboots them one at a time, with the same
+        // gate and gap as the daily batch. Every other tag reboots its instances together.
+        const { queue, followers } = instances.length > 1
+            ? await rs.planSyncGroupStagger(instances, `Scheduled reboot ${job.serverTag}`)
+            : { queue: instances, followers: new Map() };
+        const staggerText = [...followers].map(([firstId, rest]) => {
+            const first = instances.find(s => s.serverId === firstId);
+            return `\nSync group: ${first ? first.name : firstId} reboots first. ${rest.map(s => s.name).join(', ')} follow one at a time, ${rs.syncStaggerMs() / 60000} min after the one before is back up.`;
+        }).join('');
+
         sessionLogger.info('ScheduledRebootScheduler',
             `Firing scheduled reboot: ${label} (warn ${job.warnWindow}min, by ${job.requestedBy || 'unknown'})`);
         await this.notifyStaff(0xffa500, 'Scheduled Reboot Started',
             `**${label}** rebooting now (warning window: ${job.warnWindow} min)` +
-            `${job.reason ? `\nReason: ${job.reason}` : ''}`);
+            `${job.reason ? `\nReason: ${job.reason}` : ''}${staggerText}`);
 
-        // Reboot every instance concurrently; each runs its own warning countdown + stop/start.
-        const results = await Promise.all(instances.map(s =>
-            // scheduled:true => don't treat a server the daily batch already rebooted today as a
-            // "duplicate" (completedServers lingers until the GMT+3 day rollover). See rebootScheduler.isServerActive.
-            // requestedBy/reason ride along so the countdown doc in valhallamc.reboot_events says
-            // who asked (a "Player vote (4/6)" job is the vote-restart source, staff otherwise).
-            rebootScheduler.executeFullServerReboot(s, s.node || 'scheduled', {
-                warnWindowMinutes: job.warnWindow,
-                scheduled: true,
-                requestedBy: job.requestedBy,
-                reason: job.reason,
-            })
-                .then(r => ({ s, r }))
-                .catch(e => ({ s, r: { success: false, reason: e.message } }))
-        ));
+        // scheduled:true => don't treat a server the daily batch already rebooted today as a
+        // "duplicate" (completedServers lingers until the GMT+3 day rollover). See rebootScheduler.isServerActive.
+        // requestedBy/reason ride along so the countdown doc in valhallamc.reboot_events says
+        // who asked (a "Player vote (4/6)" job is the vote-restart source, staff otherwise).
+        const rebootOpts = {
+            warnWindowMinutes: job.warnWindow,
+            scheduled: true,
+            requestedBy: job.requestedBy,
+            reason: job.reason,
+        };
+        const nodeOf = new Map(instances.map(s => [s.serverId, s.node || 'scheduled']));
+
+        // Each instance runs its own warning countdown + stop/start. The queue reboots together;
+        // the instances that follow a synced first one wait for it.
+        const chains = queue.map(async (s) => {
+            let r;
+            try {
+                r = await rs.executeFullServerReboot(s, nodeOf.get(s.serverId), rebootOpts);
+            } catch (e) {
+                r = { success: false, reason: e.message };
+            }
+            const rest = followers.get(s.serverId);
+            if (!rest) return [{ s, r }];
+            const more = await rs.rebootSyncFollowers(s, r, rest, nodeOf, { scheduled: true, rebootOpts });
+            return [{ s, r }, ...more];
+        });
+        const results = (await Promise.all(chains)).flat();
         // Let each server be scheduled again later (clears completed/failed bookkeeping) — but ONLY
         // when this job actually owned the reboot. 'duplicate'/'state_conflict' means another reboot
         // (e.g. the daily batch, which now holds the lock from its uptime checks through start) owns
         // the activeReboots entry; wiping it here would delete THAT lock and allow a concurrent reboot.
         for (const { s, r } of results) {
             if (r && (r.reason === 'duplicate' || r.reason === 'state_conflict')) continue;
-            rebootScheduler.resetSingleServerState(s.serverId);
+            rs.resetSingleServerState(s.serverId);
         }
 
         // Record outcome alongside the batch reboots.
         try {
             const today = timeManager.getTodayDateString();
-            const hist = (await mongo.getRebootHistory(today)) || { date: today };
+            const hist = (await db.getRebootHistory(today)) || { date: today };
             hist.scheduledReboots = hist.scheduledReboots || [];
             for (const { s, r } of results) {
                 hist.scheduledReboots.push({
@@ -127,7 +161,7 @@ module.exports = {
                     firedAt: new Date().toISOString(),
                 });
             }
-            await mongo.updateRebootHistory(today, hist);
+            await db.updateRebootHistory(today, hist);
         } catch (err) {
             sessionLogger.warn('ScheduledRebootScheduler', `Failed to record history: ${err.message}`);
         }
