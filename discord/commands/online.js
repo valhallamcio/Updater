@@ -98,41 +98,102 @@ module.exports = {
             };
         }
 
+        const fields = [];
         for (const group of Object.values(tagGroups)) {
             const totalPlayers = group.instances.reduce((sum, i) => sum + i.players.length, 0);
 
+            let lines;
+            let name;
             if (group.instances.length === 1) {
                 const inst = group.instances[0];
-                embed.addFields({
-                    name: `${inst.name} - **${inst.players.length}**`,
-                    value: `-# ${formatPlayers(inst.players)}\n*${inst.domain}*`
-                });
+                name = `${inst.name} - **${inst.players.length}**`;
+                lines = [...playerLines(inst.players), `*${inst.domain}*`];
             } else {
-                let value = '';
+                name = `${group.mainName} - **${totalPlayers}**`;
+                lines = [];
                 for (const inst of group.instances) {
-                    value += `${inst.name} · ${inst.players.length} · ${inst.domain}\n`;
-                    value += `-# ${formatPlayers(inst.players)}\n`;
+                    lines.push(`${inst.name} · ${inst.players.length} · ${inst.domain}`);
+                    lines.push(...playerLines(inst.players));
                 }
-
-                embed.addFields({
-                    name: `${group.mainName} - **${totalPlayers}**`,
-                    value: value.trimEnd()
-                });
             }
+            // A field value caps at 1024 chars (evol, 3 instances, 10-11 broke /online).
+            // Overflow goes into untitled follow-up fields.
+            packLines(lines, FIELD_MAX).forEach((value, i) => {
+                fields.push({ name: i === 0 ? name : '\u200b', value });
+            });
         }
 
         if (onlineCount === 0) {
-            embed.addFields({
+            fields.push({
                 name: `**Oops**`,
                 value: `Looks like the servers are empty :c`
             });
         }
 
-        embed.setTitle(`Players online: ${onlineCount}`);
-        return await interaction.editReply({ embeds: [embed] });
+        // One embed holds 25 fields and 6000 chars; spill into more embeds (max 10 per message).
+        const title = `Players online: ${onlineCount}`;
+        const footer = "To see all available servers use /servers";
+        const embeds = [embed.setTitle(title)];
+        let size = title.length + footer.length;
+        let count = 0;
+        for (const field of fields) {
+            const fieldSize = field.name.length + field.value.length;
+            if (count >= 25 || size + fieldSize > 5900) {
+                if (embeds.length >= 10) break;
+                embeds.push(new EmbedBuilder().setColor(0x9c59b6));
+                size = 0;
+                count = 0;
+            }
+            embeds[embeds.length - 1].addFields(field);
+            size += fieldSize;
+            count++;
+        }
+        embed.setFooter(null).setTimestamp(null);
+        embeds[embeds.length - 1].setTimestamp().setFooter({ text: footer });
+
+        return await interaction.editReply({ embeds });
     },
 };
+
+const FIELD_MAX = 1024;
 
 function formatPlayers(players) {
     return players.join(', ').replace(/_/g, '\\_');
 }
+
+/** Player names as `-# ` lines, each short enough for one field. */
+function playerLines(players) {
+    const lines = [];
+    let line = '';
+    for (const p of players) {
+        const name = formatPlayers([p]);
+        const next = line ? `${line}, ${name}` : `-# ${name}`;
+        if (next.length > FIELD_MAX && line) {
+            lines.push(line);
+            line = `-# ${name}`;
+        } else {
+            line = next;
+        }
+    }
+    if (line) lines.push(line);
+    return lines;
+}
+
+/** Joins lines with \n into chunks of at most max chars. */
+function packLines(lines, max) {
+    const chunks = [];
+    let cur = '';
+    for (const l of lines) {
+        const next = cur ? `${cur}\n${l}` : l;
+        if (next.length > max && cur) {
+            chunks.push(cur);
+            cur = l;
+        } else {
+            cur = next;
+        }
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+}
+
+module.exports._internals = { playerLines, packLines };
