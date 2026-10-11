@@ -102,22 +102,14 @@ module.exports = {
         for (const group of Object.values(tagGroups)) {
             const totalPlayers = group.instances.reduce((sum, i) => sum + i.players.length, 0);
 
-            let lines;
-            let name;
-            if (group.instances.length === 1) {
-                const inst = group.instances[0];
-                name = `${inst.name} - **${inst.players.length}**`;
-                lines = [...playerLines(inst.players), `*${inst.domain}*`];
-            } else {
-                name = `${group.mainName} - **${totalPlayers}**`;
-                lines = [];
-                for (const inst of group.instances) {
-                    lines.push(`${inst.name} · ${inst.players.length} · ${inst.domain}`);
-                    lines.push(...playerLines(inst.players));
-                }
-            }
             // A field value caps at 1024 chars (evol, 3 instances, 10-11 broke /online).
-            // Overflow goes into untitled follow-up fields.
+            if (group.instances.length > 1) {
+                multiInstanceFields(group, totalPlayers).forEach(f => fields.push(f));
+                continue;
+            }
+            const inst = group.instances[0];
+            const name = `${inst.name} - **${inst.players.length}**`;
+            const lines = [...playerLines(inst.players), `*${inst.domain}*`];
             packLines(lines, FIELD_MAX).forEach((value, i) => {
                 fields.push({ name: i === 0 ? name : '\u200b', value });
             });
@@ -177,6 +169,43 @@ function playerLines(players) {
     }
     if (line) lines.push(line);
     return lines;
+}
+
+/**
+ * Fields for a pack with several instances. An instance header stays with its players. When an
+ * instance does not fit in the current field, it opens a new field with its header as the title,
+ * so Discord draws no empty title row.
+ */
+function multiInstanceFields(group, totalPlayers) {
+    const fields = [];
+    let field = { name: `${group.mainName} - **${totalPlayers}**`, value: '' };
+    for (const inst of group.instances) {
+        const header = `${inst.name} · ${inst.players.length} · ${inst.domain}`;
+        const players = playerLines(inst.players);
+        const block = [header, ...players].join('\n');
+        if ((field.value ? field.value.length + 1 : 0) + block.length <= FIELD_MAX) {
+            field.value = field.value ? `${field.value}\n${block}` : block;
+            continue;
+        }
+        // The pack title field keeps the header in its value when it is still empty.
+        let lines = [header, ...players];
+        if (field.value) {
+            fields.push(field);
+            field = { name: header, value: '' };
+            lines = players;
+        }
+        const chunks = packLines(lines, FIELD_MAX);
+        chunks.forEach((value, i) => {
+            if (i === chunks.length - 1) {
+                field.value = value;
+                return;
+            }
+            fields.push({ name: field.name, value });
+            field = { name: header, value: '' };
+        });
+    }
+    if (field.value) fields.push(field);
+    return fields;
 }
 
 /** Joins lines with \n into chunks of at most max chars. */
