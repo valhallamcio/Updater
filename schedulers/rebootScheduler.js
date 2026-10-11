@@ -336,6 +336,30 @@ module.exports = {
     },
 
     /**
+     * True when someone else restarted the server after sinceMs, the start of this reboot attempt.
+     * We have sent no stop yet at that point, so 'starting' or a running server with uptime shorter
+     * than the attempt can only come from another stop/start (staff, another session, a crash
+     * restart). Any other reading, or an API error, returns false and the reboot goes on.
+     * This holds for vote and staff reboots too: the restart they asked for has already happened.
+     * (evol #3 2026-10-11: a vote reboot sent its stop 7 s after an external restart, waited out
+     * the boot, then force-killed the fresh server with players on it.)
+     */
+    restartedSince: async function (server, sinceMs) {
+        try {
+            const st = await pterodactyl.getStatus(server.serverId);
+            const state = st && st.attributes && st.attributes.current_state;
+            if (state === 'starting') return true;
+            if (state !== 'running') return false;
+            const ms = st.attributes.resources && st.attributes.resources.uptime;
+            return typeof ms === 'number' && ms > 0 && ms < Date.now() - sinceMs;
+        } catch (e) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Restart check failed (${e.message}), proceeding`);
+            return false;
+        }
+    },
+
+    /**
      * Tell players a batch reboot was abandoned because their server was already restarted recently.
      * Used when a skip happens AFTER the warning countdown ran (players would otherwise wait for a
      * restart that never comes). Best-effort: a failed send never blocks the skip.
@@ -1003,6 +1027,7 @@ module.exports = {
 
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             sessionLogger.info('RebootScheduler', `[${server.name}] Reboot attempt ${attempt}/${maxRetries}`);
+            const attemptStartedAt = Date.now();
             try {
                 // A retry on a server that is already offline has no players to warn and nothing
                 // to stop, so it goes straight to the start. Before this, a start that did not take
@@ -1031,11 +1056,24 @@ module.exports = {
                         return { success: true, reason: 'recently_restarted', skipped: true };
                     }
                     this.finishRebootEvent(server.serverId);
-                    const stoppedResult = await this.ensureServerStopped(server, { checkFreshUptime: !opts.scheduled });
+                    const stoppedResult = await this.ensureServerStopped(server,
+                        { checkFreshUptime: !opts.scheduled, since: attemptStartedAt });
                     if (stoppedResult === 'skipped') {
                         // Server bounced during the save flush — same handling as the post-warning checkpoint.
                         await this.sendFreshRestartCancelNotice(server);
                         return { success: true, reason: 'recently_restarted', skipped: true };
+                    }
+                    if (stoppedResult === 'restarted') {
+                        // Someone else restarted it during this attempt. The reboot already happened,
+                        // so release the lock without stopping it again. Scheduled reboots leave the
+                        // daily stats alone.
+                        this.stateOperations.markServerCompleted(server.serverId);
+                        if (!opts.scheduled) {
+                            this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + 1;
+                            if (this.state.todayStats.totalServers > 0) this.state.todayStats.totalServers--;
+                        }
+                        await this.sendFreshRestartCancelNotice(server);
+                        return { success: true, reason: 'restarted_during_reboot', skipped: true };
                     }
                 }
                 await this.startServerWithMonitoring(server);
@@ -1368,6 +1406,8 @@ module.exports = {
      * first stop — a crash/auto-restart during the flush wait would otherwise get stopped again
      * seconds after coming back. Returns 'skipped' instead of true when that guard fires
      * (maybeSkipRecentlyRestarted already did the stats/lock bookkeeping).
+     * opts.since (every path): start of the reboot attempt. Returns 'restarted' when the server was
+     * restarted by someone else after it; the caller releases the lock.
      */
     ensureServerStopped: async function (server, opts = {}) {
         const ac = this.getAlertConfig();
@@ -1390,6 +1430,14 @@ module.exports = {
 
         if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
             return 'skipped';
+        }
+
+        // Every path, vote and staff included: do not stop a server that someone else restarted
+        // after this attempt began (see restartedSince). The caller does the bookkeeping.
+        if (opts.since && await this.restartedSince(server, opts.since)) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Restarted by someone else during this reboot; not stopping it again`);
+            return 'restarted';
         }
 
         const stopGraceMs = (ac.stopGraceSeconds != null ? ac.stopGraceSeconds : 120) * 1000;

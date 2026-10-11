@@ -218,6 +218,72 @@ test('executeFullServerReboot: a crash DURING the save flush aborts before the s
 });
 
 /*
+ * Regression (evol #3, 2026-10-11): a vote reboot was in its save flush when someone else stopped and
+ * started the server. The updater then sent its stop to the booting server, waited out the grace
+ * window and force-killed it with players online. A vote/staff reboot now skips the stop when the
+ * server restarted after the attempt began.
+ */
+test('executeFullServerReboot: scheduled reboot does not stop a server restarted during the flush', async () => {
+    reset();
+    const orig = {
+        getStatus: pterodactyl.getStatus,
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        sleep: functions.sleep,
+        warn: rs.executeRebootWarningsEnhanced,
+        stats: rs.state.todayStats,
+    };
+    let statusCalls = 0;
+    pterodactyl.getStatus = async () => { statusCalls++; return { attributes: { current_state: 'starting', resources: { uptime: 7000 } } }; };
+    rs.executeRebootWarningsEnhanced = async () => true;
+    const cmds = [], powers = [];
+    pterodactyl.sendCommand = async (id, cmd) => { cmds.push(cmd); };
+    pterodactyl.sendPowerAction = async (id, a) => { powers.push(a); };
+    functions.sleep = async () => {};
+    rs.runtimeConfig = { minimumUptimeHours: 6, playerAlerts: { preStopSaveWaitSeconds: 90 } };
+    rs.state.todayStats = { totalServers: 5 };
+    let r;
+    try {
+        r = await rs.executeFullServerReboot({ serverId: 'abc123', name: 'X', serverVersion: '1.21.1' }, 'node',
+            { scheduled: true, requestedBy: 'Player vote (4/6)' });
+    } finally {
+        Object.assign(pterodactyl, { getStatus: orig.getStatus, sendCommand: orig.sendCommand, sendPowerAction: orig.sendPowerAction });
+        functions.sleep = orig.sleep;
+        rs.executeRebootWarningsEnhanced = orig.warn;
+    }
+    assert.deepStrictEqual(r, { success: true, reason: 'restarted_during_reboot', skipped: true });
+    assert.strictEqual(powers.length, 0, `no stop/kill may reach a server someone else restarted; got: ${powers.join(',')}`);
+    assert.strictEqual(statusCalls, 1, 'one status read, after the flush');
+    assert.strictEqual(rs.state.activeReboots.has('abc123'), false, 'the lock is released');
+    assert.deepStrictEqual(rs.state.todayStats, { totalServers: 5 }, 'a scheduled reboot leaves the daily stats alone');
+    rs.state.todayStats = orig.stats;
+    reset();
+});
+
+test('restartedSince: only a start or an uptime shorter than the attempt counts', async () => {
+    const origGetStatus = pterodactyl.getStatus;
+    const since = Date.now() - 5 * 60000; // attempt began 5 min ago
+    const at = (state, uptime) => async () => ({ attributes: { current_state: state, resources: { uptime } } });
+    const cases = [
+        [at('starting', 0), true],
+        [at('running', 60000), true],            // up 1 min, attempt 5 min old
+        [at('running', 12 * 3600000), false],    // up since before the attempt
+        [at('running', 0), false],               // no uptime reading
+        [at('unknown', 0), false],               // getStatus error default
+        [at('offline', 0), false],
+        [async () => { throw new Error('boom'); }, false],
+    ];
+    try {
+        for (const [fn, want] of cases) {
+            pterodactyl.getStatus = fn;
+            assert.strictEqual(await rs.restartedSince({ serverId: 'abc123', name: 'X' }, since), want);
+        }
+    } finally {
+        pterodactyl.getStatus = origGetStatus;
+    }
+});
+
+/*
  * Pre-stop world flush (requested 2026-06-29): EVERY reboot path must `save-all` then idle the full
  * window BEFORE any stop/kill, so a slow modded save (PRI-class worlds) reaches disk and the 60s
  * force-kill in ensureServerStopped can't truncate it. The wait — not the command — is the guarantee
