@@ -16,7 +16,10 @@
  *  - a command that does not reach Bifrost is shown to the clicker and on the card, and
  *    the flag stays decided,
  *  - player text cannot format the card or mention anybody,
- *  - the card follows the proxy when it adds context or raises review to warned to muted,
+ *  - the card follows the proxy when it adds context, replaces the window, or raises
+ *    review to warned to muted,
+ *  - a card with a window shows it above the player's lines and stays under 4096, and a
+ *    card with no window looks as it did before windows,
  *  - a card the proxy closed on an in-game /unmute loses its buttons once, and a card
  *    closed by a button is left alone,
  *  - somebody without the staff role is refused before any of it.
@@ -400,6 +403,58 @@ test('the card is edited when the proxy adds a context line, and only then', asy
     const quiet = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
     assert.strictEqual(quiet.edited, 0);
     assert.strictEqual(card.edits.length, 1);
+});
+
+test('a card with a window shows the recent chat, names on, above the player\'s lines', () => {
+    const plain = chatFlags.contextText(flags['flag-2']);
+    assert.strictEqual(plain, '**Context**\n<t:1790334000:T> borderline line', 'no window: the card as before');
+    assert.strictEqual(chatFlags.contextText({ ...flags['flag-2'], window: [] }), plain, 'an empty window: the card as before');
+
+    const window = [
+        { at: new Date('2026-09-25T10:59:30Z'), from: '[D] valaheilx', text: 'Aik really thinks german internet is worse lol' },
+        { at: new Date('2026-09-25T10:59:50Z'), from: 'Friend', text: 'lol @everyone' }
+    ];
+    assert.strictEqual(chatFlags.contextText({ ...flags['flag-2'], window }),
+        '**Recent chat**\n'
+        + '<t:1790333970:T> [D] valaheilx: Aik really thinks german internet is worse lol\n'
+        + '<t:1790333990:T> Friend: lol @\u200beveryone\n'
+        + "**Player's lines**\n"
+        + '<t:1790334000:T> borderline line');
+});
+
+test('a full window keeps its newest lines, the player\'s lines keep their share, and the card stays under 4096', () => {
+    const at = (s) => new Date(Date.UTC(2026, 8, 25, 10, 30, s));
+    const window = Array.from({ length: 30 }, (_, i) => ({ at: at(i), from: `Player${i}`, text: `w${i} `.padEnd(300, 'x') }));
+    const context = Array.from({ length: 10 }, (_, i) => ({ at: at(40 + i), text: `c${i} `.padEnd(300, 'y') }));
+    const flag = { ...flags['flag-2'], window, context };
+    const text = chatFlags.contextText(flag);
+
+    assert.ok(text.length < 4096, `${text.length} characters`);
+    const [chat, own] = text.split("\n**Player's lines**\n");
+    assert.match(chat, /^\*\*Recent chat\*\*\n\(\d+ older lines left out\)\n/);
+    assert.match(chat, /Player29: w29 x+$/, 'the newest window line stays, last');
+    assert.doesNotMatch(chat, /Player0: /, 'the oldest goes');
+    assert.match(own, /^\(\d+ older lines left out\)\n/);
+    assert.match(own, /c9 y+$/, 'the flagged line stays, last');
+    assert.ok(own.length <= 1200 + 40, 'the player\'s lines keep to their share');
+    assert.strictEqual(chatFlags.buildEmbed(flag).toJSON().description, text, 'discord.js takes the description');
+});
+
+test('the card is edited when the proxy replaces the window', async () => {
+    delete flags['flag-2'];
+    flags['flag-1'].window = [{ at: new Date('2026-09-25T09:59:58Z'), from: 'Friend', text: 'before' }];
+    const ch = channel();
+    await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    const card = messages.get('msg-1');
+
+    flags['flag-1'].window = [
+        { at: new Date('2026-09-25T09:59:58Z'), from: 'Friend', text: 'before' },
+        { at: new Date('2026-09-25T10:00:04Z'), from: '[D] valaheilx', text: 'after' }
+    ];
+    const result = await chatFlags.postOpenFlags(CONFIG, { channel: ch });
+    assert.strictEqual(result.edited, 1);
+    assert.match(card.edits[0].embeds[0].toJSON().description, /<t:1790330404:T> \[D\] valaheilx: after\n\*\*Player's lines\*\*\n/);
+    assert.strictEqual(sent.length, 1, 'an edit, never a second card');
 });
 
 test('the card follows the proxy from review to muted, buttons included', async () => {

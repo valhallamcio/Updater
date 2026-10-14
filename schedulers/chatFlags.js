@@ -10,8 +10,13 @@
  * with buttons on it.
  *
  * The proxy keeps one open doc per player. While it is open, the proxy can add context
- * lines and raise `action` from review to warned to muted. Every pass compares each open
- * card with the doc and edits the card when the doc changed.
+ * lines, replace the window and raise `action` from review to warned to muted. Every pass
+ * compares each open card with the doc and edits the card when the doc changed.
+ *
+ * `context` holds the player's own last lines. `window` holds the chat the player could
+ * read before the newest hit, with a name on each line (a Discord line's name starts with
+ * `[D] `). The card shows the window above the player's lines. An older doc has no window,
+ * and its card shows the player's lines only.
  *
  * A click works like a link request. The flag leaves `open` first, on a filter that only
  * matches while it is still open. The console command goes to Bifrost after that. A second
@@ -73,6 +78,12 @@ const DECIDED = {
 };
 const SOURCE = { hardlist: 'Hard word list', symbol: 'Hate symbol', jev: 'AI filter' };
 const SCORES = ['hate', 'harass', 'threat', 'selfharm'];
+// Characters for the context lines on a card with no window.
+const CONTEXT_MAX = 3400;
+// A card with a window: the player's lines get up to OWN_LINES_MAX, and the window gets
+// the rest of LINES_MAX. Discord caps a description at 4096 and a whole embed at 6000.
+const LINES_MAX = 3600;
+const OWN_LINES_MAX = 1200;
 
 // Bifrost's console splits a line on whitespace, and a newline starts a new command.
 const SAFE_NAME = /^[^\s\u0000-\u001f\u007f]+$/;
@@ -140,6 +151,35 @@ function stamp(value, style) {
     if (value == null) return '';
     const time = new Date(value).getTime();
     return Number.isFinite(time) ? `<t:${Math.floor(time / 1000)}:${style}>` : '';
+}
+
+/**
+ * The newest lines that fit, each with its newline.
+ * @param {string[]} lines Card lines, oldest first.
+ * @param {number} max The most characters.
+ * @returns {{kept: string[], cut: number, length: number}} The kept lines, oldest first,
+ *     how many older lines were left out, and the characters the kept lines take.
+ */
+function newestThatFit(lines, max) {
+    const kept = [];
+    let length = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (length + lines[i].length + 1 > max) break;
+        kept.unshift(lines[i]);
+        length += lines[i].length + 1;
+    }
+    return { kept, cut: lines.length - kept.length, length };
+}
+
+/**
+ * One part of the card description: a heading, a note on lines left out, then the lines.
+ * @param {string} heading The heading.
+ * @param {{kept: string[], cut: number}} part What `newestThatFit` gave.
+ * @returns {string} The part.
+ */
+function linesPart(heading, part) {
+    const note = part.cut > 0 ? `(${part.cut} older line${part.cut === 1 ? '' : 's'} left out)\n` : '';
+    return `**${heading}**\n${note}${part.kept.join('\n')}`;
 }
 
 /**
@@ -628,28 +668,30 @@ module.exports = {
     },
 
     /**
-     * The context lines, oldest first, each with its time. Keeps the newest lines when
-     * they do not all fit.
+     * The window lines, then the player's own context lines, oldest first, each with its
+     * time. The window lines also carry a name. Each part keeps its newest lines when they
+     * do not all fit. A flag with no window shows the context lines only.
      * @param {object} flag The flag doc.
      * @returns {string} The card description.
      */
     contextText: function (flag) {
-        const lines = (Array.isArray(flag.context) ? flag.context : []).map(line => {
+        const toLine = (line, withName) => {
             const when = stamp(line && line.at, 'T');
             const text = cleanText(String(line && line.text != null ? line.text : '').slice(0, 300));
-            return when ? `${when} ${text}` : text;
-        });
-        if (lines.length === 0) return '**Context**\nNone';
-
-        const kept = [];
-        let length = 0;
-        for (let i = lines.length - 1; i >= 0; i--) {
-            if (length + lines[i].length + 1 > 3400) break;
-            kept.unshift(lines[i]);
-            length += lines[i].length + 1;
+            const said = withName ? `${cleanText(String(line && line.from != null ? line.from : '?').slice(0, 64))}: ${text}` : text;
+            return when ? `${when} ${said}` : said;
+        };
+        const lines = (Array.isArray(flag.context) ? flag.context : []).map(line => toLine(line, false));
+        const window = (Array.isArray(flag.window) ? flag.window : []).map(line => toLine(line, true));
+        if (window.length === 0) {
+            if (lines.length === 0) return '**Context**\nNone';
+            return linesPart('Context', newestThatFit(lines, CONTEXT_MAX));
         }
-        const cut = lines.length - kept.length;
-        return `**Context**\n${cut > 0 ? `(${cut} older line${cut === 1 ? '' : 's'} left out)\n` : ''}${kept.join('\n')}`;
+
+        const own = newestThatFit(lines, OWN_LINES_MAX);
+        const chat = newestThatFit(window, LINES_MAX - own.length);
+        const ownPart = lines.length === 0 ? "**Player's lines**\nNone" : linesPart("Player's lines", own);
+        return `${linesPart('Recent chat', chat)}\n${ownPart}`;
     },
 
     /**
