@@ -50,8 +50,8 @@ test('a reward day starts at 12:00 UTC, the same key as herobrine', () => {
 
 test('one evening and the night after it count as one night', () => {
     const doc = hw.normalizeLadder(SAMPLE);
-    // 10-25 20:10 and 10-26 02:05 share the reward day 2026-10-25
-    assert.strictEqual(hw.countNights(doc.history), 4);
+    // 10-25 20:10 and 10-26 02:05 share the reward day 2026-10-25; the 10-28 no_spot night is no night
+    assert.strictEqual(hw.countNights(doc.history), 3);
     assert.strictEqual(hw.countNights([{ at: 0 }, { at: 0 }]), 0, 'a row with no time is no night');
 });
 
@@ -96,7 +96,7 @@ test('the embed carries the counts, the step and the newest sightings', () => {
     assert.strictEqual(json.title, 'Haunted Wrapped: Alp');
     assert.strictEqual(json.description, '*i saw you too.*');
     const field = name => json.fields.find(f => f.name === name).value;
-    assert.strictEqual(field('Nights'), '4');
+    assert.strictEqual(field('Nights'), '3');
     assert.strictEqual(field('Encounters'), '4');
     assert.strictEqual(field('You saw him'), '3');
     assert.strictEqual(field('He caught you'), '1');

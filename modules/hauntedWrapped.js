@@ -90,13 +90,13 @@ function normalizeLadder(raw) {
 }
 
 /**
- * The distinct reward days in the history. A row with no time does not count.
+ * The distinct reward days on which he appeared. A row with no time, or a night he found no spot, does not count.
  * @param {object[]} history Normalized history rows.
  * @returns {number}
  */
 function countNights(history) {
     const days = new Set();
-    for (const h of history) if (h.at > 0) days.add(rewardDayKey(h.at));
+    for (const h of history) if (h.at > 0 && h.outcome !== 'no_spawn') days.add(rewardDayKey(h.at));
     return days.size;
 }
 
