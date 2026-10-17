@@ -1205,6 +1205,17 @@ module.exports = {
             .updateOne({ _id: id, 'reporter.uuid': String(reporterUuid), status: 'open' }, { $set: fields });
     },
 
+    /**
+     * One player's Herobrine ladder doc (bifrost.herobrine_players). The proxy's herobrine
+     * plugin writes it, with the player uuid as `_id`. Read it with modules/hauntedWrapped.js.
+     * @param {string[]} uuids The uuid spellings to match.
+     * @returns {Promise<object|null>} The stored doc, or null.
+     */
+    getHerobrinePlayer: async function (uuids) {
+        const db = await module.exports.getBifrostDb();
+        return db.collection('herobrine_players').findOne({ _id: { $in: uuids } });
+    },
+
     // Discord <-> Minecraft linking (bifrost.discord_link_codes, bifrost.players,
     // bifrost.discord_link_audit). The proxy mints the code in game and watches
     // bifrost.players, so the confirmation card follows the write here in about a second.
