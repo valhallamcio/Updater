@@ -36,6 +36,8 @@ module.exports = {
 
     // serverIds whose management-protocol save fell back to save-all; the warning is logged once per run.
     managementFallbackLogged: new Set(),
+    // serverId -> the pre-stop save the countdown started (preStopSave's promise). ensureServerStopped takes it.
+    preStopSaves: new Map(),
 
     // Start send timings (startServerWithMonitoring). Wings can drop a start without an API error.
     // A start sent while Wings still holds the stop lock is refused. A start whose container create
@@ -1316,11 +1318,19 @@ module.exports = {
         const announceAt = [...new Set([warnSeconds, ...milestones])].filter(s => s > 0).sort((a, b) => b - a);
         const FINAL = Math.min(60, warnSeconds); // final per-second countdown window
 
+        // The pre-stop save starts this many seconds before the end, so its flush wait runs inside
+        // the countdown and the stop goes out at 0. It used to start at 0, and players sat 90 s past
+        // the end of the countdown before the stop.
+        const saveWaitMs = (ac.preStopSaveWaitSeconds || 0) * 1000;
+        const saveAtSeconds = Math.ceil(saveWaitMs / 1000);
+        let saveStarted = false;
+
         sessionLogger.info('RebootScheduler',
             `[${serverName}] Reboot warnings: version=${version || 'unknown'} window=${warnMin}min` +
             `${dryRun ? ' (DRY RUN)' : ''}`);
 
         this.state.cancelRequested.delete(server.serverId);
+        this.preStopSaves.delete(server.serverId);
         // The countdown starts here for every path (batch, staff schedule, player vote), so this
         // is where the proxy's copy of it is written.
         this.recordRebootEvent(server, opts, warnSeconds);
@@ -1341,11 +1351,18 @@ module.exports = {
                         [`tellraw @a ${JSON.stringify({ text: '[!] Restart cancelled.', color: 'green' })}`], gapMs, dryRun);
                 }
                 this.state.cancelRequested.delete(server.serverId);
+                this.preStopSaves.delete(server.serverId);
                 return false;
             }
 
             const secondsLeft = Math.max(0, Math.round((rebootAt - Date.now()) / 1000));
             if (secondsLeft <= 0) break;
+
+            // Not awaited: a protocol save can take seconds, and the countdown keeps its pace.
+            if (saveWaitMs > 0 && !saveStarted && secondsLeft <= saveAtSeconds) {
+                saveStarted = true;
+                this.preStopSaves.set(server.serverId, this.preStopSave(server, saveWaitMs));
+            }
 
             // Milestone announcements (skip ones inside the per-second window, except the initial).
             for (const m of announceAt) {
@@ -1382,21 +1399,20 @@ module.exports = {
                 sleepMs = 200;
             } else {
                 const nextMilestone = announceAt.filter(m => m < secondsLeft).sort((a, b) => b - a)[0] || 0;
-                const target = Math.max(FINAL, nextMilestone);
+                const saveAt = saveWaitMs > 0 && !saveStarted && saveAtSeconds < secondsLeft ? saveAtSeconds : 0;
+                const target = Math.max(FINAL, nextMilestone, saveAt);
                 sleepMs = Math.min(5000, Math.max(1000, (secondsLeft - target) * 1000));
             }
             await functions.sleep(sleepMs);
         }
 
-        // Tear down the bossbar BEFORE the final save: /bossbar is a PERSISTENT custom bossbar
-        // stored in the world, so if it's still present when the world saves it survives the
-        // restart and reappears (stuck) for rejoining players. Remove -> save persists the removal.
-        // (The authoritative pre-stop flush + 90s wait lives in ensureServerStopped, which runs next.)
+        // Tear down the bossbar BEFORE the stop: /bossbar is a PERSISTENT custom bossbar stored in
+        // the world, so if it's still present when the world saves it survives the restart and
+        // reappears (stuck) for rejoining players. The stop's own save persists the removal. The
+        // pre-stop save ran before the bar went up (a window of 90 s or more), so a kill keeps none.
         if (bossbarUp) {
             await this.sendAlertCommands(server, rebootAlerts.buildBossbarTeardown(version), gapMs, dryRun);
         }
-        if (dryRun) sessionLogger.info('RebootScheduler', `[DRYRUN ${serverName}] save-all`);
-        else await pterodactyl.sendCommand(server.serverId, 'save-all').catch(() => {});
         return true;
     },
 
@@ -1416,16 +1432,24 @@ module.exports = {
         // give it time to finish BEFORE any stop/kill. save-all is async on the backend, so the
         // wait — not the command — is what lets a slow modded save (PRI-class worlds) reach disk.
         // A server with a management entry confirms its save over the protocol and skips the wait.
+        // The countdown starts the save saveWait before its end, so only the rest of the wait is
+        // left here. With no countdown save (a window of 0), the save and the full wait run now.
         const saveWaitMs = (ac.preStopSaveWaitSeconds || 0) * 1000;
-        if (saveWaitMs > 0 && !(await this.saveViaManagement(server, saveWaitMs))) {
-            try {
-                await pterodactyl.sendCommand(server.serverId, 'save-all');
-            } catch (error) {
-                sessionLogger.warn('RebootScheduler', `[${server.name}] pre-stop save-all failed: ${error.message}`);
+        if (saveWaitMs > 0) {
+            const pending = this.preStopSaves.get(server.serverId);
+            this.preStopSaves.delete(server.serverId);
+            const savedAt = await (pending || this.preStopSave(server, saveWaitMs));
+            if (savedAt !== null) {
+                const waitMs = pending ? Math.max(0, saveWaitMs - (Date.now() - savedAt)) : saveWaitMs;
+                if (waitMs > 0) {
+                    sessionLogger.info('RebootScheduler',
+                        `[${server.name}] save-all issued; waiting ${Math.ceil(waitMs / 1000)}s for world flush before stop`);
+                    await functions.sleep(waitMs);
+                } else {
+                    sessionLogger.info('RebootScheduler',
+                        `[${server.name}] save-all ran ${Math.round((Date.now() - savedAt) / 1000)}s ago in the countdown; flush wait done`);
+                }
             }
-            sessionLogger.info('RebootScheduler',
-                `[${server.name}] save-all issued; waiting ${saveWaitMs / 1000}s for world flush before stop`);
-            await functions.sleep(saveWaitMs);
         }
 
         if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
@@ -1483,6 +1507,21 @@ module.exports = {
         }
 
         throw new Error('Failed to stop server after multiple attempts');
+    },
+
+    /**
+     * The pre-stop save. Resolves to null when the world saved over the management protocol (on
+     * disk, no flush wait). Else sends save-all and resolves to its send time, which the flush wait
+     * counts from. Never rejects.
+     */
+    preStopSave: async function (server, timeoutMs) {
+        if (await this.saveViaManagement(server, timeoutMs)) return null;
+        try {
+            await pterodactyl.sendCommand(server.serverId, 'save-all');
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `[${server.name}] pre-stop save-all failed: ${error.message}`);
+        }
+        return Date.now();
     },
 
     /**

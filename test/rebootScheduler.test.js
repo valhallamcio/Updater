@@ -21,6 +21,7 @@ function reset() {
     rs.state.activeReboots.clear();
     rs.state.completedServers.clear();
     rs.state.failedServers.clear();
+    rs.preStopSaves.clear();
 }
 
 test('isServerActive: batch path blocks on completedServers (de-dup within one batch)', () => {
@@ -453,6 +454,54 @@ test('ensureServerStopped: preStopSaveWaitSeconds=0 disables the flush (no extra
     assert.ok(!log.includes('cmd:save-all'), 'flush save-all suppressed when disabled');
     assert.ok(!log.includes('sleep:0') && !log.some(e => e === 'sleep:90000'), 'no flush wait when disabled');
     assert.strictEqual(log[0], 'power:stop', 'goes straight to stop');
+});
+
+/*
+ * Regression (2026-10-19): the pre-stop save and its 90 s flush wait ran AFTER the countdown hit 0,
+ * so players sat 90 s past the end before the stop. The countdown's own save-all also froze the
+ * server a second time (PRI 2026-10-18: 5.5 s, then 3 s). The save now starts 90 s before the end:
+ * one save-all, still 90 s before the stop, and the stop goes out when the countdown says 0.
+ */
+test('countdown starts the pre-stop save 90 s before its end: one save-all, stop at 0', async () => {
+    reset();
+    const log = [];
+    const orig = {
+        sendCommand: pterodactyl.sendCommand,
+        sendPowerAction: pterodactyl.sendPowerAction,
+        getStatus: pterodactyl.getStatus,
+        sleep: functions.sleep,
+        runtimeConfig: rs.runtimeConfig,
+        now: Date.now,
+    };
+    const start = orig.now();
+    let clock = start;
+    const at = () => (clock - start) / 1000;
+    Date.now = () => clock;
+    // Yield first, so the save the countdown does not await is sent before the clock moves on.
+    functions.sleep = async (ms) => { await new Promise(r => setImmediate(r)); clock += ms; };
+    pterodactyl.sendCommand = async (id, cmd) => { log.push({ cmd, t: at() }); };
+    pterodactyl.sendPowerAction = async (id, action) => { log.push({ power: action, t: at() }); };
+    pterodactyl.getStatus = async () => ({ attributes: { current_state: 'offline' } });
+    rs.runtimeConfig = { rebootEvents: false, playerAlerts: { preStopSaveWaitSeconds: 90 } };
+    const server = { serverId: 'abc123', name: 'X', serverVersion: '1.21.1' };
+
+    try {
+        assert.strictEqual(await rs.executeRebootWarningsEnhanced(server, { warnWindowMinutes: 2 }), true);
+        await rs.ensureServerStopped(server);
+    } finally {
+        Object.assign(pterodactyl, { sendCommand: orig.sendCommand, sendPowerAction: orig.sendPowerAction, getStatus: orig.getStatus });
+        functions.sleep = orig.sleep;
+        rs.runtimeConfig = orig.runtimeConfig;
+        Date.now = orig.now;
+    }
+
+    const saves = log.filter(e => e.cmd === 'save-all');
+    const stop = log.find(e => e.power === 'stop');
+    assert.strictEqual(saves.length, 1, `one save-all for the whole reboot; got ${saves.length}`);
+    assert.ok(saves[0].t >= 29 && saves[0].t <= 31, `save-all 90 s before the end of the 120 s countdown; sent at ${saves[0].t}s`);
+    assert.ok(stop, 'the server is stopped');
+    assert.ok(stop.t - saves[0].t >= 90, 'the full flush wait still runs before the stop');
+    assert.ok(stop.t <= 122, `stop goes out when the countdown ends, not 90 s later; sent at ${stop.t}s`);
 });
 
 /*
