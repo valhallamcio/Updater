@@ -32,9 +32,21 @@ const {
 const yggdrasil = require("../modules/yggdrasil");
 const {
     ActionRowBuilder,
+    AuditLogEvent,
     ButtonBuilder,
     ButtonStyle
 } = require('discord.js');
+
+// The audit log reason on every role VU creates. A RoleCreate entry with this reason and the
+// bot as executor proves that VU made the role.
+const ROLE_REASON = 'Automated role generation for role assigner.';
+
+/**
+ * The name VU gives the role of a pack.
+ */
+function roleName(pack) {
+    return `[${pack.tag.toUpperCase()}] ${pack.name}`;
+}
 
 /**
  * The label of a pack with several instances: the shortest instance name, then the first in
@@ -50,9 +62,11 @@ function packLabel(rows) {
  * One role button per pack. The instances of a tag share one Discord role, so they share
  * one button, and the role id comes from all of them together.
  * @param {Array} servers Server docs, with the mention and Bifrost rows put in front.
- * @returns {{packs: Array, conflicts: Array}} packs: one row per tag in first-seen order, with
- *   the role id the instances carry ('' when none has one). conflicts: { tag, roleIds } for a
- *   tag whose instances carry different role ids. Such a tag gets no button and no new role.
+ * @returns {{packs: Array, conflicts: Array, hidden: Array}} packs: one row per tag in first-seen
+ *   order, with the role id the instances carry ('' when none has one). conflicts: { tag, roleIds }
+ *   for a tag whose instances carry different role ids. Such a tag gets no button and no new role.
+ *   hidden: { tag, discordRoleId } for a tag whose every instance has excludeFromServerList. The
+ *   pack is not released, so it gets no button, no new role and no emoji.
  */
 function packButtons(servers) {
     const byTag = new Map();
@@ -64,24 +78,80 @@ function packButtons(servers) {
 
     const packs = [];
     const conflicts = [];
+    const hidden = [];
     for (const [tag, rows] of byTag) {
         const roleIds = [...new Set(rows.map(r => r.discordRoleId).filter(Boolean))];
         if (roleIds.length > 1) {
             conflicts.push({ tag, roleIds });
             continue;
         }
+        const visible = rows.filter(r => !r.excludeFromServerList);
+        if (visible.length === 0) {
+            hidden.push({ tag, discordRoleId: roleIds[0] || '' });
+            continue;
+        }
         // Pack data for the emoji. The instances run one pack, so any row that has it will do.
         const data = rows.find(r => r.modpackID) || {};
         packs.push({
             tag,
-            name: rows.length === 1 ? rows[0].name : packLabel(rows),
+            // A hidden instance can carry a code name. The label comes from the visible ones.
+            name: visible.length === 1 ? visible[0].name : packLabel(visible),
             discordRoleId: roleIds[0] || '',
             hostname: data.hostname,
             modpackID: data.modpackID,
             platform: data.platform
         });
     }
-    return { packs, conflicts };
+    return { packs, conflicts, hidden };
+}
+
+/**
+ * The role ids that RoleCreate audit log entries show the role assigner created.
+ * @param {Iterable} entries Audit log entries: { targetId, executorId, reason }.
+ * @param {string} botId The bot's user id.
+ * @returns {Set<string>} Role ids.
+ */
+function createdByAssigner(entries, botId) {
+    const roleIds = new Set();
+    for (const entry of entries) {
+        if (entry.targetId && entry.executorId === botId && entry.reason === ROLE_REASON) roleIds.add(entry.targetId);
+    }
+    return roleIds;
+}
+
+/**
+ * The roles to mark as waiting for a release. VU created them, and a hidden tag holds them now.
+ * @param {Array} hidden Hidden tags from packButtons.
+ * @param {Map<string, object>} owned Role id to its role_assigner_roles row.
+ * @param {Set<string>} created Role ids that are not in owned yet, which the audit log shows VU created.
+ * @returns {Array<{roleId: string, tag: string}>}
+ */
+function pendingMarks(hidden, owned, created) {
+    const marks = [];
+    for (const { tag, discordRoleId: roleId } of hidden) {
+        if (!roleId || marks.some(mark => mark.roleId === roleId)) continue;
+        const row = owned.get(roleId);
+        if (row && row.pendingRelease) continue;
+        if (!row && !created.has(roleId)) continue;
+        marks.push({ roleId, tag });
+    }
+    return marks;
+}
+
+/**
+ * The roles of released packs that VU created while the pack was hidden. Each one takes the
+ * pack's real tag and name. A role that a hidden tag still holds waits.
+ * @param {Array} packs Visible packs from packButtons.
+ * @param {Array} hidden Hidden tags from packButtons.
+ * @param {Map<string, object>} owned Role id to its role_assigner_roles row.
+ * @returns {Array<{roleId: string, tag: string, name: string}>} The name the role must have.
+ */
+function releasedRoles(packs, hidden, owned) {
+    const held = new Set(hidden.map(h => h.discordRoleId).filter(Boolean));
+    return packs
+        .filter(pack => pack.discordRoleId && !held.has(pack.discordRoleId))
+        .filter(pack => (owned.get(pack.discordRoleId) || {}).pendingRelease)
+        .map(pack => ({ roleId: pack.discordRoleId, tag: pack.tag, name: roleName(pack) }));
 }
 
 module.exports = {
@@ -108,6 +178,11 @@ module.exports = {
         let lastPayloadHash = null;
         // Role id conflicts already logged, so the 1 min rebuild does not repeat them.
         const loggedConflicts = new Set();
+        // The role_assigner_roles rows by role id. Null until the first read works.
+        let ownedRoles = null;
+        // Role ids the audit log does not show VU created. Each one is looked up once per process.
+        const auditChecked = new Set();
+        let lastTrackError = null;
 
         client.on("interactionCreate", async interaction => {
             if (interaction.isButton() && interaction.message.channelId === options.roleChannelId) {
@@ -175,13 +250,15 @@ module.exports = {
             serverListFull = await addBifrostButton(serverListFull);
 
             // One row per tag. The role id comes from every instance, never from the first one.
-            const { packs, conflicts } = packButtons(serverListFull);
+            const { packs, conflicts, hidden } = packButtons(serverListFull);
             for (const { tag, roleIds } of conflicts) {
                 const key = `${tag}:${roleIds.join(',')}`;
                 if (loggedConflicts.has(key)) continue;
                 loggedConflicts.add(key);
                 sessionLogger.warn('RoleAssigner', `The instances of ${tag} carry different role ids (${roleIds.join(', ')}). No button for ${tag} until they match.`);
             }
+
+            await trackReleases(packs, hidden);
 
             serverList = packs.filter(server => server.discordRoleId);
             const serverListMissing = packs.filter(server => !server.discordRoleId);
@@ -257,19 +334,77 @@ module.exports = {
             lastPayloadHash = payloadHash;
         }
 
+        /**
+         * Keeps the release state of the roles VU created. A hidden tag that holds such a role
+         * marks it as waiting for a release. When its pack turns visible, the role takes the
+         * pack's real tag and name once. A role VU did not create is never renamed. Never throws:
+         * the buttons must not wait on Mongo or the audit log.
+         */
+        async function trackReleases(packs, hidden) {
+            try {
+                if (!ownedRoles) {
+                    const rows = await mongo.findAssignerRoles();
+                    ownedRoles = new Map(rows.map(row => [row.roleId, row]));
+                }
+                const channel = await client.channels.fetch(options.roleChannelId);
+                const guild = channel.guild;
+
+                const unknown = [...new Set(hidden.map(h => h.discordRoleId))]
+                    .filter(roleId => roleId && !ownedRoles.has(roleId) && !auditChecked.has(roleId));
+                let created = new Set();
+                if (unknown.length > 0) {
+                    const auditLog = await guild.fetchAuditLogs({ type: AuditLogEvent.RoleCreate, limit: 100 });
+                    created = createdByAssigner(auditLog.entries.values(), client.user.id);
+                    for (const roleId of unknown) {
+                        if (!created.has(roleId)) auditChecked.add(roleId);
+                    }
+                }
+
+                for (const { roleId, tag } of pendingMarks(hidden, ownedRoles, created)) {
+                    await mongo.recordAssignerRole(roleId, tag, true, 'audit_log');
+                    ownedRoles.set(roleId, { roleId, tag, pendingRelease: true });
+                    sessionLogger.info('RoleAssigner', `Role ${roleId} of hidden ${tag} waits for the release`);
+                }
+
+                for (const { roleId, tag, name } of releasedRoles(packs, hidden, ownedRoles)) {
+                    const role = guild.roles.cache.get(roleId);
+                    if (role && role.name !== name) {
+                        const oldName = role.name;
+                        await role.setName(name, 'The pack of this role is released.');
+                        sessionLogger.info('RoleAssigner', `Renamed role ${roleId} from ${oldName} to ${name}: ${tag} is released`);
+                    }
+                    await mongo.recordAssignerRole(roleId, tag, false, 'audit_log');
+                    ownedRoles.set(roleId, { roleId, tag, pendingRelease: false });
+                }
+                lastTrackError = null;
+            } catch (error) {
+                if (error.message !== lastTrackError) {
+                    sessionLogger.error('RoleAssigner', 'Could not track the roles of hidden packs:', error.message);
+                }
+                lastTrackError = error.message;
+            }
+        }
+
         async function generateNewRoles(serverList) {
             for (let server of serverList) {
                 sessionLogger.info('RoleAssigner', `Generating new role for ${server.name}`);
                 const channel = await client.channels.fetch(options.roleChannelId);
 
                 const newRole = await channel.guild.roles.create({
-                    name: `[${server.tag.toUpperCase()}] ${server.name}`,
-                    reason: 'Automated role generation for role assigner.'
+                    name: roleName(server),
+                    reason: ROLE_REASON
                 });
 
                 await yggdrasil.updateServer(server.tag, {
                     discord_role_id: newRole.id
                 });
+
+                try {
+                    await mongo.recordAssignerRole(newRole.id, server.tag, false, 'created');
+                    if (ownedRoles) ownedRoles.set(newRole.id, { roleId: newRole.id, tag: server.tag, pendingRelease: false });
+                } catch (error) {
+                    sessionLogger.warn('RoleAssigner', `Could not record the new role ${newRole.id} of ${server.tag}: ${error.message}`);
+                }
             }
         }
 
@@ -356,3 +491,7 @@ module.exports = {
 };
 
 module.exports.packButtons = packButtons;
+module.exports.createdByAssigner = createdByAssigner;
+module.exports.pendingMarks = pendingMarks;
+module.exports.releasedRoles = releasedRoles;
+module.exports.ROLE_REASON = ROLE_REASON;

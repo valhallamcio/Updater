@@ -1931,6 +1931,52 @@ module.exports = {
             .toArray();
     },
 
+    // Roles the role assigner created (the updater's own DB). Only these are ever renamed, so
+    // a role made by hand keeps its name. pendingRelease marks a role that a hidden server doc
+    // holds: it takes the pack's real tag and name once the doc turns visible.
+    /**
+     * Every role the role assigner owns.
+     * @returns {Promise<object[]>} `{roleId, tag, pendingRelease}` rows.
+     */
+    findAssignerRoles: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('role_assigner_roles')
+            .find({}, { projection: { _id: 0, roleId: 1, tag: 1, pendingRelease: 1 } })
+            .toArray();
+    },
+
+    /**
+     * Records a role the role assigner owns, or its new release state.
+     * @param {string} roleId Discord role id.
+     * @param {string} tag Pack tag that holds the role now.
+     * @param {boolean} pendingRelease True while a hidden server doc holds the role.
+     * @param {string} source How VU knows it made the role ('created' or 'audit_log'). Kept from the first write.
+     * @returns {Promise<object>} The updateOne result.
+     */
+    recordAssignerRole: async function (roleId, tag, pendingRelease, source) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('role_assigner_roles')
+            .updateOne(
+                { roleId: String(roleId) },
+                {
+                    $set: { roleId: String(roleId), tag: String(tag), pendingRelease: !!pendingRelease, at: new Date() },
+                    $setOnInsert: { source: String(source) }
+                },
+                { upsert: true });
+    },
+
     /**
      * Creates the indexes the link flow needs, once per process. Each spec is attempted
      * on its own (one failure used to skip every later one for the life of the process)
