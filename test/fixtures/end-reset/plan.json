@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "planId": "01JBX5P9N2C4D6F8G0H1J3K5MB",
+  "createdAt": "2026-10-21T09:00:00Z",
+  "serverId": "e2f5e517",
+  "mc": "26.1.2",
+  "loader": "neoforge",
+  "mod": "biforesting 1.0.0+26.1.2-neoforge fixture",
+  "level": "world",
+  "dimension": "minecraft:the_end",
+  "zone": { "shape": "square", "radiusChunks": 8 },
+  "keptChunks": [
+    { "chunk": [12, 12], "team": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "forceLoaded": false },
+    { "chunk": [-40, 3], "team": "5b1e4c2a-7d8e-4f90-a1b2-c3d4e5f60718", "forceLoaded": false }
+  ],
+  "zoneClaimMoves": [
+    {
+      "team": { "id": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "shortName": "Epic_Gamers#eee65f7e", "type": "party" },
+      "offset": [9, 0],
+      "chunks": [
+        { "source": [1, 5], "target": [10, 5], "forceLoaded": true, "claimedAt": "2026-10-18T21:56:58Z" },
+        { "source": [2, 5], "target": [11, 5], "forceLoaded": false, "claimedAt": "2026-10-18T21:57:03Z" }
+      ]
+    }
+  ],
+  "wipe": {
+    "chunkCount": 1534,
+    "regions": [
+      { "file": "r.0.0.mca", "keep": [[12, 12]] },
+      { "file": "r.-1.0.mca", "keep": [] },
+      { "file": "r.-2.0.mca", "keep": [[-40, 3]] }
+    ]
+  },
+  "fight": {
+    "needs_state_scanning": true,
+    "dragon_killed": false,
+    "previously_killed": false,
+    "dragon_uuid": null,
+    "exit_portal_location": null,
+    "respawn_stage": null,
+    "respawn_crystals": [],
+    "gateways": [11, 14, 12, 2, 4, 9, 7, 17, 5, 6, 15, 10, 1, 16, 3, 18, 0, 13, 8, 19]
+  },
+  "gatewaysInKeptChunks": [],
+  "forceLoads": [
+    { "source": "ftbchunks", "chunk": [1, 5], "team": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "action": "move", "target": [10, 5] },
+    { "source": "vanilla", "chunk": [0, 0], "action": "release" }
+  ],
+  "homes": [
+    { "mod": "ftbessentials", "player": "a1b2c3d4-0000-4000-8000-000000000001", "name": "base",
+      "old": [29, 76, 88], "action": "move", "new": [173, 76, 88] },
+    { "mod": "ftbessentials", "player": "a1b2c3d4-0000-4000-8000-000000000002", "name": "farm",
+      "old": [-30, 64, 40], "action": "remove", "new": null }
+  ],
+  "waystones": [
+    { "mod": "waystones", "id": "c0ffee00-0000-4000-8000-000000000001", "name": "Gate", "owner": "a1b2c3d4-0000-4000-8000-000000000001",
+      "old": [30, 75, 92], "action": "move", "new": [174, 75, 92] },
+    { "mod": "waystones", "id": "c0ffee00-0000-4000-8000-000000000002", "name": "Spawn Hub", "owner": "a1b2c3d4-0000-4000-8000-000000000003",
+      "old": [5, 62, -3], "action": "remove", "new": null }
+  ],
+  "warps": [ { "mod": "ftbessentials", "name": "end", "old": [0, 65, 0], "action": "remove", "new": null } ],
+  "backPositions": [
+    { "mod": "ftbessentials", "player": "a1b2c3d4-0000-4000-8000-000000000002", "kind": "teleport_history", "index": 0,
+      "old": [20, 70, 85], "action": "move", "new": [164, 70, 85] },
+    { "mod": "ftbessentials", "player": "a1b2c3d4-0000-4000-8000-000000000002", "kind": "teleport_history", "index": 3,
+      "old": [20, 70, 20], "action": "remove", "new": null }
+  ],
+  "offlinePlayers": [
+    { "player": "a1b2c3d4-0000-4000-8000-000000000003", "name": "Nullifiedlife67", "old": [-12, 60, 7], "action": "to_world_spawn", "new": null },
+    { "player": "a1b2c3d4-0000-4000-8000-000000000004", "name": "Kestrel_9", "old": [40, 80, 82], "action": "move", "new": [184, 80, 82] }
+  ],
+  "affectedPlayers": [
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000001",
+      "name": "StretchyBacon",
+      "reasons": [
+        { "kind": "claim_moved", "old": [16, 0, 80], "new": [160, 0, 80], "detail": "chunk [1, 5] to [10, 5], team Epic Gamers" },
+        { "kind": "claim_moved", "old": [32, 0, 80], "new": [176, 0, 80], "detail": "chunk [2, 5] to [11, 5], team Epic Gamers" },
+        { "kind": "home_moved", "old": [29, 76, 88], "new": [173, 76, 88], "detail": "base" },
+        { "kind": "waystone_moved", "old": [30, 75, 92], "new": [174, 75, 92], "detail": "Gate" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000002",
+      "name": "CoolBreeze02050",
+      "reasons": [
+        { "kind": "claim_moved", "old": [16, 0, 80], "new": [160, 0, 80], "detail": "chunk [1, 5] to [10, 5], team Epic Gamers" },
+        { "kind": "claim_moved", "old": [32, 0, 80], "new": [176, 0, 80], "detail": "chunk [2, 5] to [11, 5], team Epic Gamers" },
+        { "kind": "home_removed", "old": [-30, 64, 40], "new": null, "detail": "farm" },
+        { "kind": "back_moved", "old": [20, 70, 85], "new": [164, 70, 85], "detail": "teleport history 0" },
+        { "kind": "back_removed", "old": [20, 70, 20], "new": null, "detail": "teleport history 3" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000003",
+      "name": "Nullifiedlife67",
+      "reasons": [
+        { "kind": "waystone_removed", "old": [5, 62, -3], "new": null, "detail": "Spawn Hub" },
+        { "kind": "player_to_spawn", "old": [-12, 60, 7], "new": null, "newDim": "minecraft:overworld", "detail": "" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000004",
+      "name": "Kestrel_9",
+      "reasons": [
+        { "kind": "player_moved", "old": [40, 80, 82], "new": [184, 80, 82], "detail": "" }
+      ]
+    }
+  ],
+  "unsupported": [],
+  "backupBytes": 734003200,
+  "totals": { "kept": 2, "moved": 2, "wiped": 1534, "homes": 2, "waystones": 2, "warps": 1, "players": 2 }
+}

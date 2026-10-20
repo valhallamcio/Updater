@@ -218,6 +218,23 @@ module.exports = {
     },
 
     /**
+     * Gets the disk limit and the used disk space of a server.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @returns {{limitBytes: number, usedBytes: number}} A limitBytes of 0 means no limit.
+     * @throws If the panel gives no numbers.
+     */
+    getDiskSpace: async function (serverID) {
+        const details = await this.safeApiRequest('GET', `${pterodactylHostName}api/client/servers/${serverID}`);
+        const resources = await this.safeApiRequest('GET', `${pterodactylHostName}api/client/servers/${serverID}/resources`);
+        const limitMb = Number(details.data?.attributes?.limits?.disk);
+        const usedBytes = Number(resources.data?.attributes?.resources?.disk_bytes);
+        if (!Number.isFinite(limitMb) || !Number.isFinite(usedBytes)) {
+            throw new Error(`The panel gave no disk numbers for ${serverID}`);
+        }
+        return { limitBytes: limitMb * 1024 * 1024, usedBytes };
+    },
+
+    /**
      * Gets server uptime in hours
      * @param {string} serverID Id of the server on Pterodactyl.
      * @returns {number} Server uptime in hours, or 0 if server is not running

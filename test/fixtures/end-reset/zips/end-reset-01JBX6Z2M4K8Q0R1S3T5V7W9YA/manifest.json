@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "resetId": "01JBX6Z2M4K8Q0R1S3T5V7W9YA",
+  "planSha256": "dd8c85a92c74e9770217494a99d166d06610307da666a63e25247fb8108e3b27",
+  "createdAt": "2026-10-21T04:02:11Z",
+  "complete": true,
+  "files": [
+    {
+      "path": "world/dimensions/minecraft/the_end/region/r.0.0.mca",
+      "backup": "files/0001.mca",
+      "bytes": 20480,
+      "md5Before": "6145e660077df7700b4e8832d7e9aadb",
+      "action": "rewritten",
+      "md5After": "5b4acbe9490a58c6f3db169f196d4446",
+      "writtenAt": "2026-10-21T04:02:40Z"
+    },
+    {
+      "path": "world/dimensions/minecraft/the_end/region/r.-1.0.mca",
+      "backup": "files/0002.mca",
+      "bytes": 2097152,
+      "md5Before": "580ee80deb2ab3cc938b410c3fbce614",
+      "action": "moved",
+      "md5After": null,
+      "writtenAt": null
+    },
+    {
+      "path": "world/dimensions/minecraft/the_end/region/r.-2.0.mca",
+      "backup": "files/0003.mca",
+      "bytes": 12288,
+      "md5Before": "221022f2a1645267cc73d33525d3569f",
+      "action": "rewritten",
+      "md5After": "f1c80e36e5146c0b4e4d5f92750ed536",
+      "writtenAt": "2026-10-21T04:02:40Z"
+    },
+    {
+      "path": "world/dimensions/minecraft/the_end/data/minecraft/ender_dragon_fight.dat",
+      "backup": "files/0004.dat",
+      "bytes": 161,
+      "md5Before": "b3eee5d32e44a629ebd508fe0181bdb1",
+      "action": "rewritten",
+      "md5After": "51e8f66db8b48b70dadd6759d9503946",
+      "writtenAt": "2026-10-21T04:02:40Z"
+    },
+    {
+      "path": "world/ftbchunks/eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b.json5",
+      "backup": "files/0005.json5",
+      "bytes": 851,
+      "md5Before": "a4d5dde85a8cf1460fccc89d6e542680",
+      "action": "rewritten",
+      "md5After": "336768343bb8d5653733114b0776f1df",
+      "writtenAt": "2026-10-21T04:02:40Z"
+    }
+  ]
+}

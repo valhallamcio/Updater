@@ -435,6 +435,27 @@ module.exports = {
         return jobs;
     },
 
+    /**
+     * Finds schedule jobs by a filter, newest first.
+     * @param {object} filter Mongo filter on schedule_jobs.
+     * @param {number} [limit] Max docs.
+     * @returns {Array} The jobs.
+     */
+    findScheduleJobs: async function (filter, limit = 20) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db(mongoDBName)
+            .collection('schedule_jobs')
+            .find(filter)
+            .sort({ createdAt: -1 })
+            .limit(limit)
+            .toArray();
+    },
+
     // Reboot countdowns (valhallamc.reboot_events). Bifrost renders the countdown itself
     // (boss bar / action bar per client era) and keeps a planned restart from being relayed
     // as a crash; this collection is its only source, so EVERY countdown writes one doc.
@@ -1136,6 +1157,23 @@ module.exports = {
             .db('bifrost')
             .collection('mail')
             .insertOne(doc);
+    },
+
+    /**
+     * The mail with this meta.key, or null. Automated mails carry a key so a re-run
+     * does not send the same mail twice.
+     * @param {string} key The meta.key value.
+     */
+    findMailByMetaKey: async function (key) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        return mongoClient
+            .db('bifrost')
+            .collection('mail')
+            .findOne({ 'meta.key': String(key) }, { projection: { _id: 1 } });
     },
 
     // Player reports (bifrost.reports). The proxy files them from in-game /report, and staff

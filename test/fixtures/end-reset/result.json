@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "resetId": "01JBX6Z2M4K8Q0R1S3T5V7W9YA",
+  "kind": "reset",
+  "status": "applied",
+  "reason": null,
+  "startedAt": "2026-10-21T04:02:10Z",
+  "finishedAt": "2026-10-21T04:02:55Z",
+  "manifest": "zips/end-reset-01JBX6Z2M4K8Q0R1S3T5V7W9YA/manifest.json",
+  "totals": { "kept": 2, "moved": 2, "wiped": 1534 },
+  "fight": { "needs_state_scanning": true, "dragon_killed": false, "previously_killed": false },
+  "affectedPlayers": [
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000001",
+      "name": "StretchyBacon",
+      "reasons": [
+        { "kind": "claim_moved", "old": [16, 0, 80], "new": [160, 0, 80], "detail": "chunk [1, 5] to [10, 5], team Epic Gamers" },
+        { "kind": "claim_moved", "old": [32, 0, 80], "new": [176, 0, 80], "detail": "chunk [2, 5] to [11, 5], team Epic Gamers" },
+        { "kind": "home_moved", "old": [29, 76, 88], "new": [173, 76, 88], "detail": "base" },
+        { "kind": "waystone_moved", "old": [30, 75, 92], "new": [174, 75, 92], "detail": "Gate" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000002",
+      "name": "CoolBreeze02050",
+      "reasons": [
+        { "kind": "claim_moved", "old": [16, 0, 80], "new": [160, 0, 80], "detail": "chunk [1, 5] to [10, 5], team Epic Gamers" },
+        { "kind": "claim_moved", "old": [32, 0, 80], "new": [176, 0, 80], "detail": "chunk [2, 5] to [11, 5], team Epic Gamers" },
+        { "kind": "home_removed", "old": [-30, 64, 40], "new": null, "detail": "farm" },
+        { "kind": "back_moved", "old": [20, 70, 85], "new": [164, 70, 85], "detail": "teleport history 0" },
+        { "kind": "back_removed", "old": [20, 70, 20], "new": null, "detail": "teleport history 3" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000003",
+      "name": "Nullifiedlife67",
+      "reasons": [
+        { "kind": "waystone_removed", "old": [5, 62, -3], "new": null, "detail": "Spawn Hub" },
+        { "kind": "player_to_spawn", "old": [-12, 60, 7], "new": null, "newDim": "minecraft:overworld", "detail": "" }
+      ]
+    },
+    {
+      "player": "a1b2c3d4-0000-4000-8000-000000000004",
+      "name": "Kestrel_9",
+      "reasons": [
+        { "kind": "player_moved", "old": [40, 80, 82], "new": [184, 80, 82], "detail": "" }
+      ]
+    }
+  ],
+  "warps": [ { "mod": "ftbessentials", "name": "end", "old": [0, 65, 0], "action": "remove", "new": null } ]
+}

@@ -1,0 +1,28 @@
+{
+  max_claim_chunks: 500,
+  max_force_load_chunks: 40,
+  last_login_time: 1792900000000,
+  chunks: {
+    "minecraft:overworld": [
+      {
+        x: -160,
+        z: -95,
+        time: 1791736480665,
+      },
+    ],
+    "minecraft:the_end": [
+      {
+        x: -40,
+        z: 3,
+        time: 1791736480665,
+      },
+    ],
+  },
+  member_data: {
+    "a1b2c3d4-0000-4000-8000-000000000003": {
+      max_claimed_chunks: 500,
+      max_force_loaded_chunks: 25,
+      offline_force_loader: false,
+    },
+  },
+}
