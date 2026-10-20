@@ -18,7 +18,7 @@ module.exports = {
         "serverStartupTimeout": 20, // Minutes
         "batchingStrategy": "auto", // "auto" = dynamic based on nodes, "fixed" = use maxBatchSize
         "maxBatchSize": 12, // Only used if batchingStrategy is "fixed"
-        "playerThreshold": 50, // Reboot when less than this many players online
+        "playerThreshold": 250, // Reboot when this many players or fewer are online
         "apiRetryDelay": 2000, // NEW: Delay between API retries
         "apiMaxRetries": 3, // NEW: Max API call retries
         "nodeRebootDelay": 5000, // NEW: Delay between nodes
@@ -298,16 +298,16 @@ module.exports = {
             let triggerReason = '';
             
             // Only trigger during optimal reboot window (9:00-11:00 AM GMT+3) AND low player count
-            if (timeWindow.isInWindow && totalPlayers < options.playerThreshold) {
+            if (timeWindow.isInWindow && totalPlayers <= options.playerThreshold) {
                 shouldTrigger = true;
-                triggerReason = `Optimal time window + Low player count (${totalPlayers} < ${options.playerThreshold})`;
+                triggerReason = `Optimal time window + Low player count (${totalPlayers} <= ${options.playerThreshold})`;
             }
             
             // Log debug info about why we're not triggering
-            if (!timeWindow.isInWindow && totalPlayers < options.playerThreshold) {
+            if (!timeWindow.isInWindow && totalPlayers <= options.playerThreshold) {
                 sessionLogger.debug('RebootScheduler', 
                     `Low player count (${totalPlayers}) but outside reboot window (${timeWindow.timeString})`);
-            } else if (timeWindow.isInWindow && totalPlayers >= options.playerThreshold) {
+            } else if (timeWindow.isInWindow && totalPlayers > options.playerThreshold) {
                 sessionLogger.debug('RebootScheduler', 
                     `In reboot window (${timeWindow.timeString}) but too many players (${totalPlayers})`);
             }

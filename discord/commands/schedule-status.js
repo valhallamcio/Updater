@@ -116,7 +116,7 @@ module.exports = {
                     `Max Concurrent Reboots: ${scheduleConfig.maxConcurrentReboots || 4}/node`,
                     `Retry Limit: ${scheduleConfig.rebootRetryLimit || 3}`,
                     `Startup Timeout: ${scheduleConfig.serverStartupTimeout || 20}min`,
-                    `Player Threshold: ${scheduleConfig.playerThreshold || 25}`
+                    `Player Threshold: ${scheduleConfig.playerThreshold || 250}`
                 ].join('\n');
                 
                 embed.addFields({ name: '⚙️ Configuration', value: configText, inline: false });

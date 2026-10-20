@@ -253,7 +253,7 @@ module.exports = {
                 serverStartupTimeout: 20,
                 batchingStrategy: "auto",
                 maxBatchSize: 12,
-                playerThreshold: 25
+                playerThreshold: 250
             };
         } else {
             config.scheduler.rebootScheduler.active = true;
