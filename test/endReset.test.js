@@ -84,6 +84,8 @@ test('parseJob: verify, mail and restore need a resetId; restore keeps confirmLo
     assert.strictEqual(endReset.parseJob(job({ action: 'restore', resetId: RESET_ID })).job.confirmLoss, false);
     assert.strictEqual(endReset.parseJob(job({ action: 'restore', resetId: RESET_ID, confirmLoss: true })).job.confirmLoss, true);
     assert.strictEqual(endReset.parseJob(job({ action: 'mail', resetId: RESET_ID, mailDryRun: true })).job.mailDryRun, true);
+    assert.strictEqual(endReset.parseJob(job({ action: 'restore', resetId: RESET_ID, restoreId: PLAN_ID })).job.restoreId, PLAN_ID);
+    assert.strictEqual(endReset.parseJob(job({ action: 'restore', resetId: RESET_ID, restoreId: 'x' })).ok, false);
 });
 
 // ── ids and the request files ───────────────────────────────────────────────
@@ -135,12 +137,13 @@ test('buildRequest refuses bad ids, a bad sha and an empty window', () => {
     assert.throws(() => endReset.buildRequest({ ...ok, notAfter: 1 }), /notAfter/);
 });
 
-test('buildRestore writes the contract fields', () => {
+test('buildRestore writes the contract fields with its own restoreId', () => {
+    assert.throws(() => endReset.buildRestore({ resetId: RESET_ID, notBefore: 1, notAfter: 2 }), /restoreId/);
     const text = endReset.buildRestore({
-        resetId: RESET_ID, notBefore: Date.parse('2026-10-22T03:55:00Z'), notAfter: Date.parse('2026-10-22T05:00:00Z'), requestedBy: 'alp',
+        restoreId: PLAN_ID, resetId: RESET_ID, notBefore: Date.parse('2026-10-22T03:55:00Z'), notAfter: Date.parse('2026-10-22T05:00:00Z'), requestedBy: 'alp',
     });
     assert.deepStrictEqual(JSON.parse(text), {
-        schema: 1, resetId: RESET_ID, notBefore: '2026-10-22T03:55:00Z', notAfter: '2026-10-22T05:00:00Z', requestedBy: 'alp',
+        schema: 1, restoreId: PLAN_ID, resetId: RESET_ID, notBefore: '2026-10-22T03:55:00Z', notAfter: '2026-10-22T05:00:00Z', requestedBy: 'alp',
     });
 });
 
@@ -187,6 +190,7 @@ test('summarizePlan gives the chunk counts and the affected players', () => {
     assert.match(text, /Affected players \(4\): StretchyBacon, CoolBreeze02050, Nullifiedlife67, Kestrel_9/);
     assert.match(text, /Team Epic_Gamers#eee65f7e: 2 chunks, offset 9 0/);
     assert.match(text, /Homes: 1 move, 1 remove/);
+    assert.match(text, /Region files: 2 rebuild, 1 move/);
     assert.match(text, /Unsupported: none/);
     assert.match(text, /Evolution #3 \(e2f5e517\)/);
 });

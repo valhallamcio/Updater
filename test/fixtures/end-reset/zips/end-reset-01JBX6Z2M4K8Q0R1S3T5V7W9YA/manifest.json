@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "resetId": "01JBX6Z2M4K8Q0R1S3T5V7W9YA",
-  "planSha256": "dd8c85a92c74e9770217494a99d166d06610307da666a63e25247fb8108e3b27",
+  "planSha256": "df9256ca5ae13cf5c6f2a0f64e477a1e6b5d7a05c2540f2f40dea1bccbd4be43",
   "createdAt": "2026-10-21T04:02:11Z",
   "complete": true,
   "files": [
@@ -48,6 +48,15 @@
       "md5Before": "a4d5dde85a8cf1460fccc89d6e542680",
       "action": "rewritten",
       "md5After": "336768343bb8d5653733114b0776f1df",
+      "writtenAt": "2026-10-21T04:02:40Z"
+    },
+    {
+      "path": "world/dimensions/minecraft/the_end/poi/r.0.0.mca",
+      "backup": null,
+      "bytes": 16384,
+      "md5Before": null,
+      "action": "created",
+      "md5After": "d2ef9105f4a455c1056d670b1dd8d87d",
       "writtenAt": "2026-10-21T04:02:40Z"
     }
   ]

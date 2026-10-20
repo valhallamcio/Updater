@@ -1,6 +1,6 @@
 /*
- * Writes the binary and md5 parts of the End reset fixture: two region files, two FTB Chunks
- * team files and the manifest. plan.json, result.json, boot-log.txt and the two fight files
+ * Writes the binary and md5 parts of the End reset fixture: two region files, a new poi file for
+ * the move targets, two FTB Chunks team files and the manifest. plan.json, result.json, boot-log.txt and the two fight files
  * are kept by hand. The fight files are real 26.1.2 files: ender_dragon_fight.dat is a fresh
  * one (evol #3, 2026-10-20), fight-killed.dat is a trapped one (evol #1, 2026-10-19).
  *
@@ -113,6 +113,8 @@ function write(rel, bytes) {
 
 const r00 = write(`${END}/region/r.0.0.mca`, region([[12, 12], [10, 5], [11, 5]]));
 const r20 = write(`${END}/region/r.-2.0.mca`, region([[-40, 3]]));
+// The poi track had no r.0.0 before the reset; the engine creates it for the targets.
+const poi00 = write(`${END}/poi/r.0.0.mca`, region([[10, 5], [11, 5]]));
 const teamA = write(`world/ftbchunks/${TEAM_A}.json5`, Buffer.from(claimFile([
     { x: 12, z: 12, time: 1791736480665 },
     { x: 10, z: 5, time: 1792900930000, force: 1792900930000 },
@@ -141,6 +143,7 @@ const manifest = {
         rewritten(`${END}/region/r.-2.0.mca`, r20, 3, 'mca'),
         rewritten(`${END}/data/minecraft/ender_dragon_fight.dat`, fight, 4, 'dat'),
         rewritten(`world/ftbchunks/${TEAM_A}.json5`, teamA, 5, 'json5'),
+        { path: `${END}/poi/r.0.0.mca`, backup: null, bytes: poi00.length, md5Before: null, action: 'created', md5After: md5(poi00), writtenAt: WRITTEN_AT },
     ],
 };
 write(`zips/end-reset-${RESET_ID}/manifest.json`, Buffer.from(JSON.stringify(manifest, null, 2) + '\n'));

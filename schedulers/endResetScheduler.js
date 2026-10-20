@@ -2,13 +2,14 @@
  * endResetScheduler.js
  *
  * Runs `end_reset` jobs from valhallamc.schedule_jobs. Each job has one action:
- *   plan     Dry run. The `end_reset_plan` link op writes plan.json on the server. VU reads it,
- *            stores it on the job and posts the summary and the mails to staff.
+ *   plan     Dry run. `save-all flush` over the link, then the `end_reset_plan` link op writes
+ *            plan.json on the server. VU reads it, stores it on the job and posts the summary
+ *            and the mails to staff.
  *   apply    Writes request.json for a stored dry run and inserts one scheduled_reboot with
  *            instanceServerId. After the boot it reads result.json, verifies, then mails.
  *   verify   Runs the verify step again for a resetId.
  *   mail     Sends the mails of an applied reset. With mailDryRun it only posts them.
- *   restore  Writes restore.json for a resetId and inserts one scheduled_reboot.
+ *   restore  Writes restore.json (its own restoreId) for a resetId and inserts one scheduled_reboot.
  *
  * Job shapes: docs/end-reset.md. Contract: bifrost-lib docs/invariants/end-reset.md.
  * The only restart path is the scheduled_reboot job, so players get the usual countdown.
@@ -24,6 +25,7 @@ const { JOB_TYPE, PATHS } = endReset;
 const STAFF_CHANNEL_ID = '1358558826118381678';
 const PLAN_OP_WAIT_MS = 10 * 60000;
 const PLAN_OP_EXPIRES_MS = 5 * 60000;
+const SAVE_WAIT_MS = 3 * 60000;
 const RESULT_GRACE_MS = 30 * 60000;
 const EMBED_LIMIT = 4000;
 const LOG_PATH = 'logs/latest.log';
@@ -163,6 +165,21 @@ module.exports = {
         // One-shot, like a scheduled reboot: a VU restart mid-op does not run it twice.
         await d.mongo.deactivateScheduleJob(doc._id);
 
+        // The planner reads the files on disk, so claims and homes the game holds in memory go first.
+        let save;
+        try {
+            save = await d.yggdrasil.runOp(server.serverId, {
+                type: 'run_command',
+                params: { command: 'save-all flush' },
+                expiresInMs: PLAN_OP_EXPIRES_MS,
+            }, SAVE_WAIT_MS);
+        } catch (err) {
+            return this.fail(d, doc, label, `save-all got no answer over the link: ${err.message}`);
+        }
+        if (!save || save.state !== 'completed') {
+            return this.fail(d, doc, label, `save-all ended ${save ? save.state : 'with no doc'}. The dry run needs saved files.`);
+        }
+
         let op;
         try {
             op = await d.yggdrasil.runOp(server.serverId, {
@@ -180,12 +197,15 @@ module.exports = {
         }
         const data = (op.result && (op.result.data || op.result)) || {};
 
+        if (data.path && data.path !== PATHS.plan) {
+            return this.fail(d, doc, label, `The op wrote ${data.path}. VU reads ${PATHS.plan} only.`);
+        }
         const bytes = await readFileBytes(d, server.serverId, PATHS.plan);
         if (!bytes) return this.fail(d, doc, label, `The op finished, but ${PATHS.plan} is missing.`);
         const planSha256 = endReset.sha256(bytes);
-        const opSha = data.planSha256 || data.sha256 || null;
-        if (opSha && opSha !== planSha256) {
-            return this.fail(d, doc, label, `${PATHS.plan} changed after the op: the op says sha256 ${opSha}, the file has ${planSha256}.`);
+        if (!data.planSha256) return this.fail(d, doc, label, 'The op result has no planSha256.');
+        if (data.planSha256 !== planSha256) {
+            return this.fail(d, doc, label, `${PATHS.plan} changed after the op: the op says planSha256 ${data.planSha256}, the file has ${planSha256}.`);
         }
         let plan;
         try {
@@ -241,7 +261,7 @@ module.exports = {
         if (!job.phase) return this.restoreStart(ctx);
         if (job.phase === 'awaiting_result') return this.awaitResult(ctx, 'restore');
         if (job.phase === 'requesting') {
-            return this.fail(d, doc, label, `The job stopped while it wrote the restore for ${job.resetId}. Check ${PATHS.restore} and the scheduled reboots by hand.`);
+            return this.fail(d, doc, label, `The job stopped while it wrote restore ${job.restoreId} for reset ${job.resetId}. Check ${PATHS.restore} and the scheduled reboots by hand.`);
         }
         return this.fail(d, doc, label, `Unknown phase ${job.phase}.`);
     },
@@ -310,6 +330,7 @@ module.exports = {
             kind: 'reset',
             path: PATHS.request,
             text,
+            jobId: resetId,
             resetId,
             fireAt,
             notBefore,
@@ -330,6 +351,8 @@ module.exports = {
         if (manifest.complete !== true) return this.fail(d, doc, label, 'The manifest is not complete. The mod refuses a restore from it.');
 
         const files = manifest.files || [];
+        const created = files.filter(f => f.action === 'created').length;
+        const putBack = `puts back ${files.length - created} files${created ? ` and deletes ${created} the reset created` : ''}`;
         if (!job.confirmLoss) {
             await d.mongo.updateScheduleJob(doc._id, { error: 'confirmLoss not set' }).catch(() => {});
             await d.mongo.deactivateScheduleJob(doc._id);
@@ -337,7 +360,7 @@ module.exports = {
             await d.notify({
                 color: COLORS.go,
                 title: 'End restore needs a confirm',
-                description: `**${label}** reset \`${job.resetId}\`: the restore puts back ${files.length} files.\n${list}${files.length > 15 ? `\n- and ${files.length - 15} more` : ''}\n\n` +
+                description: `**${label}** reset \`${job.resetId}\`: the restore ${putBack}.\n${list}${files.length > 15 ? `\n- and ${files.length - 15} more` : ''}\n\n` +
                     'Player progress made after the reset in these files is lost. To go on, insert the restore job again with `confirmLoss: true`.',
             });
             return { ok: false, needsConfirm: true };
@@ -349,17 +372,19 @@ module.exports = {
         const now = d.now();
         const fireAt = job.fireAt && job.fireAt > now ? job.fireAt : now + job.warnWindow * 60000;
         const { notBefore, notAfter } = endReset.requestWindow(fireAt, job.windowMinutes);
-        const text = endReset.buildRestore({ resetId: job.resetId, notBefore, notAfter, requestedBy: job.requestedBy });
+        const restoreId = d.newId();
+        const text = endReset.buildRestore({ restoreId, resetId: job.resetId, notBefore, notAfter, requestedBy: job.requestedBy });
         return this.writeAndReboot(ctx, {
             kind: 'restore',
             path: PATHS.restore,
             text,
+            jobId: restoreId,
             resetId: job.resetId,
             fireAt,
             notBefore,
             notAfter,
             reason: `End reset restore ${job.resetId}`,
-            extra: `The restore puts back ${files.length} files. Player progress made after the reset in those files is lost.`,
+            extra: `The restore ${putBack}. Player progress made after the reset in those files is lost.`,
         });
     },
 
@@ -368,6 +393,7 @@ module.exports = {
         const id = server.serverId;
         await d.mongo.updateScheduleJob(doc._id, {
             phase: 'requesting', resetId: w.resetId, fireAt: w.fireAt, notBefore: w.notBefore, notAfter: w.notAfter,
+            ...(w.kind === 'restore' ? { restoreId: w.jobId } : {}),
         });
 
         try {
@@ -403,14 +429,14 @@ module.exports = {
             rebootJobId: reboot && reboot.insertedId ? reboot.insertedId : null,
         });
         const title = w.kind === 'reset' ? 'End reset scheduled' : 'End restore scheduled';
-        sessionLogger.info('EndResetScheduler', `${title}: ${label}, ${w.resetId}, reboot at ${endReset.isoZ(w.fireAt)}`);
+        sessionLogger.info('EndResetScheduler', `${title}: ${label}, ${w.kind} ${w.jobId}, reboot at ${endReset.isoZ(w.fireAt)}`);
         await d.notify({
             color: COLORS.go,
             title,
             description: `**${label}** reboots <t:${unix(w.fireAt)}:R> (<t:${unix(w.fireAt)}:f>). Players get the usual ${job.warnWindow} min warning.\n` +
-                `Reset \`${w.resetId}\`. The request is good from ${endReset.isoZ(w.notBefore)} to ${endReset.isoZ(w.notAfter)}.\n${w.extra || ''}`,
+                `${w.kind === 'restore' ? `Restore \`${w.jobId}\` of reset` : 'Reset'} \`${w.resetId}\`. The request is good from ${endReset.isoZ(w.notBefore)} to ${endReset.isoZ(w.notAfter)}.\n${w.extra || ''}`,
         });
-        return { ok: true, resetId: w.resetId, fireAt: w.fireAt, notBefore: w.notBefore, notAfter: w.notAfter };
+        return { ok: true, resetId: w.resetId, jobId: w.jobId, fireAt: w.fireAt, notBefore: w.notBefore, notAfter: w.notAfter };
     },
 
     removeFile: async function (d, serverId, p) {
@@ -419,8 +445,10 @@ module.exports = {
         if (!ok) sessionLogger.error('EndResetScheduler', `Could not remove ${p} on ${serverId}. Check that it is gone.`);
     },
 
-    readResult: async function ({ d, server }) {
-        const text = await d.pterodactyl.getFileContents(server.serverId, PATHS.result);
+    /** result.<id>.json of one job; result.json (the last job) when the per-job file is missing. */
+    readResult: async function ({ d, server }, id) {
+        const own = await d.pterodactyl.getFileContents(server.serverId, PATHS.resultOf(id));
+        const text = own || await d.pterodactyl.getFileContents(server.serverId, PATHS.result);
         return text ? endReset.parseResult(text) : null;
     },
 
@@ -430,17 +458,20 @@ module.exports = {
         const now = d.now();
         if (job.fireAt && now < job.fireAt) return { ok: true, waiting: 'reboot' };
 
+        const id = kind === 'restore' ? job.restoreId : job.resetId;
         let result = null;
         try {
-            result = await this.readResult(ctx);
+            result = await this.readResult(ctx, id);
         } catch (err) {
-            sessionLogger.warn('EndResetScheduler', `${PATHS.result} on ${label}: ${err.message}`);
+            sessionLogger.warn('EndResetScheduler', `${PATHS.resultOf(id)} on ${label}: ${err.message}`);
         }
-        if (!result || result.resetId !== job.resetId || result.kind !== kind) {
+        const mine = result && result.kind === kind && (kind === 'restore' ? result.restoreId === id : result.resetId === id);
+        if (!mine) {
             const deadline = (job.notAfter || job.fireAt || now) + RESULT_GRACE_MS;
             if (now > deadline) {
-                return this.fail(d, doc, label, `No ${kind} result for ${job.resetId} came by ${endReset.isoZ(deadline)}. ` +
-                    `The server did not boot in the window, or the mod did not take the request. Check ${kind === 'reset' ? PATHS.request : PATHS.restore} and the boot log.`);
+                const file = kind === 'reset' ? 'request' : 'restore';
+                return this.fail(d, doc, label, `No ${kind} result for ${id} came by ${endReset.isoZ(deadline)}. ` +
+                    `The server did not boot in the window, or the mod did not take the request (an id already in done.json gives ${file}.${id}.ignored.json and no result). Check ${PATHS.dir} and the boot log.`);
             }
             return { ok: true, waiting: 'result' };
         }
@@ -450,10 +481,12 @@ module.exports = {
 
         if (kind === 'restore') {
             const good = result.status === 'restored';
+            const files = Array.isArray(result.files) ? result.files.length : result.files;
             await d.notify({
                 color: good ? COLORS.ok : COLORS.bad,
                 title: `End restore ${result.status}`,
-                description: `**${label}** reset \`${job.resetId}\`: status ${result.status}${result.reason ? `, reason: ${result.reason}` : ''}.`,
+                description: `**${label}** restore \`${id}\` of reset \`${job.resetId}\`: status ${result.status}` +
+                    `${files != null ? `, ${files} files` : ''}${result.reason ? `, reason: ${result.reason}` : ''}.`,
             });
             return { ok: good, result };
         }
@@ -580,12 +613,12 @@ module.exports = {
         const { job } = ctx;
         let result;
         try {
-            result = await this.readResult(ctx);
+            result = await this.readResult(ctx, job.resetId);
         } catch (err) {
             return { error: err.message };
         }
         if (!result || result.resetId !== job.resetId || result.kind !== 'reset') {
-            return { error: `${PATHS.result} is not the result of reset ${job.resetId}. A later reset or restore replaced it, or the reset never ran.` };
+            return { error: `No result of reset ${job.resetId}: neither ${PATHS.resultOf(job.resetId)} nor ${PATHS.result} holds it.` };
         }
         if (result.status !== 'applied') return { error: `Reset ${job.resetId} has status ${result.status}.` };
         return { result };

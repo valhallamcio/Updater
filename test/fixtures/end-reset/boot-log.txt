@@ -1,3 +1,4 @@
 [21Oct2026 04:01:58.112] [main/INFO] [net.neoforged.fml.loading.FMLLoader/]: Loading NeoForge 26.1.2.115
-[21Oct2026 04:02:55.871] [Server thread/INFO] [com.valhalla.biforesting.BiforestingMod/]: [Biforesting] end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA: applied, kept 2, moved 2, wiped 1534
+[21Oct2026 04:02:10.004] [Server thread/INFO] [com.valhalla.biforesting.Biforesting/]: [Biforesting] end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA step: plan rebuilt from disk, matches plan.json
+[21Oct2026 04:02:55.871] [Server thread/INFO] [com.valhalla.biforesting.Biforesting/]: [Biforesting] end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA: DONE applied kept=2 moved=2 wiped=1534 files=6 affected=4 in 0.5 s
 [21Oct2026 04:03:31.402] [Server thread/INFO] [minecraft/DedicatedServer]: Done (93.290s)! For help, type "help"

@@ -30,7 +30,10 @@ const endDir = level => `${level || 'world'}/dimensions/minecraft/the_end`;
 const fightPath = level => `${endDir(level)}/data/minecraft/ender_dragon_fight.dat`;
 const regionPath = (level, cx, cz) => `${endDir(level)}/region/r.${cx >> 5}.${cz >> 5}.mca`;
 const claimPath = (level, teamId) => `${level || 'world'}/ftbchunks/${teamId}.json5`;
-const doneLine = resetId => `[Biforesting] end reset ${resetId}:`;
+// Exactly one outcome line per job starts with `[Biforesting] end reset <resetId>:`. Step lines
+// use `end reset <resetId> step:` and never match.
+const outcomeLine = resetId => `[Biforesting] end reset ${resetId}:`;
+const doneLine = resetId => `${outcomeLine(resetId)} DONE applied`;
 
 // ── JSON5 (FTB Chunks team files) ───────────────────────────────────────────
 
@@ -320,9 +323,10 @@ async function verifyReset(io, input) {
                 if (fight.hasDragonUuid) problems.push('dragon_uuid is set');
                 if (fight.exitPortal) problems.push(`exit_portal_location ${fight.exitPortal.join(' ')} is set`);
             }
-            const allowed = new Set(((plan.fight && plan.fight.gateways) || []).map(Number));
+            const planned = Array.isArray(want.gateways) ? want.gateways : (plan.fight && plan.fight.gateways) || [];
+            const allowed = new Set(planned.map(Number));
             const extra = (fight.gateways || []).filter(g => !allowed.has(g));
-            if (extra.length) problems.push(`gateways ${extra.join(', ')} are not in the plan`);
+            if (extra.length) problems.push(`gateways ${extra.join(', ')} are not in the ${Array.isArray(want.gateways) ? 'result' : 'plan'}`);
             check('fight', problems.length === 0, problems.length ? problems.join('; ')
                 : `dragon_killed false, previously_killed false, needs_state_scanning ${fight.needs_state_scanning}, ${(fight.gateways || []).length} gateways`);
         }
@@ -344,7 +348,8 @@ async function verifyReset(io, input) {
     check('kept chunks', keptBad.length === 0, keptBad.length ? keptBad.join('; ') : `${kept.length} chunks in place`);
 
     const moves = [];
-    for (const m of plan.zoneClaimMoves || []) {
+    // The applied moves when result.json has them; the engine aborts when they differ from the plan.
+    for (const m of result.zoneClaimMoves || plan.zoneClaimMoves || []) {
         for (const c of m.chunks || []) moves.push({ team: m.team && m.team.id, source: c.source, target: c.target, forceLoaded: !!c.forceLoaded });
     }
     const targetBad = await slotProblems(moves.map(m => m.target), 'target');
@@ -389,7 +394,7 @@ async function verifyReset(io, input) {
         let same = 0;
         let changed = 0;
         for (const f of manifest.files || []) {
-            if (f.action !== 'rewritten' || !f.md5After) continue;
+            if ((f.action !== 'rewritten' && f.action !== 'created') || !f.md5After) continue;
             const bytes = await files.readBinary(f.path);
             if (!bytes) { md5Bad.push(`${f.path}: missing`); continue; }
             if (md5(bytes) === f.md5After) { same++; continue; }
@@ -403,8 +408,10 @@ async function verifyReset(io, input) {
 
     // The boot log
     const done = logText.includes(doneLine(resetId));
-    check('log', done && !killedLine, [
-        done ? 'done line present' : `no "${doneLine(resetId)}" line`,
+    const failedOutcome = logText.split('\n').find(l => l.includes(`${outcomeLine(resetId)} FAILED`));
+    check('log', done && !failedOutcome && !killedLine, [
+        done ? 'DONE line present' : `no "${doneLine(resetId)}" line`,
+        failedOutcome ? `FAILED line: ${failedOutcome.slice(failedOutcome.indexOf('FAILED'), failedOutcome.indexOf('FAILED') + 200)}` : null,
         killedLine ? `"${KILLED_LINE}" is present` : 'no "killed already" line',
         scanRan ? 'scan ran: dragon not killed' : null,
     ].filter(Boolean).join(', '));
@@ -425,6 +432,7 @@ module.exports = {
     fightPath,
     regionPath,
     claimPath,
+    outcomeLine,
     doneLine,
     parseJson5,
     endClaims,

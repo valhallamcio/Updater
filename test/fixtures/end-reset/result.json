@@ -8,7 +8,26 @@
   "finishedAt": "2026-10-21T04:02:55Z",
   "manifest": "zips/end-reset-01JBX6Z2M4K8Q0R1S3T5V7W9YA/manifest.json",
   "totals": { "kept": 2, "moved": 2, "wiped": 1534 },
-  "fight": { "needs_state_scanning": true, "dragon_killed": false, "previously_killed": false },
+  "fight": {
+    "needs_state_scanning": true, "dragon_killed": false, "previously_killed": false,
+    "gateways": [11, 14, 12, 2, 4, 9, 7, 17, 5, 6, 15, 10, 1, 16, 3, 18, 0, 13, 8, 19]
+  },
+  "zoneClaimMoves": [
+    {
+      "team": { "id": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "shortName": "Epic_Gamers#eee65f7e", "type": "party" },
+      "offset": [9, 0],
+      "chunks": [
+        { "source": [1, 5], "target": [10, 5], "forceLoaded": true, "claimedAt": "2026-10-18T21:56:58Z" },
+        { "source": [2, 5], "target": [11, 5], "forceLoaded": false, "claimedAt": "2026-10-18T21:57:03Z" }
+      ]
+    }
+  ],
+  "forceLoads": [
+    { "source": "ftbchunks", "chunk": [1, 5], "team": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "action": "move", "target": [10, 5] },
+    { "source": "minecraft:forced", "chunk": [2, 5], "action": "move", "target": [11, 5] },
+    { "source": "neoforge:ftbchunks:default", "chunk": [0, 0], "team": "0,64,0", "action": "release" }
+  ],
+  "gatewaysInKeptChunks": [],
   "affectedPlayers": [
     {
       "player": "a1b2c3d4-0000-4000-8000-000000000001",

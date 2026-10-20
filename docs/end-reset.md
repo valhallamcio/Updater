@@ -6,16 +6,19 @@ side (Biforesting) does the reset at boot. The contract is bifrost-lib
 
 ## Flow
 
-1. `plan` job. The `end_reset_plan` link op writes `config/biforesting/end-reset/plan.json`. VU
-   reads it, stores its text and sha256 on the job, and posts the summary to the reboot notice
+1. `plan` job. `save-all flush` goes over the link first: the planner reads the files on disk.
+   Then the `end_reset_plan` link op writes `config/biforesting/end-reset/plan.json`. VU checks
+   its `planSha256` against the file, reads it, stores its text and sha256 on the job, and posts the summary to the reboot notice
    channel. The mails it would send come as a file.
 2. Staff read the summary. An `apply` job with that `planId` is the go.
 3. `apply` checks the plan file still has the stored sha256, that no request or reboot waits,
    the unsupported list and the disk space. Then it writes `request.json` and inserts one
    `scheduled_reboot` with `instanceServerId`. Players get the normal countdown.
-4. After `fireAt` the job reads `result.json` each tick. On `applied` it verifies. A pass sends
-   the mails from `result.json`. A fail holds them.
-5. `restore` writes `restore.json` and inserts one reboot. It needs `confirmLoss: true`.
+4. After `fireAt` the job reads `result.<resetId>.json` (else `result.json`) each tick. On
+   `applied` it verifies. A pass sends the mails from that result. A fail holds them. The log
+   check wants the one outcome line `[Biforesting] end reset <resetId>: DONE applied`.
+5. `restore` writes `restore.json` with a new `restoreId` and the `resetId` to undo, and inserts
+   one reboot. It needs `confirmLoss: true`. Its result is `result.<restoreId>.json`.
 
 ## Job shapes
 
@@ -51,12 +54,8 @@ verify checks or the mails. It writes nothing. `--dir test/fixtures/end-reset` r
 fixture. `test/fixtures/end-reset/make-fixtures.js` rebuilds the fixture region files, team files
 and manifest.
 
-## Open contract questions (2026-10-20)
+## Limits
 
-- The plan op result: VU reads `result.data.planId` and `result.data.planSha256` (or `sha256`).
-- The done line: VU takes any log line with `[Biforesting] end reset <resetId>:`. Step lines with
-  the same prefix would match too.
-- A restore reuses the reset's `resetId`, which `done.json` already holds. Request rule 1 would
-  ignore it. VU matches the restore result by `kind: restore` and that `resetId`.
 - The claim check reads only the team files named in the plan (kept and moved teams), not every
   team file on the server.
+- Verify reads the 26.x layout only. Apply refuses a plan for another version.

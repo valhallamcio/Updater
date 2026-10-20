@@ -23,6 +23,8 @@ const SERVERS = [
     { tag: 'evol', name: 'Evolution #3', serverId: 'e2f5e517' },
 ];
 const FIRE_AT = Date.parse('2026-10-21T04:00:00Z');
+const RESTORE_ID = '01JBX8R5T0M3N7P2Q4S6V8W0YC';
+const PLAN_RESULT = { planId: PLAN_ID, planSha256: PLAN_SHA, path: 'config/biforesting/end-reset/plan.json', totals: {}, unsupported: 0, backupBytes: 734003200 };
 
 /** Server-root path to fixture file: the job dir and the log map onto the fixture root. */
 function fixturePath(p) {
@@ -30,7 +32,7 @@ function fixturePath(p) {
     return path.join(FIXTURE, p.startsWith(JOB_DIR) ? p.slice(JOB_DIR.length) : p);
 }
 
-function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, disk, now = Date.parse('2026-10-21T03:40:00Z'), createFails = false } = {}) {
+function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, save, ids = [], disk, now = Date.parse('2026-10-21T03:40:00Z'), createFails = false } = {}) {
     const files = new Map(Object.entries(overlay));
     const state = { now, writes: [], deletes: [], ops: [], notices: [], updates: [], deactivated: [], created: [], mails: [], reads: [] };
     const local = p => {
@@ -42,14 +44,15 @@ function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, disk, n
     state.files = files;
     state.deps = {
         now: () => state.now,
-        newId: () => RESET_ID,
+        newId: () => (ids.length ? ids.shift() : RESET_ID),
         notify: async msg => { state.notices.push(msg); },
         http: { get: async url => ({ data: local(url.slice('fixture:'.length)) }) },
         yggdrasil: {
             getServers: async () => SERVERS,
             runOp: async (server, o, timeout) => {
                 state.ops.push({ server, op: o, timeout });
-                return op || { _id: 'op-1', state: 'completed', result: { data: { planId: PLAN_ID, sha256: PLAN_SHA } } };
+                if (o.type === 'run_command') return save || { _id: 'op-0', state: 'completed', result: { data: { output: 'Saved the game' } } };
+                return op || { _id: 'op-1', state: 'completed', result: { data: PLAN_RESULT } };
             },
         },
         pterodactyl: {
@@ -107,9 +110,8 @@ test('plan: runs the link op on the instance, stores the plan and posts the summ
     const out = await scheduler.runJob(job, state.deps);
 
     assert.strictEqual(out.ok, true);
-    assert.strictEqual(state.ops.length, 1);
-    assert.strictEqual(state.ops[0].server, 'e2f5e517');
-    assert.strictEqual(state.ops[0].op.type, 'end_reset_plan');
+    assert.deepStrictEqual(state.ops.map(o => [o.server, o.op.type]), [['e2f5e517', 'run_command'], ['e2f5e517', 'end_reset_plan']]);
+    assert.deepStrictEqual(state.ops[0].op.params, { command: 'save-all flush' });
     assert.deepStrictEqual(state.deactivated, ['plan-1']);
     assert.strictEqual(job.planId, PLAN_ID);
     assert.strictEqual(job.planSha256, PLAN_SHA);
@@ -130,7 +132,7 @@ test('plan: runs the link op on the instance, stores the plan and posts the summ
 
 test('plan: a sha256 that differs from the op stops the dry run', async () => {
     const job = { _id: 'plan-1', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: true };
-    const state = rig({ jobs: [job], op: { state: 'completed', result: { data: { planId: PLAN_ID, sha256: 'b'.repeat(64) } } } });
+    const state = rig({ jobs: [job], op: { state: 'completed', result: { data: { ...PLAN_RESULT, planSha256: 'b'.repeat(64) } } } });
     const out = await scheduler.runJob(job, state.deps);
     assert.strictEqual(out.ok, false);
     assert.match(out.error, /changed after the op/);
@@ -138,11 +140,26 @@ test('plan: a sha256 that differs from the op stops the dry run', async () => {
     assert.deepStrictEqual(titles(state), ['End reset plan stopped']);
 });
 
+test('plan: a failed save-all stops before the plan op', async () => {
+    const job = { _id: 'plan-1', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: true };
+    const state = rig({ jobs: [job], save: { state: 'expired', attempts: 0 } });
+    const out = await scheduler.runJob(job, state.deps);
+    assert.match(out.error, /save-all ended expired/);
+    assert.deepStrictEqual(state.ops.map(o => o.op.type), ['run_command']);
+});
+
+test('plan: an op result without planSha256 is refused', async () => {
+    const job = { _id: 'plan-1', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: true };
+    const state = rig({ jobs: [job], op: { state: 'completed', result: { data: { planId: PLAN_ID, sha256: PLAN_SHA } } } });
+    const out = await scheduler.runJob(job, state.deps);
+    assert.match(out.error, /no planSha256/);
+});
+
 test('plan: a failed op stops the dry run', async () => {
     const job = { _id: 'plan-1', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: true };
-    const state = rig({ jobs: [job], op: { state: 'failed', result: { error: 'unknown op type end_reset_plan' } } });
+    const state = rig({ jobs: [job], op: { state: 'failed', result: { error: 'not_applied' } } });
     const out = await scheduler.runJob(job, state.deps);
-    assert.match(out.error, /ended failed: unknown op type/);
+    assert.match(out.error, /ended failed: not_applied/);
 });
 
 test('a job with a bare tag is refused before any panel call', async () => {
@@ -347,7 +364,18 @@ test('verify: a result of another reset is refused', async () => {
     const job = { _id: 'verify-1', type: 'end_reset', action: 'verify', instanceServerId: 'e2f5e517', resetId: '01JBX7AAAAAAAAAAAAAAAAAAAA', active: true };
     const state = rig({ jobs: [job] });
     const out = await scheduler.runJob(job, state.deps);
-    assert.match(out.error, /not the result of reset 01JBX7AAAAAAAAAAAAAAAAAAAA/);
+    assert.match(out.error, /No result of reset 01JBX7AAAAAAAAAAAAAAAAAAAA/);
+});
+
+test('mail: the per-job result file wins when result.json holds a later job', async () => {
+    const job = { _id: 'mail-1', type: 'end_reset', action: 'mail', instanceServerId: 'e2f5e517', resetId: RESET_ID, active: true };
+    const later = { schema: 1, restoreId: RESTORE_ID, resetId: RESET_ID, kind: 'restore', status: 'restored', files: 6 };
+    const state = rig({ jobs: [job], overlay: {
+        [`${JOB_DIR}result.json`]: Buffer.from(JSON.stringify(later)),
+        [`${JOB_DIR}result.${RESET_ID}.json`]: Buffer.from(JSON.stringify(RESULT)),
+    } });
+    const out = await scheduler.runJob(job, state.deps);
+    assert.strictEqual(out.mails.sent, 4);
 });
 
 test('mail: mailDryRun posts the mails and sends none', async () => {
@@ -379,27 +407,31 @@ test('restore: without confirmLoss it warns and writes nothing', async () => {
     assert.deepStrictEqual(state.writes, []);
     assert.deepStrictEqual(state.created, []);
     assert.deepStrictEqual(titles(state), ['End restore needs a confirm']);
-    assert.match(state.notices[0].description, /puts back 5 files/);
+    assert.match(state.notices[0].description, /puts back 5 files and deletes 1 the reset created/);
     assert.match(state.notices[0].description, /progress made after the reset in these files is lost/);
 });
 
 test('restore: with confirmLoss it writes restore.json, reboots, and reports the result', async () => {
     const job = { _id: 'restore-1', type: 'end_reset', action: 'restore', instanceServerId: 'e2f5e517', resetId: RESET_ID, confirmLoss: true, fireAt: FIRE_AT, requestedBy: 'alp', active: true };
-    const state = rig({ jobs: [job], overlay: hide });
+    const state = rig({ jobs: [job], overlay: hide, ids: [RESTORE_ID] });
     const out = await scheduler.runJob(job, state.deps);
     assert.strictEqual(out.ok, true, out.error);
+    assert.strictEqual(job.restoreId, RESTORE_ID);
     assert.strictEqual(state.writes.length, 1);
     assert.strictEqual(state.writes[0].path, 'config/biforesting/end-reset/restore.json');
     assert.deepStrictEqual(JSON.parse(state.writes[0].text), {
-        schema: 1, resetId: RESET_ID, notBefore: '2026-10-21T03:55:00Z', notAfter: '2026-10-21T05:00:00Z', requestedBy: 'alp',
+        schema: 1, restoreId: RESTORE_ID, resetId: RESET_ID, notBefore: '2026-10-21T03:55:00Z', notAfter: '2026-10-21T05:00:00Z', requestedBy: 'alp',
     });
     assert.strictEqual(state.created[0].instanceServerId, 'e2f5e517');
     assert.strictEqual(state.created[0].reason, `End reset restore ${RESET_ID}`);
 
     state.now = FIRE_AT + 300000;
-    state.files.set(`${JOB_DIR}result.json`, Buffer.from(JSON.stringify({ ...RESULT, kind: 'restore', status: 'restored' })));
+    // A restore result is matched by its restoreId, from result.<restoreId>.json.
+    const restored = { schema: 1, restoreId: RESTORE_ID, resetId: RESET_ID, kind: 'restore', status: 'restored', reason: null, manifest: RESULT.manifest, files: 6 };
+    state.files.set(`${JOB_DIR}result.${RESTORE_ID}.json`, Buffer.from(JSON.stringify(restored)));
     const done = await scheduler.runJob(job, state.deps);
     assert.strictEqual(done.ok, true);
+    assert.match(state.notices[1].description, /restore `01JBX8R5T0M3N7P2Q4S6V8W0YC` of reset `01JBX6Z2M4K8Q0R1S3T5V7W9YA`: status restored, 6 files/);
     assert.deepStrictEqual(titles(state), ['End restore scheduled', 'End restore restored']);
     assert.deepStrictEqual(state.mails, []);
 });
@@ -408,6 +440,6 @@ test('tick runs each active end_reset job once', async () => {
     const plan = { _id: 'plan-1', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: true };
     const state = rig({ jobs: [plan, { _id: 'old', type: 'end_reset', action: 'plan', instanceServerId: 'e2f5e517', active: false }] });
     await scheduler.tick(state.deps);
-    assert.strictEqual(state.ops.length, 1);
+    assert.strictEqual(state.ops.filter(o => o.op.type === 'end_reset_plan').length, 1);
     assert.strictEqual(scheduler.running.size, 0);
 });

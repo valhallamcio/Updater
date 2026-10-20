@@ -26,9 +26,9 @@
   "wipe": {
     "chunkCount": 1534,
     "regions": [
-      { "file": "r.0.0.mca", "keep": [[12, 12]] },
-      { "file": "r.-1.0.mca", "keep": [] },
-      { "file": "r.-2.0.mca", "keep": [[-40, 3]] }
+      { "file": "r.0.0.mca", "keep": [[12, 12]], "targets": [[10, 5], [11, 5]], "action": "rebuild" },
+      { "file": "r.-1.0.mca", "keep": [], "targets": [], "action": "move" },
+      { "file": "r.-2.0.mca", "keep": [[-40, 3]], "targets": [], "action": "rebuild" }
     ]
   },
   "fight": {
@@ -44,7 +44,8 @@
   "gatewaysInKeptChunks": [],
   "forceLoads": [
     { "source": "ftbchunks", "chunk": [1, 5], "team": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "action": "move", "target": [10, 5] },
-    { "source": "vanilla", "chunk": [0, 0], "action": "release" }
+    { "source": "minecraft:forced", "chunk": [2, 5], "action": "move", "target": [11, 5] },
+    { "source": "neoforge:ftbchunks:default", "chunk": [0, 0], "team": "0,64,0", "action": "release" }
   ],
   "homes": [
     { "mod": "ftbessentials", "player": "a1b2c3d4-0000-4000-8000-000000000001", "name": "base",

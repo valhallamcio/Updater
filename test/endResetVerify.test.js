@@ -83,6 +83,17 @@ test('a missing done line fails the log check', async () => {
     assert.deepStrictEqual(failed(report), ['log']);
 });
 
+test('a step line alone is no DONE line, and a FAILED outcome fails', async () => {
+    const input = inputs();
+    input.logText = input.logText.split('\n').filter(l => !l.includes(': DONE applied')).join('\n');
+    assert.match(input.logText, /end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA step:/);
+    const noDone = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.deepStrictEqual(failed(noDone), ['log']);
+    input.logText += '[x] [Server thread/INFO] [b/]: [Biforesting] end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA: FAILED failed: disk full\n';
+    const bad = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(bad.checks.find(c => c.name === 'log').detail, /FAILED line: FAILED failed: disk full/);
+});
+
 test('after the scan ran, a live dragon and an exit portal still pass', async () => {
     const zlib = require('zlib');
     // The scan sets needs_state_scanning 0 and writes the exit portal and the dragon uuid.
@@ -111,11 +122,15 @@ test('needs_state_scanning 0 before any scan fails', async () => {
     assert.match(report.checks.find(c => c.name === 'fight').detail, /needs_state_scanning false, result says true/);
 });
 
-test('a gateway index the plan dropped fails the fight check', async () => {
+test('a gateway index the result dropped fails the fight check; the plan list is the fallback', async () => {
     const input = inputs();
-    input.plan.fight.gateways = input.plan.fight.gateways.filter(g => g !== 19);
+    input.result.fight.gateways = input.result.fight.gateways.filter(g => g !== 19);
     const report = await verify.verifyReset(verify.localIo(FIXTURE), input);
-    assert.match(report.checks.find(c => c.name === 'fight').detail, /gateways 19 are not in the plan/);
+    assert.match(report.checks.find(c => c.name === 'fight').detail, /gateways 19 are not in the result/);
+    delete input.result.fight.gateways;
+    input.plan.fight.gateways = input.plan.fight.gateways.filter(g => g !== 13);
+    const fallback = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(fallback.checks.find(c => c.name === 'fight').detail, /gateways 13 are not in the plan/);
 });
 
 test('an empty header slot of a kept chunk fails the kept check', async () => {
@@ -160,7 +175,17 @@ test('md5: a changed file with mtime equal to writtenAt fails; a later save does
     assert.strictEqual(same.ok, false);
     const later = await verify.verifyReset(patched({ [R00]: bytes }, { [R00]: { size: bytes.length, mtime: '2026-10-21T04:30:00+00:00' } }), inputs());
     assert.ok(!failed(later).includes('md5'));
-    assert.match(later.checks.find(c => c.name === 'md5').detail, /3 files match md5After, 1 saved by the game/);
+    assert.match(later.checks.find(c => c.name === 'md5').detail, /4 files match md5After, 1 saved by the game/);
+});
+
+test('md5: a created file is checked like a rewritten one', async () => {
+    const poi = 'world/dimensions/minecraft/the_end/poi/r.0.0.mca';
+    const input = inputs();
+    assert.strictEqual(input.manifest.files.find(f => f.path === poi).action, 'created');
+    const bytes = Buffer.from(read(poi));
+    bytes[bytes.length - 1] ^= 0xff;
+    const report = await verify.verifyReset(patched({ [poi]: bytes }, { [poi]: { size: bytes.length, mtime: '2026-10-21T04:02:40Z' } }), input);
+    assert.match(report.checks.find(c => c.name === 'md5').detail, /poi\/r\.0\.0\.mca: md5 differs/);
 });
 
 test('a missing or incomplete manifest fails', async () => {

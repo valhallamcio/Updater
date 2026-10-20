@@ -22,6 +22,7 @@ const PATHS = {
     request: `${JOB_DIR}/request.json`,
     restore: `${JOB_DIR}/restore.json`,
     result: `${JOB_DIR}/result.json`,
+    resultOf: id => `${JOB_DIR}/result.${id}.json`,
     manifest: resetId => `zips/end-reset-${resetId}/manifest.json`,
 };
 
@@ -126,7 +127,13 @@ function parseJob(doc) {
         job.resetId = resetId;
     }
 
-    if (action === 'restore') job.confirmLoss = doc.confirmLoss === true;
+    if (action === 'restore') {
+        job.confirmLoss = doc.confirmLoss === true;
+        if (doc.restoreId) {
+            if (!ULID_RE.test(String(doc.restoreId))) return fail('restoreId is not a ULID.');
+            job.restoreId = String(doc.restoreId);
+        }
+    }
 
     if (action === 'apply' || action === 'restore') {
         const warn = boundedInt(doc.warnWindow, DEFAULT_WARN_MINUTES, 1, 60);
@@ -209,6 +216,7 @@ function summarizePlan(plan, opts = {}) {
     lines.push(`Plan: \`${plan.planId}\`${opts.planSha256 ? ` sha256 \`${opts.planSha256.slice(0, 12)}\`` : ''}, made ${plan.createdAt || '?'}`);
     lines.push(`Zone: ${radius ?? '?'} chunks around 0,0`);
     lines.push(`Chunks: kept ${totals.kept}, moved ${totals.moved}, wiped ${totals.wiped}`);
+    lines.push(`Region files: ${countText(countBy(plan.wipe && plan.wipe.regions, 'action'))}`);
 
     for (const move of listOf(plan.zoneClaimMoves)) {
         const team = move.team || {};
@@ -301,12 +309,14 @@ function buildRequest({ resetId, planId, planSha256, notBefore, notAfter, reques
     }, null, 2) + '\n';
 }
 
-/** The bytes of restore.json. */
-function buildRestore({ resetId, notBefore, notAfter, requestedBy }) {
+/** The bytes of restore.json. restoreId is the id the restore uses up; resetId names the reset to undo. */
+function buildRestore({ restoreId, resetId, notBefore, notAfter, requestedBy }) {
+    if (!ULID_RE.test(String(restoreId))) throw new Error('restoreId is not a ULID.');
     if (!ULID_RE.test(String(resetId))) throw new Error('resetId is not a ULID.');
     if (!(notAfter > notBefore)) throw new Error('notAfter must be after notBefore.');
     return JSON.stringify({
         schema: SCHEMA,
+        restoreId,
         resetId,
         notBefore: isoZ(notBefore),
         notAfter: isoZ(notAfter),
