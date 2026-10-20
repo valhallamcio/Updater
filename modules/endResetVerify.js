@@ -10,6 +10,9 @@
  *   - the fight file has the result.json flags;
  *   - every kept chunk and every move target sits in its region file at its own position;
  *   - every move target is claimed by the same team, and no read claim is left in the zone;
+ *   - each gateway in a kept chunk has the exit its action says;
+ *   - each rebuilt inner gateway is an end_gateway between bedrock with its exit at the outer
+ *     gateway, after the `inner gateways: N built` step line;
  *   - each rewritten file still has its md5After, unless the game saved it after the reset;
  *   - the boot log has the engine's done line and no "killed already" line.
  */
@@ -34,6 +37,13 @@ const claimPath = (level, teamId) => `${level || 'world'}/ftbchunks/${teamId}.js
 // use `end reset <resetId> step:` and never match.
 const outcomeLine = resetId => `[Biforesting] end reset ${resetId}:`;
 const doneLine = resetId => `${outcomeLine(resetId)} DONE applied`;
+
+/** `{built, failed}` from the inner gateway step line, or null before the server started. */
+function innerGatewaysLine(logText, resetId) {
+    const esc = String(resetId).replace(/[^0-9A-Z]/g, '');
+    const m = new RegExp(`\\[Biforesting\\] end reset ${esc} step: inner gateways: (\\d+) built, (\\d+) failed`).exec(String(logText || ''));
+    return m ? { built: Number(m[1]), failed: Number(m[2]) } : null;
+}
 
 // ── JSON5 (FTB Chunks team files) ───────────────────────────────────────────
 
@@ -190,6 +200,57 @@ function readSlot(bytes, cx, cz) {
         return { present: false, why: `payload unreadable: ${err.message}` };
     }
 }
+
+/** mc-nbt-lib's typed tree as plain values. Longs stay BigInt. */
+function plain(tag) {
+    if (!tag || typeof tag !== 'object' || !('type' in tag)) return tag;
+    if (tag.type === 'compound') {
+        const out = {};
+        for (const [k, v] of Object.entries(tag.value)) out[k] = plain(v);
+        return out;
+    }
+    if (tag.type === 'list') return tag.value.value.map(v => plain({ type: tag.value.type, value: v }));
+    return tag.value;
+}
+
+/** The decoded chunk at a block position, or a reason why not. */
+async function chunkAt(files, level, x, z) {
+    const cx = x >> 4;
+    const cz = z >> 4;
+    const bytes = await files.readBinary(regionPath(level, cx, cz));
+    if (!bytes) return { why: `region file of chunk [${cx}, ${cz}] missing` };
+    if (bytes.length < 8192) return { why: `region file of chunk [${cx}, ${cz}] shorter than its header` };
+    const loc = bytes.readUInt32BE(((cx & 31) + (cz & 31) * 32) * 4);
+    if (!(loc >>> 8)) return { why: `chunk [${cx}, ${cz}] not in its region file` };
+    if (bytes.readUInt8((loc >>> 8) * 4096 + 4) & 0x80) return { why: `chunk [${cx}, ${cz}] is stored outside the region file` };
+    try {
+        return { chunk: plain(new MCAFile().readChunk(bytes, { offset: loc >>> 8, count: loc & 0xff })) };
+    } catch (err) {
+        return { why: `chunk [${cx}, ${cz}] unreadable: ${err.message}` };
+    }
+}
+
+/** The block name at a position: palette index packed in longs, entries never span two longs. */
+function blockAt(chunk, x, y, z) {
+    const section = (chunk.sections || []).find(s => Number(s.Y) === (y >> 4));
+    const states = section && section.block_states;
+    const palette = (states && states.palette) || [];
+    if (!palette.length) return 'minecraft:air';
+    if (palette.length === 1 || !states.data) return palette[0].Name;
+    const bits = Math.max(4, Math.ceil(Math.log2(palette.length)));
+    const perLong = Math.floor(64 / bits);
+    const i = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
+    const word = BigInt.asUintN(64, BigInt(states.data[Math.floor(i / perLong)]));
+    const index = Number((word >> BigInt((i % perLong) * bits)) & ((1n << BigInt(bits)) - 1n));
+    return palette[index] ? palette[index].Name : `palette index ${index} out of range`;
+}
+
+function blockEntityAt(chunk, x, y, z) {
+    return (chunk.block_entities || []).find(be => be.x === x && be.y === y && be.z === z) || null;
+}
+
+const samePos = (a, b) => Array.isArray(a) && Array.isArray(b) && a.length === 3 && b.length === 3 && a.every((v, i) => Number(v) === Number(b[i]));
+const posText = p => (Array.isArray(p) ? p.join(' ') : String(p));
 
 // ── File access ────────────────────────────────────────────────────────────
 
@@ -388,6 +449,53 @@ async function verifyReset(io, input) {
     check('claims', claimBad.length === 0, claimBad.length ? claimBad.join('; ')
         : `${moves.length} targets claimed, no claim in the zone (${teams.size} team files read)`);
 
+    // Gateways in kept chunks: the exit their action says. A cleared exit may come back as a new
+    // one once a player uses the gateway, so only the old exit is refused there.
+    const keptGateways = result.gatewaysInKeptChunks || plan.gatewaysInKeptChunks || [];
+    const gatewayBad = [];
+    for (const g of keptGateways) {
+        const [x, y, z] = g.pos;
+        const at = await chunkAt(files, level, x, z);
+        if (!at.chunk) { gatewayBad.push(`${posText(g.pos)}: ${at.why}`); continue; }
+        const be = blockEntityAt(at.chunk, x, y, z);
+        if (!be) { gatewayBad.push(`${posText(g.pos)}: no block entity`); continue; }
+        const exit = be.exit_portal ? Array.from(be.exit_portal) : null;
+        if (g.action === 'clear_exit') {
+            if (samePos(exit, g.exitPortal)) gatewayBad.push(`${posText(g.pos)}: clear_exit, but the old exit ${posText(g.exitPortal)} is still set`);
+            continue;
+        }
+        const want = g.action === 'move_exit' ? g.newExitPortal : g.exitPortal;
+        if (!samePos(exit, want)) gatewayBad.push(`${posText(g.pos)}: ${g.action}, exit ${exit ? posText(exit) : 'none'}, want ${posText(want)}`);
+    }
+    check('kept gateways', gatewayBad.length === 0, gatewayBad.length ? gatewayBad.join('; ')
+        : (keptGateways.length ? `${keptGateways.length} gateways have the planned exit` : 'none'));
+
+    // Inner gateways: built at ServerStartedEvent, after the outcome line.
+    const planInner = plan.innerGateways || [];
+    const inner = result.innerGateways || [];
+    const innerBad = [];
+    if (planInner.length && !inner.length) innerBad.push(`the plan rebuilds ${planInner.length}, result.json lists none`);
+    if (inner.length) {
+        const line = innerGatewaysLine(logText, resetId);
+        if (!line) innerBad.push('no "inner gateways: N built" line yet');
+        else if (line.built !== inner.length || line.failed) innerBad.push(`log says ${line.built} built, ${line.failed} failed, of ${inner.length}`);
+        for (const g of inner) {
+            const [x, y, z] = g.pos;
+            if (g.status !== 'built') { innerBad.push(`spot ${g.index}: status ${g.status}${g.reason ? ` (${g.reason})` : ''}`); continue; }
+            const at = await chunkAt(files, level, x, z);
+            if (!at.chunk) { innerBad.push(`spot ${g.index}: ${at.why}`); continue; }
+            const blocks = [y - 1, y, y + 1].map(by => blockAt(at.chunk, x, by, z));
+            if (blocks[1] !== 'minecraft:end_gateway') innerBad.push(`spot ${g.index}: block at ${posText(g.pos)} is ${blocks[1]}`);
+            if (blocks[0] !== 'minecraft:bedrock' || blocks[2] !== 'minecraft:bedrock') innerBad.push(`spot ${g.index}: below and above are ${blocks[0]} and ${blocks[2]}`);
+            const be = blockEntityAt(at.chunk, x, y, z);
+            const exit = be && be.exit_portal ? Array.from(be.exit_portal) : null;
+            if (!be || be.id !== 'minecraft:end_gateway') innerBad.push(`spot ${g.index}: no end_gateway block entity`);
+            else if (!samePos(exit, g.exitPortal)) innerBad.push(`spot ${g.index}: exit ${exit ? posText(exit) : 'none'}, want the outer gateway ${posText(g.exitPortal)}`);
+        }
+    }
+    check('inner gateways', innerBad.length === 0, innerBad.length ? innerBad.join('; ')
+        : (inner.length ? `${inner.length} built, each exits to its outer gateway` : 'none'));
+
     // md5 of the files the engine rewrote
     if (manifest) {
         const md5Bad = [];
@@ -434,6 +542,9 @@ module.exports = {
     claimPath,
     outcomeLine,
     doneLine,
+    innerGatewaysLine,
+    plain,
+    blockAt,
     parseJson5,
     endClaims,
     readFight,

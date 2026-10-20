@@ -39,9 +39,13 @@
     "exit_portal_location": null,
     "respawn_stage": null,
     "respawn_crystals": [],
-    "gateways": [11, 14, 12, 2, 4, 9, 7, 17, 5, 6, 15, 10, 1, 16, 3, 18, 0, 13, 8, 19]
+    "gateways": [11, 14, 12, 2, 4, 9, 7, 17, 6, 15, 10, 1, 16, 3, 18, 0, 13, 8, 19]
   },
-  "gatewaysInKeptChunks": [],
+  "gatewaysInKeptChunks": [
+    { "pos": [204, 75, 204], "chunk": [12, 12], "exitPortal": [-1, 75, 96], "moved": false, "action": "rebuild_inner" }
+  ],
+  "innerGateways": [ { "index": 5, "pos": [-1, 75, 96], "exitPortal": [204, 75, 204], "exactTeleport": false } ],
+  "requiresFixes": [ "minecraft-dragon-scan-gateway" ],
   "forceLoads": [
     { "source": "ftbchunks", "chunk": [1, 5], "team": "eee65f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "action": "move", "target": [10, 5] },
     { "source": "minecraft:forced", "chunk": [2, 5], "action": "move", "target": [11, 5] },

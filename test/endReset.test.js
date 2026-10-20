@@ -156,32 +156,59 @@ test('contract files: a schema other than 1 is refused', () => {
 // ── preflight and summary ───────────────────────────────────────────────────
 
 const BIG_DISK = { limitBytes: 100 * 1024 ** 3, usedBytes: 10 * 1024 ** 3 };
+const FIX_OK = new Map([['minecraft-dragon-scan-gateway', 'applied']]);
 
 test('preflight: the fixture plan passes with room on the disk', () => {
-    assert.deepStrictEqual(endReset.preflight(plan(), { disk: BIG_DISK }), []);
-    assert.deepStrictEqual(endReset.preflight(plan(), { disk: { limitBytes: 0, usedBytes: 5e12 } }), [], 'limit 0 = no limit');
+    assert.deepStrictEqual(endReset.preflight(plan(), { disk: BIG_DISK, fixStates: FIX_OK }), []);
+    assert.deepStrictEqual(endReset.preflight(plan(), { disk: { limitBytes: 0, usedBytes: 5e12 }, fixStates: FIX_OK }), [], 'limit 0 = no limit');
 });
 
 test('preflight: unsupported mods stop the apply unless ignoreUnsupported', () => {
     const p = { ...plan(), unsupported: [{ mod: 'somehomes', reason: 'no rewrite rule' }] };
-    const problems = endReset.preflight(p, { disk: BIG_DISK });
+    const problems = endReset.preflight(p, { disk: BIG_DISK, fixStates: FIX_OK });
     assert.strictEqual(problems.length, 1);
     assert.match(problems[0], /somehomes/);
-    assert.deepStrictEqual(endReset.preflight(p, { disk: BIG_DISK, ignoreUnsupported: true }), []);
+    assert.deepStrictEqual(endReset.preflight(p, { disk: BIG_DISK, fixStates: FIX_OK, ignoreUnsupported: true }), []);
 });
 
 test('preflight: free disk under twice the backup size stops the apply', () => {
     const backup = plan().backupBytes;
     const tight = { limitBytes: 10 * 1024 ** 3, usedBytes: 10 * 1024 ** 3 - 2 * backup + 1 };
-    assert.match(endReset.preflight(plan(), { disk: tight })[0], /less than twice/);
+    assert.match(endReset.preflight(plan(), { disk: tight, fixStates: FIX_OK })[0], /less than twice/);
     const exact = { limitBytes: 10 * 1024 ** 3, usedBytes: 10 * 1024 ** 3 - 2 * backup };
-    assert.deepStrictEqual(endReset.preflight(plan(), { disk: exact }), []);
-    assert.match(endReset.preflight(plan(), { disk: null })[0], /no disk numbers/);
+    assert.deepStrictEqual(endReset.preflight(plan(), { disk: exact, fixStates: FIX_OK }), []);
+    assert.match(endReset.preflight(plan(), { disk: null, fixStates: FIX_OK })[0], /no disk numbers/);
+});
+
+test('preflight: a required fix must be applied, even with ignoreUnsupported', () => {
+    const skipped = new Map([['minecraft-dragon-scan-gateway', 'skipped(kill list)']]);
+    assert.match(endReset.preflight(plan(), { disk: BIG_DISK, fixStates: skipped })[0], /requires fix minecraft-dragon-scan-gateway\. The server says skipped\(kill list\)/);
+    assert.match(endReset.preflight(plan(), { disk: BIG_DISK, fixStates: new Map() })[0], /says nothing about it/);
+    assert.match(endReset.preflight(plan(), { disk: BIG_DISK, fixStates: null })[0], /could not read the fix states/);
+    const listed = { ...plan(), unsupported: [{ mod: 'biforesting', reason: 'fix minecraft-dragon-scan-gateway is skipped(kill list); 1 rebuilt inner gateways in chunks -8..8 would make the fight scan report a killed dragon' }] };
+    const problems = endReset.preflight(listed, { disk: BIG_DISK, fixStates: FIX_OK, ignoreUnsupported: true });
+    assert.strictEqual(problems.length, 1);
+    assert.match(problems[0], /The dry run found fix minecraft-dragon-scan-gateway is skipped/);
+    assert.deepStrictEqual(endReset.preflight({ ...plan(), requiresFixes: [] }, { disk: BIG_DISK, fixStates: null }), []);
+});
+
+test('parseFixStates reads the bf fixes lines', () => {
+    const states = endReset.parseFixStates([
+        'fixes: 12 in this build, active: none',
+        'minecraft-dragon-scan-gateway: applied, off, target minecraft [26.1.2.109,26.1.2.121]. Scan ignores gateways',
+        'gregtech-recipe-cache: skipped(kill list), off, target gtceu any',
+        'ae2-craft-lag: pending(target class not loaded), on, target ae2 any',
+    ].join('\n'));
+    assert.deepStrictEqual([...states], [
+        ['minecraft-dragon-scan-gateway', 'applied'],
+        ['gregtech-recipe-cache', 'skipped(kill list)'],
+        ['ae2-craft-lag', 'pending(target class not loaded)'],
+    ]);
 });
 
 test('preflight: other Minecraft versions and dimensions are refused', () => {
-    assert.match(endReset.preflight({ ...plan(), mc: '1.21.1' }, { disk: BIG_DISK })[0], /1\.21\.1/);
-    assert.match(endReset.preflight({ ...plan(), dimension: 'minecraft:the_nether' }, { disk: BIG_DISK })[0], /the_nether/);
+    assert.match(endReset.preflight({ ...plan(), mc: '1.21.1' }, { disk: BIG_DISK, fixStates: FIX_OK })[0], /1\.21\.1/);
+    assert.match(endReset.preflight({ ...plan(), dimension: 'minecraft:the_nether' }, { disk: BIG_DISK, fixStates: FIX_OK })[0], /the_nether/);
 });
 
 test('summarizePlan gives the chunk counts and the affected players', () => {
@@ -191,6 +218,9 @@ test('summarizePlan gives the chunk counts and the affected players', () => {
     assert.match(text, /Team Epic_Gamers#eee65f7e: 2 chunks, offset 9 0/);
     assert.match(text, /Homes: 1 move, 1 remove/);
     assert.match(text, /Region files: 2 rebuild, 1 move/);
+    assert.match(text, /Gateways in kept chunks: 1 \(1 rebuild inner\)/);
+    assert.match(text, /Inner gateways to rebuild: 1 \(spots 5\)/);
+    assert.match(text, /Requires fixes: minecraft-dragon-scan-gateway/);
     assert.match(text, /Unsupported: none/);
     assert.match(text, /Evolution #3 \(e2f5e517\)/);
 });

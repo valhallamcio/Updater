@@ -41,14 +41,14 @@ const failed = report => report.checks.filter(c => !c.ok).map(c => c.name);
 test('the fixture reset passes every check', async () => {
     const report = await verify.verifyReset(verify.localIo(FIXTURE), inputs());
     assert.deepStrictEqual(failed(report), [], verify.verifyText(report));
-    assert.deepStrictEqual(report.checks.map(c => c.name), ['result', 'manifest', 'fight', 'kept chunks', 'move targets', 'claims', 'md5', 'log']);
+    assert.deepStrictEqual(report.checks.map(c => c.name), ['result', 'manifest', 'fight', 'kept chunks', 'move targets', 'claims', 'kept gateways', 'inner gateways', 'md5', 'log']);
     assert.strictEqual(report.ok, true);
     assert.strictEqual(report.scanRan, false);
     assert.match(report.notes.join(' '), /scan has not run yet/);
 });
 
 test('readFight reads the real fresh and trapped 26.1.2 files', () => {
-    const fresh = verify.readFight(read('world/dimensions/minecraft/the_end/data/minecraft/ender_dragon_fight.dat'));
+    const fresh = verify.readFight(read('fight-fresh.dat'));
     assert.deepStrictEqual(fresh, {
         needs_state_scanning: true, dragon_killed: false, previously_killed: false,
         hasDragonUuid: false, exitPortal: null,
@@ -78,7 +78,7 @@ test('the "killed already" line fails the log check', async () => {
 
 test('a missing done line fails the log check', async () => {
     const input = inputs();
-    input.logText = input.logText.split('\n').filter(l => !l.includes('end reset')).join('\n');
+    input.logText = input.logText.split('\n').filter(l => !l.includes('end reset 01JBX6Z2M4K8Q0R1S3T5V7W9YA:')).join('\n');
     const report = await verify.verifyReset(verify.localIo(FIXTURE), input);
     assert.deepStrictEqual(failed(report), ['log']);
 });
@@ -186,6 +186,77 @@ test('md5: a created file is checked like a rewritten one', async () => {
     bytes[bytes.length - 1] ^= 0xff;
     const report = await verify.verifyReset(patched({ [poi]: bytes }, { [poi]: { size: bytes.length, mtime: '2026-10-21T04:02:40Z' } }), input);
     assert.match(report.checks.find(c => c.name === 'md5').detail, /poi\/r\.0\.0\.mca: md5 differs/);
+});
+
+test('inner gateways: no step line yet fails', async () => {
+    const input = inputs();
+    input.logText = input.logText.split('\n').filter(l => !l.includes('inner gateway')).join('\n');
+    const report = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.deepStrictEqual(failed(report), ['inner gateways']);
+    assert.match(report.checks.find(c => c.name === 'inner gateways').detail, /no "inner gateways: N built" line yet/);
+});
+
+test('inner gateways: a failed status, a wrong exit and a missing chunk fail', async () => {
+    const input = inputs();
+    input.logText = input.logText.replace('inner gateways: 1 built, 0 failed', 'inner gateways: 0 built, 1 failed');
+    input.result.innerGateways[0].status = 'failed';
+    input.result.innerGateways[0].reason = 'java.lang.IllegalStateException: no End level';
+    const failedStatus = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    const detail = failedStatus.checks.find(c => c.name === 'inner gateways').detail;
+    assert.match(detail, /log says 0 built, 1 failed, of 1/);
+    assert.match(detail, /spot 5: status failed \(java\.lang\.IllegalStateException: no End level\)/);
+
+    const wrongExit = inputs();
+    wrongExit.result.innerGateways[0].exitPortal = [196, 75, 196];
+    const exitReport = await verify.verifyReset(verify.localIo(FIXTURE), wrongExit);
+    assert.match(exitReport.checks.find(c => c.name === 'inner gateways').detail, /spot 5: exit 204 75 204, want the outer gateway 196 75 196/);
+
+    const noChunk = await verify.verifyReset(patched({ 'world/dimensions/minecraft/the_end/region/r.-1.0.mca': null }), inputs());
+    assert.match(noChunk.checks.find(c => c.name === 'inner gateways').detail, /spot 5: region file of chunk \[-1, 6\] missing/);
+});
+
+test('inner gateways: the block must be end_gateway between bedrock', async () => {
+    const input = inputs();
+    input.result.innerGateways[0].pos = [-1, 74, 96];
+    input.result.innerGateways[0].exitPortal = [204, 75, 204];
+    const report = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    const detail = report.checks.find(c => c.name === 'inner gateways').detail;
+    assert.match(detail, /block at -1 74 96 is minecraft:bedrock/);
+    assert.match(detail, /below and above are minecraft:air and minecraft:end_gateway/);
+});
+
+test('inner gateways: the plan rebuilds some, result.json lists none', async () => {
+    const input = inputs();
+    delete input.result.innerGateways;
+    const report = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(report.checks.find(c => c.name === 'inner gateways').detail, /the plan rebuilds 1, result\.json lists none/);
+});
+
+test('kept gateways: the exit must match the action', async () => {
+    const input = inputs();
+    input.result.gatewaysInKeptChunks[0].action = 'clear_exit';
+    const cleared = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(cleared.checks.find(c => c.name === 'kept gateways').detail, /clear_exit, but the old exit -1 75 96 is still set/);
+    input.result.gatewaysInKeptChunks[0] = { ...input.result.gatewaysInKeptChunks[0], action: 'move_exit', newExitPortal: [100, 70, 100] };
+    const moved = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(moved.checks.find(c => c.name === 'kept gateways').detail, /move_exit, exit -1 75 96, want 100 70 100/);
+    input.result.gatewaysInKeptChunks[0] = { pos: [204, 75, 205], chunk: [12, 12], exitPortal: [-1, 75, 96], moved: false, action: 'keep' };
+    const missing = await verify.verifyReset(verify.localIo(FIXTURE), input);
+    assert.match(missing.checks.find(c => c.name === 'kept gateways').detail, /204 75 205: no block entity/);
+});
+
+test('innerGatewaysLine and blockAt', () => {
+    const log = read('boot-log.txt').toString('utf8');
+    assert.deepStrictEqual(verify.innerGatewaysLine(log, '01JBX6Z2M4K8Q0R1S3T5V7W9YA'), { built: 1, failed: 0 });
+    assert.strictEqual(verify.innerGatewaysLine(log, '01JBX7AAAAAAAAAAAAAAAAAAAA'), null);
+    const { MCAFile } = require('mc-nbt-lib/mca-handler');
+    const bytes = read('world/dimensions/minecraft/the_end/region/r.-1.0.mca');
+    const loc = bytes.readUInt32BE(((-1 & 31) + (6 & 31) * 32) * 4);
+    const chunk = verify.plain(new MCAFile().readChunk(bytes, { offset: loc >>> 8, count: loc & 0xff }));
+    assert.deepStrictEqual([73, 74, 75, 76, 77].map(y => verify.blockAt(chunk, -1, y, 96)),
+        ['minecraft:air', 'minecraft:bedrock', 'minecraft:end_gateway', 'minecraft:bedrock', 'minecraft:air']);
+    assert.strictEqual(verify.blockAt(chunk, -2, 75, 96), 'minecraft:air');
+    assert.strictEqual(verify.blockAt(chunk, -1, 10, 96), 'minecraft:air');
 });
 
 test('a missing or incomplete manifest fails', async () => {

@@ -24,6 +24,7 @@ const SERVERS = [
 ];
 const FIRE_AT = Date.parse('2026-10-21T04:00:00Z');
 const RESTORE_ID = '01JBX8R5T0M3N7P2Q4S6V8W0YC';
+const FIXES_OUTPUT = 'fixes: 12 in this build, active: none\nminecraft-dragon-scan-gateway: applied, off, target minecraft [26.1.2.109,26.1.2.121]. Scan ignores gateways';
 const PLAN_RESULT = { planId: PLAN_ID, planSha256: PLAN_SHA, path: 'config/biforesting/end-reset/plan.json', totals: {}, unsupported: 0, backupBytes: 734003200 };
 
 /** Server-root path to fixture file: the job dir and the log map onto the fixture root. */
@@ -32,7 +33,7 @@ function fixturePath(p) {
     return path.join(FIXTURE, p.startsWith(JOB_DIR) ? p.slice(JOB_DIR.length) : p);
 }
 
-function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, save, ids = [], disk, now = Date.parse('2026-10-21T03:40:00Z'), createFails = false } = {}) {
+function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, save, fixes, ids = [], disk, now = Date.parse('2026-10-21T03:40:00Z'), createFails = false } = {}) {
     const files = new Map(Object.entries(overlay));
     const state = { now, writes: [], deletes: [], ops: [], notices: [], updates: [], deactivated: [], created: [], mails: [], reads: [] };
     const local = p => {
@@ -51,6 +52,9 @@ function rig({ overlay = {}, jobs = [], reboots = [], mailKeys = [], op, save, i
             getServers: async () => SERVERS,
             runOp: async (server, o, timeout) => {
                 state.ops.push({ server, op: o, timeout });
+                if (o.type === 'run_command' && o.params.command === 'bf fixes') {
+                    return fixes || { _id: 'op-f', state: 'completed', result: { data: { output: FIXES_OUTPUT } } };
+                }
                 if (o.type === 'run_command') return save || { _id: 'op-0', state: 'completed', result: { data: { output: 'Saved the game' } } };
                 return op || { _id: 'op-1', state: 'completed', result: { data: PLAN_RESULT } };
             },
@@ -250,6 +254,50 @@ test('apply: the whole run, from request to verify to mails', async () => {
     assert.match(state.notices[2].description, /4 sent, 0 sent before\./);
 });
 
+test('apply: reads the fix states over the link before it writes', async () => {
+    const job = applyJob();
+    const state = rig({ jobs: [storedPlan(), job] });
+    await scheduler.runJob(job, state.deps);
+    assert.deepStrictEqual(state.ops.map(o => o.op.params && o.op.params.command), ['bf fixes']);
+    assert.strictEqual(state.writes.length, 1);
+});
+
+test('apply: verify waits for the inner gateways step line, then saves and checks', async () => {
+    const job = applyJob({ phase: 'awaiting_result', resetId: RESET_ID, notBefore: FIRE_AT - 300000, notAfter: FIRE_AT + 3600000 });
+    const early = fs.readFileSync(path.join(FIXTURE, 'boot-log.txt'), 'utf8').split('\n').filter(l => !l.includes('inner gateway')).join('\n');
+    const pending = { ...RESULT, innerGateways: RESULT.innerGateways.map(g => ({ ...g, status: 'pending' })) };
+    const state = rig({ jobs: [storedPlan(), job], now: FIRE_AT + 300000, overlay: {
+        'logs/latest.log': Buffer.from(early),
+        [`${JOB_DIR}result.json`]: Buffer.from(JSON.stringify(pending)),
+    } });
+    assert.deepStrictEqual(await scheduler.runJob(job, state.deps), { ok: true, waiting: 'inner gateways' });
+    assert.strictEqual(job.active, true);
+    assert.deepStrictEqual(state.notices, []);
+
+    // The server started: the mod filled in the status and logged the line.
+    state.files.delete('logs/latest.log');
+    state.files.delete(`${JOB_DIR}result.json`);
+    const out = await scheduler.runJob(job, state.deps);
+    assert.strictEqual(out.ok, true, JSON.stringify(out.report && out.report.checks));
+    assert.deepStrictEqual(state.ops.map(o => o.op.params && o.op.params.command), ['save-all flush']);
+    assert.match(state.notices[0].description, /PASS inner gateways: 1 built/);
+    assert.strictEqual(state.mails.length, 4);
+});
+
+test('apply: no inner gateways line by the deadline still verifies, and fails', async () => {
+    const job = applyJob({ phase: 'awaiting_result', resetId: RESET_ID, notBefore: FIRE_AT - 300000, notAfter: FIRE_AT + 3600000 });
+    const early = fs.readFileSync(path.join(FIXTURE, 'boot-log.txt'), 'utf8').split('\n').filter(l => !l.includes('inner gateway')).join('\n');
+    const pending = { ...RESULT, innerGateways: RESULT.innerGateways.map(g => ({ ...g, status: 'pending' })) };
+    const state = rig({ jobs: [storedPlan(), job], now: FIRE_AT + 3600000 + 30 * 60000 + 1, overlay: {
+        'logs/latest.log': Buffer.from(early),
+        [`${JOB_DIR}result.${RESET_ID}.json`]: Buffer.from(JSON.stringify(pending)),
+    } });
+    const out = await scheduler.runJob(job, state.deps);
+    assert.strictEqual(out.ok, false);
+    assert.match(state.notices[0].description, /FAIL inner gateways: no "inner gateways: N built" line yet; spot 5: status pending/);
+    assert.deepStrictEqual(state.mails, []);
+});
+
 test('apply: a failed verify holds the mails', async () => {
     const job = applyJob({ phase: 'awaiting_result', resetId: RESET_ID, notBefore: FIRE_AT - 300000, notAfter: FIRE_AT + 3600000 });
     const log = fs.readFileSync(path.join(FIXTURE, 'boot-log.txt'), 'utf8') +
@@ -309,6 +357,8 @@ test('apply refusals write nothing and schedule nothing', async () => {
             overlay: { [`${JOB_DIR}plan.json`]: unsupported },
         },
         { name: 'small disk', jobs: [storedPlan(), applyJob()], disk: { limitBytes: 2 * 1024 ** 3, usedBytes: 1.5 * 1024 ** 3 }, error: /less than twice/ },
+        { name: 'fix skipped', jobs: [storedPlan(), applyJob()], fixes: { state: 'completed', result: { data: { output: 'minecraft-dragon-scan-gateway: skipped(kill list), off, target minecraft any' } } }, error: /The server says skipped\(kill list\)/ },
+        { name: 'fix state unknown', jobs: [storedPlan(), applyJob()], fixes: { state: 'expired', attempts: 0 }, error: /could not read the fix states/ },
     ];
     for (const c of cases) {
         const job = c.jobs[c.jobs.length - 1];

@@ -71,6 +71,15 @@ function unix(ms) {
     return Math.floor(ms / 1000);
 }
 
+/** One console command over the link. Resolves with the op doc; throws when no answer came. */
+async function runCommand(d, serverId, command, waitMs) {
+    return d.yggdrasil.runOp(serverId, {
+        type: 'run_command',
+        params: { command },
+        expiresInMs: PLAN_OP_EXPIRES_MS,
+    }, waitMs);
+}
+
 /** files/contents first; the download link when the panel refuses the size. */
 async function readFileBytes(d, serverId, p) {
     try {
@@ -168,11 +177,7 @@ module.exports = {
         // The planner reads the files on disk, so claims and homes the game holds in memory go first.
         let save;
         try {
-            save = await d.yggdrasil.runOp(server.serverId, {
-                type: 'run_command',
-                params: { command: 'save-all flush' },
-                expiresInMs: PLAN_OP_EXPIRES_MS,
-            }, SAVE_WAIT_MS);
+            save = await runCommand(d, server.serverId, 'save-all flush', SAVE_WAIT_MS);
         } catch (err) {
             return this.fail(d, doc, label, `save-all got no answer over the link: ${err.message}`);
         }
@@ -273,6 +278,19 @@ module.exports = {
         return stored && stored.planSha256 && stored.planText ? stored : null;
     },
 
+    /** Fix states of the running server from `bf fixes`, or null when the link gave no answer. */
+    readFixStates: async function (d, serverId) {
+        try {
+            const op = await runCommand(d, serverId, 'bf fixes', SAVE_WAIT_MS);
+            if (!op || op.state !== 'completed') return null;
+            const states = endReset.parseFixStates(op.result && op.result.data && op.result.data.output);
+            return states.size ? states : null;
+        } catch (err) {
+            sessionLogger.warn('EndResetScheduler', `bf fixes on ${serverId}: ${err.message}`);
+            return null;
+        }
+    },
+
     /** Why a new request may not go out now, or null. */
     pendingWork: async function ({ d, server }) {
         const id = server.serverId;
@@ -309,7 +327,8 @@ module.exports = {
         } catch (err) {
             sessionLogger.warn('EndResetScheduler', `Disk numbers for ${id}: ${err.message}`);
         }
-        const problems = endReset.preflight(plan, { ignoreUnsupported: job.ignoreUnsupported, disk });
+        const fixStates = (plan.requiresFixes || []).length ? await this.readFixStates(d, id) : null;
+        const problems = endReset.preflight(plan, { ignoreUnsupported: job.ignoreUnsupported, disk, fixStates });
         if (problems.length) return this.fail(d, doc, label, problems.join('\n'));
 
         const now = d.now();
@@ -476,6 +495,15 @@ module.exports = {
             return { ok: true, waiting: 'result' };
         }
 
+        // Inner gateways are built at ServerStartedEvent, after the outcome line. Wait for their step line.
+        if (kind === 'reset' && result.status === 'applied' && (result.innerGateways || []).length) {
+            const log = await ctx.io.readBinary(LOG_PATH).catch(() => null);
+            const deadline = (job.notAfter || job.fireAt || now) + RESULT_GRACE_MS;
+            if (!endResetVerify.innerGatewaysLine(log ? log.toString('utf8') : '', job.resetId) && now <= deadline) {
+                return { ok: true, waiting: 'inner gateways' };
+            }
+        }
+
         await d.mongo.updateScheduleJob(doc._id, { phase: 'done', result, resultAt: new Date(d.now()) });
         await d.mongo.deactivateScheduleJob(doc._id);
 
@@ -543,9 +571,17 @@ module.exports = {
         const manifestText = await d.pterodactyl.getFileContents(server.serverId, manifestPath);
         const manifest = manifestText ? endReset.parseManifest(manifestText) : null;
         const plan = await this.loadPlan(ctx, result, manifest, planId);
+
+        // The rebuilt inner gateways live in the running world until a save writes their chunks.
+        const saveNote = [];
+        if ((result.innerGateways || []).length) {
+            const save = await runCommand(d, server.serverId, 'save-all flush', SAVE_WAIT_MS).catch(err => ({ state: err.message }));
+            if (!save || save.state !== 'completed') saveNote.push(`save-all before the gateway check ended ${save ? save.state : 'with no doc'}.`);
+        }
         const log = await io.readBinary(LOG_PATH);
 
         const report = await endResetVerify.verifyReset(io, { plan, result, manifest, logText: log ? log.toString('utf8') : '' });
+        report.notes.push(...saveNote);
         await d.mongo.updateScheduleJob(doc._id, {
             verify: { ok: report.ok, checks: report.checks, notes: report.notes, at: new Date(d.now()) },
         });

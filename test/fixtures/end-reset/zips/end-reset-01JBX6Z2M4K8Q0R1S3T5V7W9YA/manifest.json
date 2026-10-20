@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "resetId": "01JBX6Z2M4K8Q0R1S3T5V7W9YA",
-  "planSha256": "df9256ca5ae13cf5c6f2a0f64e477a1e6b5d7a05c2540f2f40dea1bccbd4be43",
+  "planSha256": "1f726ce2ced77c79700a592d0e97b8fc80c6e57e7a3818cb31e06f3a5851a0dd",
   "createdAt": "2026-10-21T04:02:11Z",
   "complete": true,
   "files": [
@@ -11,7 +11,7 @@
       "bytes": 20480,
       "md5Before": "6145e660077df7700b4e8832d7e9aadb",
       "action": "rewritten",
-      "md5After": "5b4acbe9490a58c6f3db169f196d4446",
+      "md5After": "493ace3509f2037767a66c06063abad4",
       "writtenAt": "2026-10-21T04:02:40Z"
     },
     {
@@ -29,16 +29,16 @@
       "bytes": 12288,
       "md5Before": "221022f2a1645267cc73d33525d3569f",
       "action": "rewritten",
-      "md5After": "f1c80e36e5146c0b4e4d5f92750ed536",
+      "md5After": "ab39323d37eada87bcf6bb09c81c4122",
       "writtenAt": "2026-10-21T04:02:40Z"
     },
     {
       "path": "world/dimensions/minecraft/the_end/data/minecraft/ender_dragon_fight.dat",
       "backup": "files/0004.dat",
-      "bytes": 161,
+      "bytes": 157,
       "md5Before": "b3eee5d32e44a629ebd508fe0181bdb1",
       "action": "rewritten",
-      "md5After": "51e8f66db8b48b70dadd6759d9503946",
+      "md5After": "057e5ac0684110daf002e791a461f78a",
       "writtenAt": "2026-10-21T04:02:40Z"
     },
     {
@@ -56,7 +56,7 @@
       "bytes": 16384,
       "md5Before": null,
       "action": "created",
-      "md5After": "d2ef9105f4a455c1056d670b1dd8d87d",
+      "md5After": "c43a8de3318563b8ef64ff6086aeda65",
       "writtenAt": "2026-10-21T04:02:40Z"
     }
   ]

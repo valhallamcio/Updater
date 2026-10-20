@@ -12,11 +12,16 @@ side (Biforesting) does the reset at boot. The contract is bifrost-lib
    channel. The mails it would send come as a file.
 2. Staff read the summary. An `apply` job with that `planId` is the go.
 3. `apply` checks the plan file still has the stored sha256, that no request or reboot waits,
-   the unsupported list and the disk space. Then it writes `request.json` and inserts one
+   the unsupported list and the disk space. Each fix in `requiresFixes` must say `applied` in
+   `bf fixes` over the link, and must not sit in `unsupported`, even with `ignoreUnsupported`. Then it writes `request.json` and inserts one
    `scheduled_reboot` with `instanceServerId`. Players get the normal countdown.
 4. After `fireAt` the job reads `result.<resetId>.json` (else `result.json`) each tick. On
    `applied` it verifies. A pass sends the mails from that result. A fail holds them. The log
-   check wants the one outcome line `[Biforesting] end reset <resetId>: DONE applied`.
+   check wants the one outcome line `[Biforesting] end reset <resetId>: DONE applied`. With
+   `innerGateways` the job first waits for the step line `inner gateways: N built, M failed`
+   (written at ServerStartedEvent), runs `save-all flush`, then checks each rebuilt gateway on
+   disk: end_gateway between bedrock, `exit_portal` at its outer gateway. Kept gateways must have
+   the exit their action says.
 5. `restore` writes `restore.json` with a new `restoreId` and the `resetId` to undo, and inserts
    one reboot. It needs `confirmLoss: true`. Its result is `result.<restoreId>.json`.
 

@@ -30,6 +30,7 @@ const PATHS = {
 const SUPPORTED_MC = /^26\./;
 
 const PLAN_OP = 'end_reset_plan';
+const FIX_STATE_APPLIED = 'applied';
 const SERVER_ID_RE = /^[0-9a-f]{8}$/;
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -235,6 +236,10 @@ function summarizePlan(plan, opts = {}) {
     lines.push(`Fight: needs scan ${fight.needs_state_scanning ? 'yes' : 'no'}, dragon killed ${fight.dragon_killed ? 'yes' : 'no'}, ${listOf(fight.gateways).length} gateways left`);
     const kept = listOf(plan.gatewaysInKeptChunks);
     if (kept.length) lines.push(`Gateways in kept chunks: ${kept.length} (${countText(countBy(kept, 'action'))})`);
+    const inner = listOf(plan.innerGateways);
+    if (inner.length) lines.push(`Inner gateways to rebuild: ${inner.length} (spots ${inner.map(g => g.index).join(', ')})`);
+    const fixes = listOf(plan.requiresFixes);
+    if (fixes.length) lines.push(`Requires fixes: ${fixes.join(', ')}. Apply checks they are applied on the server.`);
 
     if (plan.backupBytes != null) lines.push(`Backup size: ${(plan.backupBytes / 1024 ** 3).toFixed(2)} GB`);
 
@@ -250,14 +255,33 @@ function summarizePlan(plan, opts = {}) {
     return lines.join('\n');
 }
 
+/** Fix states from the `bf fixes` lines: `<id>: <state>, on|off, target ...`. */
+function parseFixStates(output) {
+    const states = new Map();
+    for (const line of String(output || '').split('\n')) {
+        const m = /^\s*([a-z0-9][a-z0-9_.-]*): (applied|pending\([^)]*\)|skipped\([^)]*\)),/.exec(line);
+        if (m) states.set(m[1], m[2]);
+    }
+    return states;
+}
+
 /**
  * Problems that stop an apply. An empty list is a go.
  * @param {object} plan Parsed plan.json.
- * @param {object} opts { ignoreUnsupported, disk: {limitBytes, usedBytes}|null }.
+ * @param {object} opts { ignoreUnsupported, disk: {limitBytes, usedBytes}|null,
+ *   fixStates: Map of fix id to state from the live server, or null when unknown }.
  * @returns {string[]}
  */
 function preflight(plan, opts = {}) {
     const problems = [];
+    // A required fix stops the boot even with ignoreUnsupported, so it stops the apply too.
+    for (const fix of listOf(plan.requiresFixes)) {
+        const listed = listOf(plan.unsupported).find(u => String(u.reason || '').startsWith(`fix ${fix} is `));
+        const state = opts.fixStates ? opts.fixStates.get(fix) : undefined;
+        if (listed) problems.push(`The dry run found ${listed.reason}.`);
+        else if (!opts.fixStates) problems.push(`The plan requires fix ${fix}, and VU could not read the fix states of the server.`);
+        else if (state !== FIX_STATE_APPLIED) problems.push(`The plan requires fix ${fix}. The server says ${state || 'nothing about it'}.`);
+    }
     if (!SUPPORTED_MC.test(String(plan.mc || ''))) {
         problems.push(`The plan is for Minecraft ${plan.mc}. VU can verify 26.x only.`);
     }
@@ -480,6 +504,7 @@ module.exports = {
     ACTIONS,
     PATHS,
     PLAN_OP,
+    FIX_STATE_APPLIED,
     SUPPORTED_MC,
     ULID_RE,
     DEFAULT_WARN_MINUTES,
@@ -495,6 +520,7 @@ module.exports = {
     parseManifest,
     planTotals,
     summarizePlan,
+    parseFixStates,
     preflight,
     requestWindow,
     buildRequest,
