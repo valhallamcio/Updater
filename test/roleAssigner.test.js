@@ -10,7 +10,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { packButtons, createdByAssigner, pendingMarks, releasedRoles, ROLE_REASON } = require('../schedulers/roleAssigner');
+const { packButtons, markUnreleased, createdByAssigner, pendingMarks, releasedRoles, ROLE_REASON } = require('../schedulers/roleAssigner');
 
 const EVOL = [
     { tag: 'evol', name: 'Evolution #3', serverId: 'e2f5e517', discordRoleId: '' },
@@ -57,30 +57,48 @@ test('the mention and Bifrost rows pass through unchanged', () => {
 });
 
 /*
- * Unreleased packs. A server doc with excludeFromServerList is not released yet. Its name must
- * not reach the public role channel: no button, no new role, no emoji. The buttons, the new
- * roles and the emojis all come from packs, so a hidden tag must not be in packs.
+ * Unreleased packs. A server doc with unreleased: true carries a code name. Its name must not
+ * reach the public role channel: no button, no new role, no emoji. The buttons, the new roles
+ * and the emojis all come from packs, so an unreleased tag must not be in packs.
+ * excludeFromServerList plays no part: live servers use it too.
  */
 
 const BOT = 'bot-fenrir';
 const ROLE_EMBER = 'role-ember';
 const ROLE_OLD_TFGM = 'role-old-tfgm';
-const EMBER = { tag: 'ember', name: 'Project Ember', serverId: '08f3d7de', discordRoleId: '', excludeFromServerList: true };
-const TFGM = { tag: 'tfgm', name: 'TerraFirmaGreg Modern', serverId: '08f3d7de', discordRoleId: ROLE_EMBER, modpackID: 7, excludeFromServerList: false };
+const EMBER = { tag: 'ember', name: 'Project Ember', serverId: '08f3d7de', discordRoleId: '', excludeFromServerList: true, unreleased: true };
+// The EA release keeps the server off the list. It only drops unreleased.
+const TFGM = { tag: 'tfgm', name: 'TerraFirmaGreg Modern', serverId: '08f3d7de', discordRoleId: ROLE_EMBER, modpackID: 7, excludeFromServerList: true };
 
-test('a hidden pack gets no button, no new role and no emoji', () => {
+test('a live pack off the server list keeps its button', () => {
+    const gttn = { tag: 'gttn', name: 'GT Terra Nova', serverId: '54601a8a', discordRoleId: 'role-gtnh', excludeFromServerList: true };
+    const mmcc = { tag: 'mmcc', name: 'GTNH MMCC Migration', serverId: '0272474f', discordRoleId: 'role-mmcc', excludeFromServerList: true, unreleased: false };
+    const { packs, hidden } = packButtons([gttn, mmcc, GTNH]);
+    assert.deepStrictEqual(packs.map(p => p.tag), ['gttn', 'mmcc', 'gtnh']);
+    assert.deepStrictEqual(packs.map(p => p.name), ['GT Terra Nova', 'GTNH MMCC Migration', 'GT New Horizons']);
+    assert.deepStrictEqual(hidden, []);
+});
+
+test('the unreleased flag comes from the serverIds, per instance', () => {
+    const mention = { name: 'Updates', tag: 'updates', discordRoleId: 'role-updates' };
+    const servers = markUnreleased([mention, ...EVOL.map(s => ({ ...s })), { ...GTNH }], ['e2f5e517', 'not-listed']);
+    assert.deepStrictEqual(servers.map(s => !!s.unreleased), [false, true, false, false, false]);
+    assert.strictEqual(packButtons(servers).packs.find(p => p.tag === 'evol').name, 'Evolution');
+});
+
+test('an unreleased pack gets no button, no new role and no emoji', () => {
     const { packs, conflicts, hidden } = packButtons([EMBER, GTNH]);
     assert.deepStrictEqual(packs.map(p => p.tag), ['gtnh'], 'the role-less hidden pack is not on the new-role list');
     assert.deepStrictEqual(conflicts, []);
     assert.deepStrictEqual(hidden, [{ tag: 'ember', discordRoleId: '' }]);
 
     const leaked = packButtons([{ ...EMBER, discordRoleId: ROLE_EMBER }, GTNH]);
-    assert.deepStrictEqual(leaked.packs.map(p => p.tag), ['gtnh'], 'a hidden pack that already has a role loses its button');
+    assert.deepStrictEqual(leaked.packs.map(p => p.tag), ['gtnh'], 'an unreleased pack that already has a role loses its button');
     assert.deepStrictEqual(leaked.hidden, [{ tag: 'ember', discordRoleId: ROLE_EMBER }]);
 });
 
-test('a hidden instance of a released pack keeps the button, and its name stays off the label', () => {
-    const codeName = { tag: 'evol', name: 'Evo', serverId: 'c0de0001', discordRoleId: 'role-evol', excludeFromServerList: true };
+test('an unreleased instance of a released pack keeps the button, and its name stays off the label', () => {
+    const codeName = { tag: 'evol', name: 'Evo', serverId: 'c0de0001', discordRoleId: 'role-evol', unreleased: true };
     const { packs, hidden } = packButtons([codeName, ...EVOL]);
     assert.deepStrictEqual(hidden, []);
     assert.strictEqual(packs.length, 1);
@@ -88,14 +106,14 @@ test('a hidden instance of a released pack keeps the button, and its name stays 
     assert.strictEqual(packs[0].discordRoleId, 'role-evol');
 });
 
-test('a hidden instance with its own role id is still a conflict, checked before the hidden check', () => {
-    const split = [EVOL[1], { ...EVOL[2], discordRoleId: 'role-other', excludeFromServerList: true }, GTNH];
+test('an unreleased instance with its own role id is still a conflict, checked before the release check', () => {
+    const split = [EVOL[1], { ...EVOL[2], discordRoleId: 'role-other', unreleased: true }, GTNH];
     const { packs, conflicts, hidden } = packButtons(split);
     assert.deepStrictEqual(packs.map(p => p.tag), ['gtnh']);
     assert.deepStrictEqual(conflicts, [{ tag: 'evol', roleIds: ['role-evol', 'role-other'] }]);
     assert.deepStrictEqual(hidden, []);
 
-    const allHidden = EVOL.map((s, i) => ({ ...s, discordRoleId: `role-${i}`, excludeFromServerList: true }));
+    const allHidden = EVOL.map((s, i) => ({ ...s, discordRoleId: `role-${i}`, unreleased: true }));
     assert.deepStrictEqual(packButtons(allHidden).conflicts.map(c => c.tag), ['evol']);
 });
 
@@ -109,20 +127,20 @@ test('only RoleCreate entries by the bot with the role assigner reason count as 
     assert.deepStrictEqual([...createdByAssigner(entries, BOT)], [ROLE_EMBER]);
 });
 
-test('a hidden tag marks a role VU made as waiting for the release, and nothing else', () => {
+test('an unreleased tag marks a role VU made as waiting for the release, and nothing else', () => {
     const { hidden } = packButtons([
         { ...EMBER, discordRoleId: ROLE_EMBER },
-        { tag: 'onyx', name: 'Project Onyx', discordRoleId: 'role-onyx', excludeFromServerList: true },
-        { tag: 'gtse', name: 'GT Star Enterprise', discordRoleId: 'role-gtnh', excludeFromServerList: true },
-        { tag: 'gtff', name: 'GT Final Frontier', discordRoleId: 'role-gtnh', excludeFromServerList: true },
-        { tag: 'mmcc', name: 'GTNH MMCC Migration', discordRoleId: 'role-mmcc', excludeFromServerList: true }
+        { tag: 'onyx', name: 'Project Onyx', discordRoleId: 'role-onyx', unreleased: true },
+        { tag: 'slate', name: 'Project Slate', discordRoleId: 'role-by-hand', unreleased: true },
+        { tag: 'shale', name: 'Project Shale', discordRoleId: 'role-by-hand', unreleased: true },
+        { tag: 'flint', name: 'Project Flint', discordRoleId: 'role-flint', unreleased: true }
     ]);
     const owned = new Map([
         ['role-onyx', { roleId: 'role-onyx', tag: 'onyx', pendingRelease: false }],
-        ['role-mmcc', { roleId: 'role-mmcc', tag: 'mmcc', pendingRelease: true }]
+        ['role-flint', { roleId: 'role-flint', tag: 'flint', pendingRelease: true }]
     ]);
-    // ember: the audit log proves it. onyx: VU created it on record. mmcc: already waiting.
-    // role-gtnh: neither, so it is never touched.
+    // ember: the audit log proves it. onyx: VU created it on record. flint: already waiting.
+    // role-by-hand: neither, so it is never touched.
     assert.deepStrictEqual(pendingMarks(hidden, owned, new Set([ROLE_EMBER])), [
         { roleId: ROLE_EMBER, tag: 'ember' },
         { roleId: 'role-onyx', tag: 'onyx' }
@@ -153,7 +171,7 @@ test('a released pack whose role VU did not make keeps that role name', () => {
     assert.deepStrictEqual(pendingMarks(hidden, owned, new Set()), []);
 });
 
-test('a role that a hidden tag still holds is not renamed for a visible tag that shares it', () => {
+test('a role that an unreleased tag still holds is not renamed for a released tag that shares it', () => {
     const owned = new Map([[ROLE_EMBER, { roleId: ROLE_EMBER, tag: 'ember', pendingRelease: true }]]);
     const { packs, hidden } = packButtons([{ ...EMBER, discordRoleId: ROLE_EMBER }, TFGM]);
     assert.deepStrictEqual(packs.map(p => p.tag), ['tfgm']);

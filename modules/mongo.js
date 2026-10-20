@@ -1978,6 +1978,25 @@ module.exports = {
     },
 
     /**
+     * serverIds of the bifrost.servers docs marked unreleased: true. The role assigner keeps such
+     * a pack out of the role channel. The Yggdrasil API does not carry the field.
+     * @returns {Promise<string[]>} serverIds.
+     */
+    findUnreleasedServerIds: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const docs = await mongoClient
+            .db('bifrost')
+            .collection('servers')
+            .find({ unreleased: true }, { projection: { _id: 0, serverId: 1 } })
+            .toArray();
+        return docs.map(doc => doc.serverId).filter(Boolean);
+    },
+
+    /**
      * Creates the indexes the link flow needs, once per process. Each spec is attempted
      * on its own (one failure used to skip every later one for the life of the process)
      * and the ensured flag is only set once they all landed, so the next lookup retries.

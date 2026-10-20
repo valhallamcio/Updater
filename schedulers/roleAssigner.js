@@ -65,8 +65,9 @@ function packLabel(rows) {
  * @returns {{packs: Array, conflicts: Array, hidden: Array}} packs: one row per tag in first-seen
  *   order, with the role id the instances carry ('' when none has one). conflicts: { tag, roleIds }
  *   for a tag whose instances carry different role ids. Such a tag gets no button and no new role.
- *   hidden: { tag, discordRoleId } for a tag whose every instance has excludeFromServerList. The
- *   pack is not released, so it gets no button, no new role and no emoji.
+ *   hidden: { tag, discordRoleId } for a tag whose every instance has unreleased: true. The pack
+ *   carries a code name, so it gets no button, no new role and no emoji. excludeFromServerList
+ *   plays no part: live servers use it too.
  */
 function packButtons(servers) {
     const byTag = new Map();
@@ -85,8 +86,8 @@ function packButtons(servers) {
             conflicts.push({ tag, roleIds });
             continue;
         }
-        const visible = rows.filter(r => !r.excludeFromServerList);
-        if (visible.length === 0) {
+        const released = rows.filter(r => !r.unreleased);
+        if (released.length === 0) {
             hidden.push({ tag, discordRoleId: roleIds[0] || '' });
             continue;
         }
@@ -94,8 +95,8 @@ function packButtons(servers) {
         const data = rows.find(r => r.modpackID) || {};
         packs.push({
             tag,
-            // A hidden instance can carry a code name. The label comes from the visible ones.
-            name: visible.length === 1 ? visible[0].name : packLabel(visible),
+            // An unreleased instance carries a code name. The label comes from the released ones.
+            name: released.length === 1 ? released[0].name : packLabel(released),
             discordRoleId: roleIds[0] || '',
             hostname: data.hostname,
             modpackID: data.modpackID,
@@ -103,6 +104,21 @@ function packButtons(servers) {
         });
     }
     return { packs, conflicts, hidden };
+}
+
+/**
+ * Sets unreleased: true on the server docs whose serverId is in the list. The Yggdrasil API does
+ * not carry the field, so the ids come from bifrost.servers.
+ * @param {Array} servers Server docs from Yggdrasil.
+ * @param {Array<string>} unreleasedServerIds serverIds of the docs with unreleased: true.
+ * @returns {Array} The same docs.
+ */
+function markUnreleased(servers, unreleasedServerIds) {
+    const ids = new Set(unreleasedServerIds);
+    for (const server of servers) {
+        if (server && ids.has(server.serverId)) server.unreleased = true;
+    }
+    return servers;
 }
 
 /**
@@ -188,6 +204,11 @@ module.exports = {
             if (interaction.isButton() && interaction.message.channelId === options.roleChannelId) {
                 try {
                     let serverList = await yggdrasil.getServers();
+                    try {
+                        markUnreleased(serverList, await mongo.findUnreleasedServerIds());
+                    } catch (error) {
+                        sessionLogger.warn('RoleAssigner', `Could not read the unreleased servers: ${error.message}`);
+                    }
                     serverList = await addMentionButton(serverList);
                     serverList = await addBifrostButton(serverList);
                     let server = packButtons(serverList).packs.find(pack => pack.tag === interaction.customId);
@@ -246,6 +267,9 @@ module.exports = {
 
         async function buildButtons() {
             let serverList = await yggdrasil.getServers();
+            // Without this list a code name would reach the channel. A failed read throws, and
+            // the buttons stay as they are until the next interval.
+            markUnreleased(serverList, await mongo.findUnreleasedServerIds());
             let serverListFull = await addMentionButton(serverList);
             serverListFull = await addBifrostButton(serverListFull);
 
@@ -335,8 +359,8 @@ module.exports = {
         }
 
         /**
-         * Keeps the release state of the roles VU created. A hidden tag that holds such a role
-         * marks it as waiting for a release. When its pack turns visible, the role takes the
+         * Keeps the release state of the roles VU created. An unreleased tag that holds such a
+         * role marks it as waiting for a release. When its pack is released, the role takes the
          * pack's real tag and name once. A role VU did not create is never renamed. Never throws:
          * the buttons must not wait on Mongo or the audit log.
          */
@@ -491,6 +515,7 @@ module.exports = {
 };
 
 module.exports.packButtons = packButtons;
+module.exports.markUnreleased = markUnreleased;
 module.exports.createdByAssigner = createdByAssigner;
 module.exports.pendingMarks = pendingMarks;
 module.exports.releasedRoles = releasedRoles;
