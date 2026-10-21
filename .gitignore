@@ -147,3 +147,8 @@ statistics_player*
 
 # one-off migration backups (reversible state dumps, not source)
 scripts/serverstart-migration-backup-*.json
+
+# one-off ticket scratch in the repo root: give lists and per-server console copies
+/_*.txt
+/.tmp-*
+/_*_console.js
