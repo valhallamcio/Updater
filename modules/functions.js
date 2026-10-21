@@ -117,6 +117,9 @@ module.exports = {    /**
                                     }
                                 }
                             }
+                            // Remove the container dir, as the server dir branch does (Soulrend v8.5.2 left a 2 GB v8/ copy)
+                            await fs.remove(dirPath);
+                            sessionLogger.info('Functions', `Moved contents and removed container directory ${dir}`);
                             break;
                         } catch (error) {
                             sessionLogger.error('Functions', `Error moving contents from ${dir}:`, error);
