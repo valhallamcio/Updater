@@ -453,10 +453,38 @@ module.exports = {
                 if (error.response && error.response.status === 404) {
                     return null;
                 }
+                // Wings since the 10-2026 update answers 500 ("openat2 ...: file does not exist")
+                // for a missing file. The parent listing tells it apart from a real failure.
+                if (error.response && error.response.status === 500 && await this.fileMissing(serverID, filePath)) {
+                    return null;
+                }
                 sessionLogger.error('Pterodactyl', `Failed to read ${filePath} on ${serverID} (attempt ${attempt}/${maxRetries}):`, error.response?.status || error.message);
                 if (attempt === maxRetries) throw error;
                 await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
             }
+        }
+    },
+
+    /**
+     * True only when the parent directory lists fine and has no entry with this name.
+     * A failed listing gives false, so the caller keeps its error.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @param {string} filePath Path to the file on the server.
+     * @returns {boolean}
+     */
+    fileMissing: async function (serverID, filePath) {
+        const parts = String(filePath).replace(/^\/+/, '').split('/');
+        const name = parts.pop();
+        const dir = '/' + parts.join('/');
+        apiCallTracker.track('files/list', getCaller());
+        try {
+            const response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/list?directory=${encodeURIComponent(dir)}`, {
+                headers: header,
+                timeout: 30000
+            });
+            return !response.data.data.some(entry => entry.attributes && entry.attributes.name === name);
+        } catch (error) {
+            return false;
         }
     },
 
