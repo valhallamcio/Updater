@@ -25,7 +25,9 @@
  *      player who did enough that week, when the community met the target. The week
  *      keeps its top chapter, and the weekly trophy shows that chapter's icon. The close
  *      of the last week also marks the `veteran` reward for every player who did enough
- *      in every week.
+ *      in every week. With `finisherCountsWeekly`, a player who completed `finalQuestId`
+ *      did enough in every week from their finish week on. Under the team rule the
+ *      earliest finish in their party counts. The week target still takes real counts.
  *   6. It queues every pending reward as a `give_item` op that waits up to 14 days
  *      for the player (`waiting_player`), with an idempotency key per reward.
  *
@@ -201,7 +203,7 @@ module.exports = {
                 await this.assignFounders(event, sched, progress, now, teams);
                 await this.assignMilestones(event, sched, progress, now, teams);
                 await this.assignFinishers(event, sched, progress, now, teams);
-                await this.closeWeeks(event, sched, progress, counts, options, now);
+                await this.closeWeeks(event, sched, progress, counts, options, now, teams);
             }
         }
         if (this.opsConfig().useOpsApi) {
@@ -396,16 +398,21 @@ module.exports = {
      * and then closes. The closed week and its rewards keep the week's top chapter.
      * The close that finishes the event marks the veteran rewards before it closes, for
      * the same reason. No later pass counts, so this is their only chance.
+     * With `finisherCountsWeekly`, a finisher has the minimum from their finish week on.
+     * The target still compares the real count.
      */
-    closeWeeks: async function (event, sched, progress, counts, options, now) {
+    closeWeeks: async function (event, sched, progress, counts, options, now, teams = null) {
         const delayMs = (Number(options.weekCloseDelayMinutes) || 0) * 60 * 1000;
         const closed = (event.closedWeeks || []).map(w => ({ index: w.index }));
-        for (const index of questProgress.closableWeeks(sched, event.closedWeeks, now, delayMs)) {
+        const closable = questProgress.closableWeeks(sched, event.closedWeeks, now, delayMs);
+        if (closable.length === 0) return;
+        const finishWeek = await this.finishWeeks(event, sched, progress, teams);
+        for (const index of closable) {
             const count = Number(counts.weekCounts[index]) || 0;
             const target = questProgress.weekTarget(event.weeklyTargets, index);
             const met = target !== null && count >= target;
             const chapter = questProgress.topChapter(event, counts.weekChapters, index);
-            const recipients = met ? questProgress.weeklyRecipients(progress, event, index) : [];
+            const recipients = met ? questProgress.weeklyRecipients(progress, event, index, finishWeek) : [];
             const reward = { state: 'pending', week: index, at: new Date(now) };
             if (chapter) reward.chapter = chapter.index;
             for (const doc of recipients) {
@@ -413,7 +420,7 @@ module.exports = {
             }
             closed.push({ index });
             if (questProgress.eventFinished(sched, closed, now)) {
-                await this.markVeterans(event, sched, progress, now);
+                await this.markVeterans(event, sched, progress, now, finishWeek);
             }
             const entry = { index, count, target, met, recipients: recipients.length, closedAt: new Date(now) };
             if (chapter) entry.chapter = chapter;
@@ -423,12 +430,33 @@ module.exports = {
     },
 
     /**
+     * The finish week of each finisher for the week close, with `finisherCountsWeekly`.
+     * Under the team rule it needs the parties: from this pass when `readTeams` read them,
+     * else read here. A missing or bad file leaves each player with their own finish.
+     * @returns {Promise<Map<string, number>|null>} Null when the rule is off.
+     */
+    finishWeeks: async function (event, sched, progress, teams) {
+        if (!questProgress.finisherCountsWeekly(event)) return null;
+        let partyOf = teams ? teams.partyOf : null;
+        const anyFinish = progress.some(doc => questProgress.toMs(doc.finishedAt) !== null);
+        if (!partyOf && anyFinish && questProgress.teamSpec(event)) {
+            const path = partiesPath(event);
+            try {
+                partyOf = questProgress.parseParties(await this.downloadProgressFile(event.serverId, path));
+            } catch (error) {
+                sessionLogger.warn('QuestEventReader', `Event ${event._id}: could not read ${path} on ${event.serverId}, finishers count alone this close (${error.message})`);
+            }
+        }
+        return questProgress.finishWeeks(progress, event, sched, partyOf);
+    },
+
+    /**
      * Marks the `veteran` reward for every player with `veteran.minQuests` in every week.
      * `addQuestEventReward` never replaces a record, so a second run marks nothing new.
      */
-    markVeterans: async function (event, sched, progress, now) {
+    markVeterans: async function (event, sched, progress, now, finishWeek = null) {
         if (!event.veteran) return;
-        const recipients = questProgress.veteranRecipients(progress, event, sched);
+        const recipients = questProgress.veteranRecipients(progress, event, sched, finishWeek);
         for (const doc of recipients) {
             await mongo.addQuestEventReward(event._id, doc.uuid, 'veteran', { state: 'pending', at: new Date(now), earnedAt: new Date(now) });
         }

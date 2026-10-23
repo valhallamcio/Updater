@@ -27,7 +27,10 @@
  *    milestone or finisher number a member already holds, with no `$inc` and `sharedWith`
  *    on the reward, so a team takes one speedrunner place and every member gets the trophy,
  *  - a failed or missing parties file numbers everybody alone that pass and stops nothing,
- *  - without `teams.enabled` the parties file is never read and the numbers stay per player.
+ *  - without `teams.enabled` the parties file is never read and the numbers stay per player,
+ *  - with `finisherCountsWeekly`, a finisher has the weekly and veteran minimum from the
+ *    finish week on, a party member from the party's earliest finish, and the target still
+ *    counts real quests. Without it, a finisher needs the real count like everybody else.
  *
  * Every module is faked at its own surface, the way test/cakeDrop.test.js does it. The
  * Mongo fakes apply the real bulkWrite ops from modules/mongo.js to an in-memory store.
@@ -976,4 +979,112 @@ test('teams: a pass with nobody waiting for a number reads no parties file', asy
 
     await reader.countPass(OPTIONS, START + DAY + 2);
     assert.deepStrictEqual(partyReads, ['season2'], 'everybody has a number now');
+});
+
+/** `n` completions of distinct quests from `firstQuest` on, one ms apart from `at`. */
+function done(uuid, firstQuest, n, at) {
+    return Array.from({ length: n }, (_, i) => [firstQuest + i, uuid, at + i]);
+}
+
+/** DJ2 Season 2 after 10-23: 10 quests a week, and a finisher counts as 10 from the finish week. */
+function finisherWeekly(extra = {}) {
+    Object.assign(ev, { weekCount: 3, weeklyMinContribution: 10, weeklyTargets: [3], finisher: { reward: CAKE }, finisherCountsWeekly: true }, extra);
+}
+
+const rewardWeeks = (uuid) => Object.keys((progress[pid(uuid)] || {}).rewards || {}).filter(questProgress.isWeekKey).sort();
+
+test('finisher weekly: a finish mid-week marks that week, and a finish before a later close marks that week too', async () => {
+    finisherWeekly();
+    // A does 1 quest, then finishes on day 3 of week0. B does 3 quests a week and never finishes. C does 1 in week1.
+    setFile('season2', [
+        [1, A, START + 1000], [809, A, START + 3 * DAY + 5 * HOUR],
+        ...done(B, 100, 3, START + DAY), ...done(B, 200, 3, START + WEEK + DAY),
+        [1, C, START + WEEK + 2 * DAY]
+    ]);
+    await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
+
+    assert.deepStrictEqual(rewardWeeks(A), ['week0', 'week1'], 'the finish week and the empty week after it');
+    assert.deepStrictEqual(rewardWeeks(B), [], '3 quests a week is short of 10');
+    assert.deepStrictEqual(rewardWeeks(C), [], 'not finished and short of 10');
+    // The target compares real quests: A adds 2 to week0 and nothing to week1.
+    assert.deepStrictEqual(closes.map(c => [c.index, c.count, c.met, c.recipients]), [[0, 5, true, 1], [1, 4, true, 1]]);
+    assert.deepStrictEqual(ev.weekCounts, [5, 4, 0]);
+});
+
+test('finisher weekly: off by default, so a finisher short of the minimum gets nothing', async () => {
+    finisherWeekly({ finisherCountsWeekly: undefined });
+    setFile('season2', [[1, A, START + 1000], [809, A, START + 3 * DAY], ...done(B, 100, 3, START + DAY), ...done(B, 200, 3, START + WEEK)]);
+    await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
+    assert.strictEqual(closes.length, 2);
+    assert.ok(closes.every(c => c.met));
+    assert.deepStrictEqual(rewardWeeks(A), []);
+});
+
+test('finisher weekly: a missed target marks nobody, finished or not', async () => {
+    finisherWeekly({ weeklyTargets: [10] });
+    setFile('season2', [[1, A, START + 1000], [809, A, START + DAY]]);
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+    assert.deepStrictEqual(closes.map(c => [c.index, c.count, c.met, c.recipients]), [[0, 2, false, 0]]);
+    assert.deepStrictEqual(rewardWeeks(A), []);
+});
+
+test('finisher weekly: a veteran needs 10 in every week before the finish week, and none after it', async () => {
+    finisherWeekly({ veteran: { reward: { id: 'simple_trophies:trophy', name: 'DJ2 Season 2 Veteran' } } });
+    setFile('season2', [
+        // A: 10, then 10 with the finish, then nothing.
+        ...done(A, 100, 10, START + DAY), ...done(A, 200, 9, START + WEEK + DAY), [809, A, START + WEEK + 2 * DAY],
+        // B: 10, then 2 with the finish, then nothing.
+        ...done(B, 100, 10, START + DAY), [200, B, START + WEEK + DAY], [809, B, START + WEEK + 2 * DAY],
+        // C: 5 before the finish week, so one pre-finish week is short.
+        ...done(C, 100, 5, START + DAY), ...done(C, 200, 9, START + WEEK + DAY), [809, C, START + WEEK + 2 * DAY],
+        // D: 10, 10, 3 and no finish.
+        ...done(D, 100, 10, START + DAY), ...done(D, 200, 10, START + WEEK + DAY), ...done(D, 300, 3, START + 2 * WEEK + DAY)
+    ]);
+    const lastClose = START + 3 * WEEK + CLOSE_DELAY;
+    await reader.countPass(OPTIONS, lastClose);
+
+    assert.strictEqual(closes.length, 3);
+    assert.deepStrictEqual(Object.values(progress).filter(d => d.rewards.veteran).map(d => d.uuid).sort(), [A, B]);
+    assert.deepStrictEqual(progress[pid(B)].rewards.veteran, { state: 'pending', at: new Date(lastClose), earnedAt: new Date(lastClose) });
+    assert.deepStrictEqual(rewardWeeks(B), ['week0', 'week1', 'week2']);
+    assert.deepStrictEqual(rewardWeeks(C), ['week1', 'week2']);
+    assert.deepStrictEqual(rewardWeeks(D), ['week0', 'week1']);
+    assert.deepStrictEqual(closes.map(c => c.count), [35, 32, 3], 'real quests only');
+});
+
+test('finisher weekly: a party member counts from the party\'s finish, with one parties read per pass', async () => {
+    finisherWeekly({ teams: { enabled: true, windowMs: DAY } });
+    // A finishes in week0. B shares A's party and was offline, so BQ has no finish for B yet.
+    // C is in another party, and D in none.
+    setParties([[1, [A, B]], [2, [C]]]);
+    setFile('season2', [
+        [1, A, START + 1000], [809, A, START + DAY],
+        [1, B, START + 2000], [2, B, START + 3000], [3, B, START + WEEK + DAY],
+        [1, C, START + 4000], [2, C, START + WEEK + DAY],
+        [1, D, START + 5000], ...done(D, 100, 2, START + WEEK + 2 * DAY)
+    ]);
+    await reader.countPass(OPTIONS, START + WEEK - 1);
+    assert.deepStrictEqual(partyReads, ['season2'], 'founder and finisher numbers wait');
+    assert.strictEqual(closes.length, 0);
+
+    // Nobody waits for a number now, so the close reads the parties itself.
+    await reader.countPass(OPTIONS, START + 2 * WEEK + CLOSE_DELAY);
+    assert.deepStrictEqual(partyReads, ['season2', 'season2']);
+    assert.deepStrictEqual(rewardWeeks(A), ['week0', 'week1']);
+    assert.deepStrictEqual(rewardWeeks(B), ['week0', 'week1'], 'the party finished in week0');
+    assert.deepStrictEqual(closes.map(c => [c.index, c.count, c.recipients]), [[0, 6, 2], [1, 4, 2]]);
+    assert.deepStrictEqual(rewardWeeks(C), []);
+    assert.deepStrictEqual(rewardWeeks(D), []);
+    assert.strictEqual(progress[pid(B)].finishedAt, null, 'the count keeps B\'s own record');
+});
+
+test('finisher weekly: a failed parties read leaves each player with their own finish', async () => {
+    finisherWeekly({ teams: { enabled: true, windowMs: DAY } });
+    // The download fails, so nobody can tell whether B shares A's party.
+    setParties(null);
+    setFile('season2', [[1, A, START + 1000], [809, A, START + DAY], [1, B, START + 2000], [2, B, START + 3000]]);
+    await reader.countPass(OPTIONS, START + WEEK + CLOSE_DELAY);
+    assert.strictEqual(closes.length, 1);
+    assert.deepStrictEqual(rewardWeeks(A), ['week0']);
+    assert.deepStrictEqual(rewardWeeks(B), []);
 });

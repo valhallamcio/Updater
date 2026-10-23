@@ -467,20 +467,70 @@ function finisherCandidates(progressDocs, event, sched) {
         .sort((a, b) => toMs(a.finishedAt) - toMs(b.finishedAt) || String(a.uuid).localeCompare(String(b.uuid)));
 }
 
-/** The progress docs that earn week `index`'s reward: enough completions that week, not excluded. */
-function weeklyRecipients(progressDocs, event, index) {
+/**
+ * True when a finisher counts as having the weekly minimum: `finisherCountsWeekly === true`
+ * on an event with a `finisher`. A finished party runs out of quests.
+ */
+function finisherCountsWeekly(event) {
+    return event.finisherCountsWeekly === true && finisherQuestId(event) !== null;
+}
+
+/**
+ * The week from which each finisher counts as having the weekly and the veteran minimum:
+ * the week of their `finishedAt`. Under the team rule a party member counts from the
+ * earliest finish in the party, because BQ gives a member the party's completions only at
+ * their next login. Earlier weeks keep the real count.
+ * @param {Map<string, number>|null} partyOf Normalized uuid to party id. Null: nobody shares.
+ * @returns {Map<string, number>} Normalized uuid to week index. Empty when the rule is off.
+ */
+function finishWeeks(progressDocs, event, sched, partyOf = null) {
+    const weeks = new Map();
+    if (!finisherCountsWeekly(event)) return weeks;
+    const partyWeek = new Map();
+    for (const doc of progressDocs) {
+        const at = toMs(doc.finishedAt);
+        if (at === null || at < sched.startAt || at >= sched.endAt) continue;
+        const uuid = normalizeUuid(doc.uuid);
+        const week = Math.floor((at - sched.startAt) / sched.weekMs);
+        weeks.set(uuid, week);
+        const party = partyOf ? partyOf.get(uuid) : undefined;
+        if (party !== undefined && (!partyWeek.has(party) || week < partyWeek.get(party))) partyWeek.set(party, week);
+    }
+    if (partyWeek.size === 0) return weeks;
+    for (const doc of progressDocs) {
+        const uuid = normalizeUuid(doc.uuid);
+        const week = partyWeek.get(partyOf.get(uuid));
+        if (week !== undefined && (!weeks.has(uuid) || week < weeks.get(uuid))) weeks.set(uuid, week);
+    }
+    return weeks;
+}
+
+/** True when `finishWeek` (from `finishWeeks`) counts the doc's player as done in week `index`. */
+function finishedBy(finishWeek, doc, index) {
+    if (!finishWeek) return false;
+    const week = finishWeek.get(normalizeUuid(doc.uuid));
+    return week !== undefined && week <= index;
+}
+
+/**
+ * The progress docs that earn week `index`'s reward: enough completions that week, or a
+ * finish in `finishWeek` at or before the week. Not excluded.
+ * @param {Map<string, number>|null} [finishWeek] From `finishWeeks`. Null: real counts only.
+ */
+function weeklyRecipients(progressDocs, event, index, finishWeek = null) {
     const min = Number(event.weeklyMinContribution) || 0;
     const excluded = new Set((event.excluded || []).map(normalizeUuid));
     return progressDocs.filter(doc => !excluded.has(normalizeUuid(doc.uuid))
-        && Number((doc.weeks || {})[index] || 0) >= Math.max(min, 1));
+        && (Number((doc.weeks || {})[index] || 0) >= Math.max(min, 1) || finishedBy(finishWeek, doc, index)));
 }
 
 /**
  * The progress docs that earn the `veteran` reward: at least `veteran.minQuests` in every
- * week of the event, not excluded. `minQuests` defaults to the weekly minimum. Empty when
- * the event has no `veteran`.
+ * week of the event, not excluded. `minQuests` defaults to the weekly minimum. A week at or
+ * after the player's week in `finishWeek` counts as done. Empty when the event has no `veteran`.
+ * @param {Map<string, number>|null} [finishWeek] From `finishWeeks`. Null: real counts only.
  */
-function veteranRecipients(progressDocs, event, sched) {
+function veteranRecipients(progressDocs, event, sched, finishWeek = null) {
     const veteran = event.veteran;
     if (!veteran || typeof veteran !== 'object') return [];
     const min = Number(veteran.minQuests) > 0
@@ -490,7 +540,7 @@ function veteranRecipients(progressDocs, event, sched) {
     return progressDocs.filter(doc => {
         if (excluded.has(normalizeUuid(doc.uuid))) return false;
         for (let i = 0; i < sched.weekCount; i++) {
-            if (Number((doc.weeks || {})[i] || 0) < min) return false;
+            if (Number((doc.weeks || {})[i] || 0) < min && !finishedBy(finishWeek, doc, i)) return false;
         }
         return true;
     });
@@ -565,6 +615,8 @@ module.exports = {
     founderCandidates,
     milestoneCandidates,
     finisherCandidates,
+    finisherCountsWeekly,
+    finishWeeks,
     weeklyRecipients,
     veteranRecipients,
     diffProgress

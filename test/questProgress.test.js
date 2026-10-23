@@ -21,6 +21,9 @@
  *    chapters counts for the lowest index only,
  *  - the top chapter of a week has the most completions, and a tie goes to the lower index,
  *  - a veteran did `veteran.minQuests` (default: the weekly minimum) in EVERY week,
+ *  - with `finisherCountsWeekly === true` and a `finisher`, a finisher has the weekly and
+ *    veteran minimum from the week of `finishedAt` on, and a party member from the party's
+ *    earliest finish,
  *  - teams need `teams.enabled === true`, and the window falls back to 24 hours,
  *  - the parties file is read in both forms, with uuids as the progress file has them,
  *  - a candidate shares a number only with a member of its own party who holds one for
@@ -437,6 +440,39 @@ test('veterans: minQuests in every week, the weekly minimum by default, exclusio
     assert.deepStrictEqual(got({ weeklyMinContribution: 2, veteran: { ...veteran, minQuests: 3 } }), ['e']);
     assert.deepStrictEqual(got({ weeklyMinContribution: 0, veteran }), [A, B, 'e'], 'a minimum of 0 means 1');
     assert.deepStrictEqual(got({ weeklyMinContribution: 2 }), [], 'no veteran on the event');
+});
+
+test('finish weeks: a finisher has the weekly and veteran minimum from the finish week on, a party from its earliest finish', () => {
+    const sched = qp.schedule(event());
+    const veteran = { reward: { id: 'minecraft:cake' } };
+    const on = event({ finisher: { reward: {} }, finalQuestId: 809, finisherCountsWeekly: true, weeklyMinContribution: 10, veteran });
+    const docs = [
+        { uuid: A, weeks: { 0: 3, 1: 1 }, finishedAt: new Date(START + WEEK + DAY) },
+        { uuid: B.toUpperCase(), weeks: { 0: 12, 1: 2 }, finishedAt: null },
+        { uuid: C, weeks: { 0: 12, 1: 12 }, finishedAt: START + 2 * WEEK },
+        { uuid: D, weeks: { 0: 1 }, finishedAt: START + 3 * DAY },
+        { uuid: 'e', weeks: { 0: 1 }, finishedAt: START - 1 }
+    ];
+    // A and B are a party, and so are C and D. B has no finish of its own yet.
+    const partyOf = new Map([[A, 1], [B, 1], [C, 2], [D, 2]]);
+
+    assert.deepStrictEqual([...qp.finishWeeks(docs, on, sched)].sort(), [[A, 1], [C, 2], [D, 0]], 'a finish before the start is none');
+    const fw = qp.finishWeeks(docs, on, sched, partyOf);
+    assert.deepStrictEqual([...fw].sort(), [[A, 1], [B, 1], [C, 0], [D, 0]]);
+    for (const off of [{ finisherCountsWeekly: 'true' }, { finisherCountsWeekly: undefined }, { finisher: undefined }]) {
+        assert.strictEqual(qp.finishWeeks(docs, { ...on, ...off }, sched, partyOf).size, 0, JSON.stringify(off));
+    }
+
+    const weekly = (index, finishWeek) => qp.weeklyRecipients(docs, on, index, finishWeek).map(d => d.uuid);
+    assert.deepStrictEqual(weekly(0, fw), [B.toUpperCase(), C, D], 'A is short of 10 in the week before its finish');
+    assert.deepStrictEqual(weekly(1, fw), [A, B.toUpperCase(), C, D]);
+    assert.deepStrictEqual(weekly(1, null), [C], 'without finish weeks only the real count');
+
+    const veterans = (finishWeek) => qp.veteranRecipients(docs, on, sched, finishWeek).map(d => d.uuid);
+    assert.deepStrictEqual(veterans(fw), [B.toUpperCase(), C, D]);
+    assert.deepStrictEqual(veterans(null), []);
+    assert.deepStrictEqual(qp.veteranRecipients(docs, { ...on, excluded: [D] }, sched, fw).map(d => d.uuid), [B.toUpperCase(), C],
+        'an excluded finisher gets nothing');
 });
 
 test('teams: only enabled === true turns them on, and a missing or bad window is 24 hours', () => {
