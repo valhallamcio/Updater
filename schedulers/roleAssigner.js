@@ -178,6 +178,7 @@ module.exports = {
         "roleChannelId": "",
         "MentionRoleId": "",
         "BifrostRoleId": "",
+        "extraRoleIds": [],
         "defaultEmojiId": "",
     },
 
@@ -211,6 +212,7 @@ module.exports = {
                     }
                     serverList = await addMentionButton(serverList);
                     serverList = await addBifrostButton(serverList);
+                    serverList = await addExtraButtons(serverList);
                     let server = packButtons(serverList).packs.find(pack => pack.tag === interaction.customId);
                     let replyMessage = "Something went wrong!";
                     //console.log(interaction);
@@ -272,6 +274,7 @@ module.exports = {
             markUnreleased(serverList, await mongo.findUnreleasedServerIds());
             let serverListFull = await addMentionButton(serverList);
             serverListFull = await addBifrostButton(serverListFull);
+            serverListFull = await addExtraButtons(serverListFull);
 
             // One row per tag. The role id comes from every instance, never from the first one.
             const { packs, conflicts, hidden } = packButtons(serverListFull);
@@ -485,6 +488,28 @@ module.exports = {
             };
 
             serverList.unshift(mentionObj);
+            return serverList;
+        }
+
+        /**
+         * One button per role id in extraRoleIds (event roles, e.g. Halloween "Witching hour").
+         * The button shows the role name. A role that does not exist gets no button.
+         */
+        async function addExtraButtons(serverList) {
+            const ids = Array.isArray(options.extraRoleIds) ? options.extraRoleIds : [];
+            if (ids.length === 0) return serverList;
+
+            const channel = await client.channels.fetch(options.roleChannelId);
+
+            for (const id of [...ids].reverse()) {
+                const role = channel.guild.roles.cache.find(role => role.id === id);
+                if (!role) continue;
+                serverList.unshift({
+                    name: role.name,
+                    tag: role.name.toLowerCase(),
+                    discordRoleId: role.id
+                });
+            }
             return serverList;
         }
 
