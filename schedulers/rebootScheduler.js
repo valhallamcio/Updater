@@ -42,8 +42,14 @@ module.exports = {
     // Start send timings (startServerWithMonitoring). Wings can drop a start without an API error.
     // A start sent while Wings still holds the stop lock is refused. A start whose container create
     // fails goes starting, then offline. Both left the server offline for the full boot budget.
+    // Poll interval of waitForServerState. The start follows the stop wait, so each second of
+    // poll lag is a second the server sits offline. A 30 s poll gave 19 to 32 s of it (10-29).
+    statePollMs: 2000,
+
     startRetry: {
-        lockSettleMs: 10000,     // wait after "offline" before the first send, so Wings releases its stop lock
+        // Wait after "offline" before the first send, so Wings releases its stop lock. Wings frees
+        // it after Docker's exit cleanup: 0.6 to 0.9 s typical, 2.5 s max over 652 stops (10-29).
+        lockSettleMs: 5000,
         pollMs: 10000,           // state poll interval while a start send is watched
         droppedAfterMs: 45000,   // still offline this long after a send, no other state seen: resend
         failedBootWaitMs: 60000, // offline this long after a starting state (failed boot): resend
@@ -1691,31 +1697,21 @@ module.exports = {
     },
 
     /**
-     * Wait for server to reach specific state using simple REST API (original working approach)
+     * Polls the power state every statePollMs until it is targetState. Returns false when the
+     * timeout runs out first. A failed read ('unknown') does not count as the target.
      */
     waitForServerState: async function (server, targetState, timeout) {
         const startTime = Date.now();
-        
+
         while (Date.now() - startTime < timeout) {
-            try {
-                const status = await pterodactyl.getStatus(server.serverId);
-                
-                if (status && status.attributes && status.attributes.current_state === targetState) {
-                    sessionLogger.info('RebootScheduler', 
-                        `[${server.name}] Reached target state: ${targetState}`);
-                    return true;
-                }
-                
-                // Wait 30 seconds before next check (original working interval)
-                await functions.sleep(30000);
-                
-            } catch (error) {
-                sessionLogger.warn('RebootScheduler', 
-                    `[${server.name}] Status check error: ${error.message}`);
-                await functions.sleep(30000);
+            if (await this.readServerState(server) === targetState) {
+                sessionLogger.info('RebootScheduler',
+                    `[${server.name}] Reached target state: ${targetState}`);
+                return true;
             }
+            await functions.sleep(this.statePollMs);
         }
-        
+
         sessionLogger.error('RebootScheduler', 
             `[${server.name}] TIMEOUT waiting for state: ${targetState} after ${timeout/1000}s`);
         return false;
