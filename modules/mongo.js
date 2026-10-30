@@ -532,6 +532,45 @@ module.exports = {
     },
 
     /**
+     * Creates the bifrost.server_boots indexes: one record per boot of a supervisor
+     * (serverId, supervisorStartedAt, bootCount), and the per-server time lookup.
+     * @returns {Promise<void>}
+     */
+    ensureServerBootIndexes: async function () {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const collection = mongoClient.db('bifrost').collection('server_boots');
+        await collection.createIndex({ serverId: 1, supervisorStartedAt: 1, bootCount: 1 }, { unique: true, name: 'server_boots_boot' });
+        await collection.createIndex({ serverId: 1, readyAt: -1 }, { name: 'server_boots_server' });
+    },
+
+    /**
+     * Writes one boot record to bifrost.server_boots, once: a record that is already there
+     * stays as it is, so a VU restart that reads the same state.json again writes nothing.
+     * @param {object} doc The record (schedulers/bootRecorder.js bootRecord).
+     * @returns {Promise<boolean>} true when the record is new.
+     */
+    insertServerBoot: async function (doc) {
+        if (!mainClientConnected) {
+            await mongoClient.connect();
+            mainClientConnected = true;
+        }
+
+        const result = await mongoClient
+            .db('bifrost')
+            .collection('server_boots')
+            .updateOne(
+                { serverId: doc.serverId, supervisorStartedAt: doc.supervisorStartedAt, bootCount: doc.bootCount },
+                { $setOnInsert: doc },
+                { upsert: true }
+            );
+        return result.upsertedCount > 0;
+    },
+
+    /**
      * Stores a reboot request for tracking
      * @param {object} requestData Reboot request data
      * @returns {object} Inserted document with _id

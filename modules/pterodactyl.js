@@ -433,6 +433,31 @@ module.exports = {
     },
 
     /**
+     * Reads a small file with one request and no retry, for a probe that runs on every server.
+     * Wings answers 404, or 500 since the 10-2026 update, for a missing file. Both give null
+     * without the listing check of getFileContents, so a probe of a missing file costs one call.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @param {string} filePath Path to the file on the server.
+     * @returns {Buffer|null} File contents, or null when the panel answers 404 or 500.
+     * @throws On any other failure (timeout, 429, no answer).
+     */
+    readFileOnce: async function (serverID, filePath) {
+        apiCallTracker.track('files/contents', getCaller());
+        try {
+            const response = await axios.get(`${pterodactylHostName}api/client/servers/${serverID}/files/contents?file=${encodeURIComponent(filePath)}`, {
+                headers: header,
+                responseType: 'arraybuffer',
+                timeout: 15000
+            });
+            return Buffer.from(response.data);
+        } catch (error) {
+            const status = error.response && error.response.status;
+            if (status === 404 || status === 500) return null;
+            throw error;
+        }
+    },
+
+    /**
      * Reads the raw contents of a file on the server.
      * @param {string} serverID Id of the server on Pterodactyl.
      * @param {string} filePath Path to the file on the server.

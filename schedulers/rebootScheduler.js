@@ -5,6 +5,7 @@ const timeManager = require("../modules/timeManager");
 const functions = require("../modules/functions");
 const rebootAlerts = require("../modules/rebootAlerts");
 const managementClient = require("../modules/managementClient");
+const supervisorState = require("../modules/supervisorState");
 const { EmbedBuilder } = require("discord.js");
 const sessionLogger = require("../modules/sessionLogger");
 
@@ -56,6 +57,22 @@ module.exports = {
         maxSends: 3,             // start sends per reboot attempt
         bootTimeoutMs: 1200000,  // 20 min for a boot that took, counted from its send
     },
+
+    // Warm reboot of a server that starts through the standby supervisor (modules/supervisorState).
+    // config.json scheduler.rebootScheduler.supervisor.warmReboot: false turns the warm path off;
+    // the uptime and restart checks still read state.json.
+    supervisorTiming: {
+        prepareSeconds: 180,          // `supervisor warm-reboot` this long before the end of the countdown
+        preSaveSeconds: [30, 5],      // extra saves before `now`, so the old JVM's save at its stop is small
+        preSaveTimeoutMs: 20000,      // management save budget of each extra save
+        pollMs: 3000,                 // state.json read interval while a warm reboot runs
+        acceptMs: 30000,              // phase still live and no new boot this long after `now`: refused or no answer
+        stopTimeoutSeconds: 300,      // the supervisor's default stopTimeoutSeconds
+        coldBootSecondsDefault: 600,  // when state.json has no cold boot time yet
+    },
+
+    // serverId -> the warm reboot plan of the running attempt (warmRebootPlan).
+    warmPlans: new Map(),
 
     // Enhanced state tracking with thread-safe operations
     state: {
@@ -335,12 +352,44 @@ module.exports = {
      * always from the same panel snapshot.
      */
     getConfirmedUptimeHours: async function (serverId) {
+        const st = await this.effectiveStatus(serverId);
+        if (st.state !== 'running') return null;
+        if (typeof st.uptimeMs !== 'number') return null;
+        return Math.floor(st.uptimeMs / (1000 * 3600));
+    },
+
+    /**
+     * Power state and uptime of the Minecraft server from one getStatus read. A server that runs
+     * through the standby supervisor reboots inside its container (warm reboot, crash restore,
+     * cold reboot), and Wings stays running with the container's uptime. While Wings says
+     * running, such a server's state.json gives the state (a boot phase reads as 'starting')
+     * and the uptime (time since the last boot, if shorter than the container's). With no
+     * fresh state.json, or Wings not running, the Wings reading stands.
+     * @returns {Promise<{state: string, uptimeMs: (number|undefined), supervisor: (object|null)}>}
+     */
+    effectiveStatus: async function (serverId) {
         const st = await pterodactyl.getStatus(serverId);
-        const state = st && st.attributes && st.attributes.current_state;
-        if (state !== 'running') return null;
-        const ms = st.attributes.resources && st.attributes.resources.uptime;
-        if (typeof ms !== 'number') return null;
-        return Math.floor(ms / (1000 * 3600));
+        const attrs = (st && st.attributes) || {};
+        const result = {
+            state: attrs.current_state || 'unknown',
+            uptimeMs: attrs.resources ? attrs.resources.uptime : undefined,
+            supervisor: null,
+        };
+        if (result.state !== 'running') return result;
+        const sup = await supervisorState.current(serverId);
+        if (!sup) return result;
+        const v = supervisorState.view(sup);
+        result.supervisor = sup;
+        result.state = v.state;
+        if (v.sinceBootMs !== null) {
+            result.uptimeMs = typeof result.uptimeMs === 'number' ? Math.min(result.uptimeMs, v.sinceBootMs) : v.sinceBootMs;
+        }
+        return result;
+    },
+
+    /** "phase=live lastBoot=crash-restore bootCount=4" for a log line, or '' without supervisor info. */
+    supervisorNote: function (sup) {
+        return sup ? ` (supervisor phase=${sup.phase} lastBoot=${sup.lastBoot.kind || '?'} bootCount=${sup.bootCount})` : '';
     },
 
     /**
@@ -351,15 +400,21 @@ module.exports = {
      * This holds for vote and staff reboots too: the restart they asked for has already happened.
      * (evol #3 2026-10-11: a vote reboot sent its stop 7 s after an external restart, waited out
      * the boot, then force-killed the fresh server with players on it.)
+     * On a supervisor server a reboot inside the container counts too: a crash restore, a warm or
+     * cold reboot someone else started (effectiveStatus).
      */
     restartedSince: async function (server, sinceMs) {
         try {
-            const st = await pterodactyl.getStatus(server.serverId);
-            const state = st && st.attributes && st.attributes.current_state;
-            if (state === 'starting') return true;
-            if (state !== 'running') return false;
-            const ms = st.attributes.resources && st.attributes.resources.uptime;
-            return typeof ms === 'number' && ms > 0 && ms < Date.now() - sinceMs;
+            const st = await this.effectiveStatus(server.serverId);
+            let restarted = false;
+            if (st.state === 'starting') restarted = true;
+            else if (st.state === 'running') {
+                restarted = typeof st.uptimeMs === 'number' && st.uptimeMs > 0 && st.uptimeMs < Date.now() - sinceMs;
+            }
+            if (restarted && st.supervisor) {
+                sessionLogger.info('RebootScheduler', `[${server.name}] Rebooted inside its container${this.supervisorNote(st.supervisor)}`);
+            }
+            return restarted;
         } catch (e) {
             sessionLogger.warn('RebootScheduler',
                 `[${server.name}] Restart check failed (${e.message}), proceeding`);
@@ -421,7 +476,22 @@ module.exports = {
         // Check uptime for all servers using simple REST API (original working approach)
         const uptimePromises = servers.map(async (server) => {
             try {
-                const uptimeHours = await pterodactyl.getServerUptime(server.serverId);
+                let uptimeHours = await pterodactyl.getServerUptime(server.serverId);
+                // Above 0 means Wings says running, so state.json is current. A reboot inside
+                // the container (warm reboot, crash restore) lowers the uptime.
+                if (uptimeHours > 0) {
+                    const sup = await supervisorState.current(server.serverId);
+                    if (sup) {
+                        const v = supervisorState.view(sup);
+                        const supHours = v.state !== 'running' ? 0
+                            : v.sinceBootMs !== null ? Math.floor(v.sinceBootMs / (1000 * 3600)) : uptimeHours;
+                        if (supHours < uptimeHours) {
+                            sessionLogger.info('RebootScheduler',
+                                `${server.name}: container up ${uptimeHours}h, server up ${supHours}h${this.supervisorNote(sup)}`);
+                            uptimeHours = supHours;
+                        }
+                    }
+                }
                 return { server, uptimeHours };
             } catch (error) {
                 sessionLogger.error('RebootScheduler', `Error checking uptime for ${server.name}:`, error.message);
@@ -1036,6 +1106,7 @@ module.exports = {
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             sessionLogger.info('RebootScheduler', `[${server.name}] Reboot attempt ${attempt}/${maxRetries}`);
             const attemptStartedAt = Date.now();
+            let warmDone = false;
             try {
                 // A retry on a server that is already offline has no players to warn and nothing
                 // to stop, so it goes straight to the start. Before this, a start that did not take
@@ -1044,11 +1115,17 @@ module.exports = {
                     sessionLogger.info('RebootScheduler',
                         `[${server.name}] Server is offline on retry: skipping warnings and stop, starting now`);
                 } else {
+                    // A supervisor server reboots inside its container at the end of the countdown.
+                    // The countdown sends `supervisor warm-reboot` prepareSeconds before its end.
+                    const warm = await this.warmRebootPlan(server);
+                    if (warm) this.warmPlans.set(server.serverId, warm);
+
                     // Warning window also honors a cancel request: returning false means a
                     // staff member cancelled mid-countdown — abort without stopping the server.
                     const warned = await this.executeRebootWarningsEnhanced(server, opts);
                     if (warned === false) {
                         sessionLogger.warn('RebootScheduler', `[${server.name}] Reboot cancelled before stop`);
+                        await this.cancelWarmPrep(server);
                         this.stateOperations.removeActiveReboot(server.serverId);
                         return { success: false, reason: 'cancelled' };
                     }
@@ -1060,14 +1137,18 @@ module.exports = {
                         // its end, and a cancel stamp only matches a doc whose fireAt is still ahead —
                         // this one's isn't, so left alone it stays open and the proxy keeps the bar up.
                         this.finishRebootEvent(server.serverId);
+                        await this.cancelWarmPrep(server);
                         await this.sendFreshRestartCancelNotice(server);
                         return { success: true, reason: 'recently_restarted', skipped: true };
                     }
                     this.finishRebootEvent(server.serverId);
-                    const stoppedResult = await this.ensureServerStopped(server,
-                        { checkFreshUptime: !opts.scheduled, since: attemptStartedAt });
+                    const stopOpts = { checkFreshUptime: !opts.scheduled, since: attemptStartedAt };
+                    const stoppedResult = warm
+                        ? await this.warmRebootServer(server, warm, stopOpts)
+                        : await this.ensureServerStopped(server, stopOpts);
                     if (stoppedResult === 'skipped') {
                         // Server bounced during the save flush — same handling as the post-warning checkpoint.
+                        await this.cancelWarmPrep(server);
                         await this.sendFreshRestartCancelNotice(server);
                         return { success: true, reason: 'recently_restarted', skipped: true };
                     }
@@ -1075,6 +1156,7 @@ module.exports = {
                         // Someone else restarted it during this attempt. The reboot already happened,
                         // so release the lock without stopping it again. Scheduled reboots leave the
                         // daily stats alone.
+                        await this.cancelWarmPrep(server);
                         this.stateOperations.markServerCompleted(server.serverId);
                         if (!opts.scheduled) {
                             this.state.todayStats.skippedReboots = (this.state.todayStats.skippedReboots || 0) + 1;
@@ -1083,8 +1165,9 @@ module.exports = {
                         await this.sendFreshRestartCancelNotice(server);
                         return { success: true, reason: 'restarted_during_reboot', skipped: true };
                     }
+                    warmDone = stoppedResult === 'warm';
                 }
-                await this.startServerWithMonitoring(server);
+                if (!warmDone) await this.startServerWithMonitoring(server);
 
                 // Safety net: clear any reboot bossbar that survived into the fresh world
                 // (covers a save race), so rejoining players never see a stuck countdown bar.
@@ -1092,13 +1175,14 @@ module.exports = {
                     await pterodactyl.sendCommand(server.serverId, `bossbar remove ${rebootAlerts.BOSSBAR_ID}`).catch(() => {});
                 }
 
-                sessionLogger.info('RebootScheduler', `[${server.name}] Reboot completed successfully`);
+                sessionLogger.info('RebootScheduler', `[${server.name}] ${warmDone ? 'Warm reboot' : 'Reboot'} completed successfully`);
                 this.stateOperations.markServerCompleted(server.serverId);
                 if (!this.state.todayStats.successfulReboots) this.state.todayStats.successfulReboots = 0;
                 this.state.todayStats.successfulReboots++;
-                return { success: true };
+                return warmDone ? { success: true, warm: true } : { success: true };
 
             } catch (error) {
+                await this.cancelWarmPrep(server);
                 sessionLogger.error('RebootScheduler', `[${server.name}] Attempt ${attempt} failed: ${error.message}`);
                 // This attempt's countdown doc dies with the attempt. recordRebootEvent runs at every
                 // entry into the warning window and its 60s dedupe cannot cover a window that threw at
@@ -1110,6 +1194,8 @@ module.exports = {
                     sessionLogger.info('RebootScheduler', `[${server.name}] Waiting ${delay/1000}s before retry...`);
                     await functions.sleep(delay);
                 }
+            } finally {
+                this.warmPlans.delete(server.serverId);
             }
         }
 
@@ -1331,6 +1417,11 @@ module.exports = {
         const saveAtSeconds = Math.ceil(saveWaitMs / 1000);
         let saveStarted = false;
 
+        // A supervisor server gets `supervisor warm-reboot` this long before the end, so a
+        // reboot-only standby can park before the handover (executeFullServerReboot sets the plan).
+        const warmPlan = this.warmPlans.get(server.serverId);
+        const prepAtSeconds = warmPlan ? this.supervisorTiming.prepareSeconds : 0;
+
         sessionLogger.info('RebootScheduler',
             `[${serverName}] Reboot warnings: version=${version || 'unknown'} window=${warnMin}min` +
             `${dryRun ? ' (DRY RUN)' : ''}`);
@@ -1370,6 +1461,11 @@ module.exports = {
                 this.preStopSaves.set(server.serverId, this.preStopSave(server, saveWaitMs));
             }
 
+            if (warmPlan && !warmPlan.prepared && !warmPlan.prepareTried && secondsLeft <= prepAtSeconds) {
+                await this.prepareWarmReboot(server, warmPlan);
+            }
+            if (warmPlan) this.warmPreSave(server, warmPlan, secondsLeft);
+
             // Milestone announcements (skip ones inside the per-second window, except the initial).
             for (const m of announceAt) {
                 if (secondsLeft <= m && !doneMilestones.has(m)) {
@@ -1406,7 +1502,8 @@ module.exports = {
             } else {
                 const nextMilestone = announceAt.filter(m => m < secondsLeft).sort((a, b) => b - a)[0] || 0;
                 const saveAt = saveWaitMs > 0 && !saveStarted && saveAtSeconds < secondsLeft ? saveAtSeconds : 0;
-                const target = Math.max(FINAL, nextMilestone, saveAt);
+                const prepAt = warmPlan && !warmPlan.prepareTried && prepAtSeconds < secondsLeft ? prepAtSeconds : 0;
+                const target = Math.max(FINAL, nextMilestone, saveAt, prepAt);
                 sleepMs = Math.min(5000, Math.max(1000, (secondsLeft - target) * 1000));
             }
             await functions.sleep(sleepMs);
@@ -1433,7 +1530,173 @@ module.exports = {
      */
     ensureServerStopped: async function (server, opts = {}) {
         const ac = this.getAlertConfig();
+        await this.awaitPreStopSave(server, ac);
 
+        if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
+            return 'skipped';
+        }
+
+        // Every path, vote and staff included: do not stop a server that someone else restarted
+        // after this attempt began (see restartedSince). The caller does the bookkeeping.
+        if (opts.since && await this.restartedSince(server, opts.since)) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Restarted by someone else during this reboot; not stopping it again`);
+            return 'restarted';
+        }
+
+        return this.stopViaPanel(server, ac);
+    },
+
+    /**
+     * The stop step of a supervisor server (warmRebootPlan): the save wait and the restart checks
+     * of ensureServerStopped, then `supervisor warm-reboot now`. The Wings container keeps running.
+     * Returns 'warm' when the supervisor brought the server back, 'skipped' or 'restarted' as
+     * ensureServerStopped does. When the supervisor refuses, does not answer or times out, the
+     * server is stopped over the panel as before and true is returned; the caller then starts it.
+     */
+    warmRebootServer: async function (server, plan, opts = {}) {
+        const ac = this.getAlertConfig();
+        await this.awaitPreStopSave(server, ac);
+
+        if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
+            return 'skipped';
+        }
+        if (opts.since && await this.restartedSince(server, opts.since)) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Restarted by someone else during this reboot; not rebooting it again`);
+            return 'restarted';
+        }
+
+        const outcome = await this.triggerWarmReboot(server, plan);
+        if (outcome.done) return 'warm';
+        sessionLogger.warn('RebootScheduler',
+            `[${server.name}] Warm reboot ${outcome.reason}; panel stop and start instead`);
+        return this.stopViaPanel(server, ac);
+    },
+
+    /**
+     * The warm reboot plan of one attempt, or null for the panel stop and start. One read of
+     * state.json, past the detection cache, so a server switched to the supervisor is seen at
+     * its next reboot. Pack updates do not come here: they keep the panel path.
+     */
+    warmRebootPlan: async function (server) {
+        const cfg = this.runtimeConfig && this.runtimeConfig.supervisor;
+        if (cfg && cfg.warmReboot === false) return null;
+        const sup = await supervisorState.read(server.serverId);
+        if (!supervisorState.isWarmMode(sup)) return null;
+        if (!supervisorState.isFresh(sup)) {
+            sessionLogger.warn('RebootScheduler',
+                `[${server.name}] Supervisor state.json is stale (${Math.round((Date.now() - sup.updatedAtMs) / 1000)}s); panel stop and start`);
+            return null;
+        }
+        sessionLogger.info('RebootScheduler',
+            `[${server.name}] Supervisor mode=${sup.mode}: warm reboot at the end of the countdown`);
+        return { mode: sup.mode, prepared: false, prepareTried: false, triggered: false, savedAt: new Set(), lastSave: null };
+    },
+
+    /**
+     * The extra saves of a warm reboot (supervisorTiming.preSaveSeconds), the same save as the
+     * T-90 s one (preStopSave: management protocol, else save-all). Not awaited here, so the
+     * countdown keeps its pace. Each save starts after the one before has ended, and
+     * triggerWarmReboot waits for the last one before `now`. A short window that skips past a
+     * mark gives one save, not several.
+     */
+    warmPreSave: function (server, plan, secondsLeft) {
+        const due = this.supervisorTiming.preSaveSeconds.filter(s => secondsLeft <= s && !plan.savedAt.has(s));
+        if (!due.length) return;
+        due.forEach(s => plan.savedAt.add(s));
+        const timeoutMs = this.supervisorTiming.preSaveTimeoutMs;
+        plan.lastSave = Promise.resolve(plan.lastSave).then(() => this.preStopSave(server, timeoutMs));
+    },
+
+    /** `supervisor warm-reboot`: a reboot-only standby boots now. Harmless in the other modes. */
+    prepareWarmReboot: async function (server, plan) {
+        plan.prepareTried = true;
+        plan.prepared = await this.sendSupervisorCommand(server, 'supervisor warm-reboot');
+    },
+
+    /**
+     * `supervisor warm-reboot cancel` when this attempt sent `supervisor warm-reboot` and not yet
+     * `now`. A reboot-only standby is aborted, so it does not hold its memory. Never throws.
+     */
+    cancelWarmPrep: async function (server) {
+        const plan = this.warmPlans.get(server.serverId);
+        if (!plan || !plan.prepared || plan.triggered) return;
+        plan.prepared = false;
+        await this.sendSupervisorCommand(server, 'supervisor warm-reboot cancel');
+    },
+
+    /** One console command to the supervisor. Returns false when the send failed. */
+    sendSupervisorCommand: async function (server, command) {
+        try {
+            await pterodactyl.sendCommand(server.serverId, command);
+            sessionLogger.info('RebootScheduler', `[${server.name}] Sent: ${command}`);
+            return true;
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `[${server.name}] ${command} failed: ${error.message}`);
+            return false;
+        }
+    },
+
+    /**
+     * Sends `supervisor warm-reboot now` and reads state.json every pollMs until the server is
+     * live again (supervisorState.rebootDone). Gives up when the phase is still live with no new
+     * boot after acceptMs (refused or no answer), when the supervisor stops, or after the last
+     * cold boot time plus stopTimeoutSeconds.
+     * @returns {Promise<{done: boolean, reason: (string|undefined)}>} done false: the server may
+     *   still run, and the caller stops it over the panel.
+     */
+    triggerWarmReboot: async function (server, plan) {
+        const t = this.supervisorTiming;
+        if (!plan.prepared) await this.prepareWarmReboot(server, plan);
+        if (plan.lastSave) await plan.lastSave;
+
+        const before = await supervisorState.read(server.serverId);
+        if (!supervisorState.isFresh(before) || !supervisorState.canWarmReboot(before)) {
+            const what = !before ? 'unreadable'
+                : `mode=${before.mode} phase=${before.phase}${supervisorState.isFresh(before) ? '' : ' stale'}`;
+            return { done: false, reason: `not started (state.json ${what})` };
+        }
+
+        const sentAt = Date.now();
+        try {
+            await pterodactyl.sendCommand(server.serverId, 'supervisor warm-reboot now');
+        } catch (error) {
+            return { done: false, reason: `not started (command failed: ${error.message})` };
+        }
+        plan.triggered = true;
+        const coldSeconds = supervisorState.coldBootSeconds(before) || t.coldBootSecondsDefault;
+        const timeoutMs = (coldSeconds + t.stopTimeoutSeconds) * 1000;
+        sessionLogger.info('RebootScheduler',
+            `[${server.name}] Sent: supervisor warm-reboot now (mode=${before.mode}, bootCount=${before.bootCount}, timeout ${Math.round(timeoutMs / 1000)}s)`);
+
+        let accepted = false;
+        while (Date.now() - sentAt < timeoutMs) {
+            await functions.sleep(t.pollMs);
+            const now = await supervisorState.read(server.serverId);
+            if (!now) continue;
+            if (supervisorState.rebootDone(now, before)) {
+                sessionLogger.info('RebootScheduler',
+                    `[${server.name}] Back up after ${Math.round((Date.now() - sentAt) / 1000)}s inside the container` +
+                    `${this.supervisorNote(now)}${now.lastBoot.fallback ? ` fallback=${JSON.stringify(now.lastBoot.fallback)}` : ''}`);
+                return { done: true };
+            }
+            if (now.phase === 'stopping') return { done: false, reason: 'stopped: the supervisor is shutting down' };
+            if (now.phase !== 'live' || now.bootCount !== before.bootCount
+                || now.supervisorStartedAtMs !== before.supervisorStartedAtMs) {
+                accepted = true;
+            }
+            if (!accepted && Date.now() - sentAt >= t.acceptMs) {
+                return { done: false, reason: `refused or no answer (phase live, bootCount ${now.bootCount} after ${Math.round(t.acceptMs / 1000)}s)` };
+            }
+        }
+        return { done: false, reason: `timed out after ${Math.round(timeoutMs / 1000)}s` };
+    },
+
+    /**
+     * The pre-stop save of every reboot path, before any stop, kill or warm reboot.
+     */
+    awaitPreStopSave: async function (server, ac = this.getAlertConfig()) {
         // Hard guarantee for EVERY reboot path (daily batch, scheduled, vote): flush the world and
         // give it time to finish BEFORE any stop/kill. save-all is async on the backend, so the
         // wait — not the command — is what lets a slow modded save (PRI-class worlds) reach disk.
@@ -1457,19 +1720,13 @@ module.exports = {
                 }
             }
         }
+    },
 
-        if (opts.checkFreshUptime && await this.maybeSkipRecentlyRestarted(server)) {
-            return 'skipped';
-        }
-
-        // Every path, vote and staff included: do not stop a server that someone else restarted
-        // after this attempt began (see restartedSince). The caller does the bookkeeping.
-        if (opts.since && await this.restartedSince(server, opts.since)) {
-            sessionLogger.warn('RebootScheduler',
-                `[${server.name}] Restarted by someone else during this reboot; not stopping it again`);
-            return 'restarted';
-        }
-
+    /**
+     * Panel stop until Wings says offline: the graceful stop, then a kill once the JVM is idle.
+     * Returns true; throws when three stop attempts did not bring the server offline.
+     */
+    stopViaPanel: async function (server, ac = this.getAlertConfig()) {
         const stopGraceMs = (ac.stopGraceSeconds != null ? ac.stopGraceSeconds : 120) * 1000;
         const maxStopAttempts = 3;
 

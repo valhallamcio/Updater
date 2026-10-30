@@ -14,6 +14,8 @@ const { WebSocketServer } = require('ws');
 const managementClient = require('../modules/managementClient');
 const rs = require('../schedulers/rebootScheduler');
 const pterodactyl = require('../modules/pterodactyl');
+// No standby supervisor on these servers: state.json reads find no file and never reach the panel.
+pterodactyl.readFileOnce = async () => null;
 const functions = require('../modules/functions');
 const sessionLogger = require('../modules/sessionLogger');
 const config = require('../config/config.json');

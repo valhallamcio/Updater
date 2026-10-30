@@ -14,6 +14,8 @@ const assert = require('node:assert');
 const rs = require('../schedulers/rebootScheduler');
 const mongo = require('../modules/mongo');
 const pterodactyl = require('../modules/pterodactyl');
+// No standby supervisor on these servers: state.json reads find no file and never reach the panel.
+pterodactyl.readFileOnce = async () => null;
 const functions = require('../modules/functions');
 const yggdrasil = require('../modules/yggdrasil');
 const rebootCancel = require('../discord/commands/reboot-cancel');
