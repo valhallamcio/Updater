@@ -80,7 +80,10 @@ async function fetchHistory(cfg, deps = {}) {
     const end = nowSec - (nowSec % step);
     const start = end - cfg.lookbackDays * 86400;
     const url = `${String(cfg.prometheusUrl).replace(/\/$/, '')}/api/v1/query_range`;
-    const response = await get(url, { params: { query: cfg.query, start, end, step }, timeout: 30000 });
+    // the read-only proxy on new-lithium (valhalla-monitoring prom-ro) wants this bearer; plain Prometheus ignores it
+    const token = process.env.PROMETHEUS_RO_TOKEN;
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const response = await get(url, { params: { query: cfg.query, start, end, step }, headers, timeout: 30000 });
     const body = response && response.data;
     if (!body || body.status !== 'success' || !body.data || body.data.resultType !== 'matrix') {
         throw new Error(`Prometheus answered ${body && body.status ? body.status : 'nothing usable'}`);
