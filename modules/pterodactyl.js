@@ -681,8 +681,11 @@ module.exports = {
      * @param {number} interval Interval in seconds to check the server status. Default interval is 3 seconds.
      * @param {number} preSaveWaitSeconds save-all then idle this long before stopping, so a slow modded
      *                                     world finishes flushing to disk before the stop/kill. Default 90s; 0 disables.
+     * @param {object} [opts] holdKill: async () => a reason not to kill yet, or null (a standby
+     *                        supervisor that boots or stops a JVM); it can hold the kill for up to
+     *                        holdMaxSeconds (default 1200) of kill wait.
      */
-    shutdown: async function (serverID, timeToKill = 30, interval = 3, preSaveWaitSeconds = 90) {
+    shutdown: async function (serverID, timeToKill = 30, interval = 3, preSaveWaitSeconds = 90, opts = {}) {
         // Flush the world and let it settle BEFORE the stop. shutdown() force-kills an idling server
         // after timeToKill, so without this an in-flight modded save could be truncated.
         if (preSaveWaitSeconds > 0) {
@@ -737,7 +740,12 @@ module.exports = {
                         // update (or a server wedged at high CPU) forever.
                         const idle = state !== 'unknown' && cpu < 10;
                         const capped = killWaitSeconds >= killHardCapSeconds;
-                        if (idle || capped) {
+                        let held = null;
+                        if ((idle || capped) && opts.holdKill && killWaitSeconds < (opts.holdMaxSeconds || 1200)) {
+                            held = await Promise.resolve(opts.holdKill()).catch(() => null);
+                            if (held) sessionLogger.info('Pterodactyl', `${serverID}: ${held}, no kill yet`);
+                        }
+                        if ((idle || capped) && !held) {
                             progressBar.update(1);
                             sessionLogger.info('Pterodactyl',
                                 idle ? 'Server is idling. Killing it...' : 'Kill grace exhausted. Killing it...');

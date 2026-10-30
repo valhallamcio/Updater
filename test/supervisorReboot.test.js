@@ -47,6 +47,7 @@ let wings;    // Wings power state
 let sim;      // the fake supervisor, or null (no state.json)
 let started;  // startServerWithMonitoring calls
 let onSleep;  // hook run after each fake sleep
+let supervisorJson; // the server's supervisor.json, or null (no file: the supervisor defaults)
 
 /**
  * A state.json in schema 1, up since 12 h ago after a cold boot of 80 s, with an unknown field.
@@ -119,7 +120,12 @@ beforeEach(() => {
         if (sim) sim.onCommand(cmd);
         return { success: true };
     };
-    pterodactyl.readFileOnce = async () => { reads++; return sim ? sim.read() : null; };
+    supervisorJson = null;
+    pterodactyl.readFileOnce = async (id, path) => {
+        if (path === 'supervisor.json') return supervisorJson ? Buffer.from(JSON.stringify(supervisorJson)) : null;
+        reads++;
+        return sim ? sim.read() : null;
+    };
     pterodactyl.getStatus = async () => ({
         attributes: { current_state: wings, resources: { uptime: 12 * HOUR + (clock - T0), cpu_absolute: 0 } },
     });
@@ -361,17 +367,71 @@ test('fallback: phase still live 30 s after now (refused or no answer) gives the
     assert.ok(warnings.some(w => /refused or no answer/.test(w)));
 });
 
-test('fallback: a handover that never comes back times out at the cold boot plus 300 s', async () => {
+test('fallback: a handover that never comes back times out at the supervisor worst case', async () => {
     sim = supervisor({ hang: true });
 
     const result = await rs.executeFullServerReboot(SERVER, 'node', SCHEDULED_5MIN);
 
     assert.deepStrictEqual(result, { success: true });
+    // park wait 180 + stop 300 + takeover 300 (supervisor defaults) + cold boot 80 + margin 60
     const now = at('supervisor warm-reboot now');
     const stop = actions.find(a => a.action === 'stop');
-    assert.ok(stop.at - now >= 380000 && stop.at - now <= 384000, `stop ${(stop.at - now) / 1000}s after now`);
+    assert.ok(stop.at - now >= 920000 && stop.at - now <= 924000, `stop ${(stop.at - now) / 1000}s after now`);
     assert.strictEqual(started, 1);
-    assert.ok(warnings.some(w => /timed out after 380s/.test(w)));
+    assert.ok(warnings.some(w => /timed out after 920s/.test(w)));
+});
+
+test('the warm wait takes its timeouts from the server\'s supervisor.json', async () => {
+    sim = supervisor({ hang: true });
+    supervisorJson = { mode: 'always-image', stopTimeoutSeconds: 100, takeoverTimeoutSeconds: 50, parkWaitSeconds: 10, other: true };
+
+    await rs.executeFullServerReboot(SERVER, 'node', SCHEDULED_5MIN);
+
+    assert.ok(warnings.some(w => /timed out after 300s/.test(w)), warnings.join(' | '));
+});
+
+test('batch: a crash restore 2 h ago skips the daily reboot before the countdown', async () => {
+    sim = supervisor({ events: [{ at: T0, state: () => ({
+        bootCount: 2,
+        lastBoot: { kind: 'crash-restore', trigger: 'crash', startedAt: iso(T0 - 2 * HOUR), readyAt: iso(T0 - 2 * HOUR + 15000), seconds: 15, fallback: null },
+        live: { pid: 81, startedAt: iso(T0 - 9 * HOUR), readyAt: iso(T0 - 2 * HOUR + 15000), via: 'restore', bootSeconds: null },
+    }) }] });
+
+    const result = await rs.executeFullServerReboot(SERVER, 'node');
+
+    assert.deepStrictEqual(result, { success: true, reason: 'recently_restarted', skipped: true });
+    assert.deepStrictEqual(commands, [], 'no countdown, no supervisor command');
+    assert.deepStrictEqual(actions, []);
+});
+
+// --- the panel kill ---
+
+test('forceKillWhenIdle: no kill while the supervisor stops, even at low CPU', async () => {
+    let stopping = true;
+    sim = { read: () => Buffer.from(JSON.stringify(fixture({ phase: stopping ? 'stopping' : 'live' }))), onCommand() {} };
+    wings = 'stopping';
+    onSleep = () => { if (clock - T0 >= 200000) wings = 'offline'; };
+
+    const stoppedAlone = await rs.forceKillWhenIdle(SERVER, rs.getAlertConfig());
+
+    assert.strictEqual(stoppedAlone, true);
+    assert.deepStrictEqual(actions, [], 'the CPU was idle and the 120 s grace passed, but the supervisor was stopping');
+});
+
+test('forceKillWhenIdle: a stale state.json or a phase past the hold gives the kill as before', async () => {
+    sim = { read: () => Buffer.from(JSON.stringify(fixture({ phase: 'stopping', updatedAgoMs: 10 * 60000 }))), onCommand() {} };
+    wings = 'stopping';
+    await rs.forceKillWhenIdle(SERVER, rs.getAlertConfig());
+    assert.deepStrictEqual(actions.map(a => [a.action, a.at - T0]), [['kill', 0]], 'stale: idle kill at once');
+
+    actions = [];
+    clock = T0;
+    supervisorState.forget();
+    sim = { read: () => Buffer.from(JSON.stringify(fixture({ phase: 'takeover' }))), onCommand() {} };
+    wings = 'running';
+    await rs.forceKillWhenIdle(SERVER, rs.getAlertConfig());
+    assert.strictEqual(actions.length, 1);
+    assert.ok(actions[0].at - T0 >= rs.supervisorTiming.killHoldMaxSeconds * 1000, 'killed only after the hold max');
 });
 
 test('panel path: a stale state.json, mode off, no file or warmReboot false send no supervisor command', async () => {

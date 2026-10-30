@@ -68,8 +68,11 @@ module.exports = {
         preSaveTimeoutMs: 20000,      // management save budget of each extra save
         pollMs: 3000,                 // state.json read interval while a warm reboot runs
         acceptMs: 30000,              // phase still live and no new boot this long after `now`: refused or no answer
-        stopTimeoutSeconds: 300,      // the supervisor's default stopTimeoutSeconds
+        // The wait for `now` is the supervisor's worst case: park wait + stop + takeover (each from
+        // its supervisor.json, supervisorState.readTimeouts) + the last cold boot + this margin.
+        marginSeconds: 60,
         coldBootSecondsDefault: 600,  // when state.json has no cold boot time yet
+        killHoldMaxSeconds: 1200,     // longest a booting or stopping supervisor holds off a panel kill
     },
 
     // serverId -> the warm reboot plan of the running attempt (warmRebootPlan).
@@ -1754,8 +1757,8 @@ module.exports = {
     /**
      * Sends `supervisor warm-reboot now` and reads state.json every pollMs until the server is
      * live again (supervisorState.rebootDone). Gives up when the phase is still live with no new
-     * boot after acceptMs (refused or no answer), when the supervisor stops, or after the last
-     * cold boot time plus stopTimeoutSeconds.
+     * boot after acceptMs (refused or no answer), when the supervisor stops, or after the
+     * supervisor's worst case: park wait, stop, takeover, the last cold boot and a margin.
      * @returns {Promise<{done: boolean, reason: (string|undefined)}>} done false: the server may
      *   still run, and the caller stops it over the panel.
      */
@@ -1779,7 +1782,8 @@ module.exports = {
         }
         plan.triggered = true;
         const coldSeconds = supervisorState.coldBootSeconds(before) || t.coldBootSecondsDefault;
-        const timeoutMs = (coldSeconds + t.stopTimeoutSeconds) * 1000;
+        const sup = await supervisorState.readTimeouts(server.serverId);
+        const timeoutMs = (sup.parkWaitSeconds + sup.stopTimeoutSeconds + sup.takeoverTimeoutSeconds + coldSeconds + t.marginSeconds) * 1000;
         sessionLogger.info('RebootScheduler',
             `[${server.name}] Sent: supervisor warm-reboot now (mode=${before.mode}, bootCount=${before.bootCount}, timeout ${Math.round(timeoutMs / 1000)}s)`);
 
@@ -1934,14 +1938,21 @@ module.exports = {
      * NOTE: pterodactyl.getStatus() returns current_state:'unknown' + cpu_absolute:0 on an API error.
      * We must NOT read that as "idle" and kill — an API blip during a save would then corrupt the
      * world. Only a CONFIRMED known state with a real low CPU triggers the idle kill.
+     *
+     * A supervisor server whose fresh state.json shows a boot, takeover or stopping phase is not
+     * killed: CPU says nothing about a save in one of two JVMs, and a refused restore can turn
+     * into a cold boot during this wait. The supervisor's own timeouts end a hang. The hold lasts
+     * up to supervisorTiming.killHoldMaxSeconds; a stale file ends it at once.
      */
     forceKillWhenIdle: async function (server, ac = this.getAlertConfig()) {
         const idleCpu = ac.killIdleCpuPercent != null ? ac.killIdleCpuPercent : 20;
         const maxWaitMs = (ac.killIdleMaxWaitSeconds != null ? ac.killIdleMaxWaitSeconds : 120) * 1000;
+        const holdMaxMs = this.supervisorTiming.killHoldMaxSeconds * 1000;
         const pollMs = 5000;
         const start = Date.now();
+        let held = null;
 
-        while (Date.now() - start < maxWaitMs) {
+        while (Date.now() - start < maxWaitMs || (held && Date.now() - start < holdMaxMs)) {
             const status = await pterodactyl.getStatus(server.serverId); // returns a safe default on error
             const state = status && status.attributes && status.attributes.current_state;
             const cpu = status && status.attributes && status.attributes.resources
@@ -1950,6 +1961,14 @@ module.exports = {
             if (state === 'offline') {
                 sessionLogger.info('RebootScheduler', `[${server.name}] Stopped on its own — no kill needed`);
                 return true;
+            }
+
+            held = await this.supervisorHoldsKill(server);
+            if (held) {
+                sessionLogger.info('RebootScheduler',
+                    `[${server.name}] Supervisor phase ${held}: no kill while it boots, takes over or stops`);
+                await functions.sleep(pollMs);
+                continue;
             }
 
             // 'unknown' == getStatus swallowed an API error (cpu is a meaningless 0); keep waiting.
@@ -1967,11 +1986,21 @@ module.exports = {
         }
 
         // Hard cap reached: server is wedged at high CPU (or status unreadable). Kill as last resort.
-        sessionLogger.warn('RebootScheduler',
-            `[${server.name}] Kill grace (${maxWaitMs / 1000}s) exhausted — force-killing`);
+        sessionLogger.warn('RebootScheduler', held
+            ? `[${server.name}] Supervisor still in phase ${held} after ${holdMaxMs / 1000}s — force-killing`
+            : `[${server.name}] Kill grace (${maxWaitMs / 1000}s) exhausted — force-killing`);
         await pterodactyl.sendPowerAction(server.serverId, 'kill')
             .catch(e => sessionLogger.error('RebootScheduler', `[${server.name}] kill failed: ${e.message}`));
         return false;
+    },
+
+    /**
+     * The phase of a supervisor that is booting, taking over or stopping a server JVM (fresh
+     * state.json), or null: no supervisor info, or a phase a kill cannot cut short.
+     */
+    supervisorHoldsKill: async function (server) {
+        const sup = await supervisorState.current(server.serverId);
+        return supervisorState.holdsKill(sup) ? sup.phase : null;
     },
 
     /**

@@ -101,7 +101,40 @@ function isWarmMode(state) {
  */
 function bootStartedAtMs(state) {
     const times = [state.lastBoot.startedAtMs, state.live.startedAtMs].filter(t => t !== null);
-    return times.length ? Math.max(...times) : null;
+    if (times.length) return Math.max(...times);
+    return state.lastBoot.readyAtMs;
+}
+
+/**
+ * The supervisor is booting, taking over or stopping a server JVM: a panel kill now could cut a
+ * world save or a boot. Its own timeouts (stopTimeoutSeconds, takeoverTimeoutSeconds) end a hang.
+ */
+function holdsKill(state) {
+    return !!state && (BOOT_PHASES.includes(state.phase) || state.phase === 'stopping');
+}
+
+/** The supervisor.json defaults (bifrost-lib docs/standby-supervisor.md). */
+const TIMEOUT_DEFAULTS = { stopTimeoutSeconds: 300, takeoverTimeoutSeconds: 300, parkWaitSeconds: 180 };
+
+/**
+ * The supervisor's own timeouts from supervisor.json in the server dir. A missing key, a missing
+ * or broken file, or a failed read gives the default of that key.
+ * @param {string} serverId Pterodactyl server id.
+ * @returns {Promise<{stopTimeoutSeconds: number, takeoverTimeoutSeconds: number, parkWaitSeconds: number}>}
+ */
+async function readTimeouts(serverId) {
+    const out = { ...TIMEOUT_DEFAULTS };
+    try {
+        const raw = await pterodactyl.readFileOnce(serverId, 'supervisor.json');
+        const doc = raw ? JSON.parse(raw.toString('utf8')) : null;
+        for (const key of Object.keys(out)) {
+            const v = doc && num(doc[key]);
+            if (v !== null && v !== undefined && v >= 0) out[key] = v;
+        }
+    } catch (_) {
+        // defaults
+    }
+    return out;
 }
 
 /** The ready time of the current server JVM, or null while it boots. */
@@ -212,9 +245,12 @@ module.exports = {
     WARM_MODES,
     STALE_MS,
     DETECT_TTL_MS,
+    TIMEOUT_DEFAULTS,
     parse,
     isFresh,
     isWarmMode,
+    holdsKill,
+    readTimeouts,
     view,
     readyAtMs,
     canWarmReboot,

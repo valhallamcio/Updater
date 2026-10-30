@@ -30,6 +30,7 @@ const {
     upload
 } = require('../modules/downloader');
 const pterodactyl = require('../modules/pterodactyl');
+const supervisorState = require('../modules/supervisorState');
 const unpacker = require('../modules/unpacker');
 const {
     unpack
@@ -253,11 +254,96 @@ async function startInstances(allServerIds, skip = []) {
  * @param {Object} sync Player sync client, injectable for tests.
  * @returns {Object} The freeze handle for playerSync.releaseFreeze or reseedAndRelease.
  */
-async function freezeAndShutdown(pack, allServerIds, freezeOpts, report, client = pterodactyl, sync = playerSync) {
+async function freezeAndShutdown(pack, allServerIds, freezeOpts, report, client = pterodactyl, sync = playerSync, sup = supervisorState) {
     const freeze = await sync.freezeGroup(allServerIds, { label: pack.tag, report, ...freezeOpts });
     await report(`\n- Shutting down ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`);
-    for (const sid of allServerIds) await client.shutdown(sid);
+    for (const sid of allServerIds) {
+        await client.shutdown(sid, undefined, undefined, undefined, { holdKill: () => supervisorHold(sid, sup) });
+        await dropStandbyImage(sid, report, client);
+    }
     return freeze;
+}
+
+/**
+ * Why a panel kill must wait on a standby supervisor server: its fresh state.json shows a boot,
+ * takeover or stopping phase (a save or a boot runs in one of its JVMs). Null otherwise.
+ */
+async function supervisorHold(serverId, sup = supervisorState) {
+    const state = await sup.current(serverId);
+    return sup.holdsKill(state) ? `supervisor phase ${state.phase}` : null;
+}
+
+/**
+ * Deletes the standby supervisor's image (standby/image*) of a stopped instance, so its next
+ * start boots cold from the files on disk. An image built before a pack deploy or a /restore
+ * could take over with a changed file unseen: root datapacks/ is outside the supervisor's input
+ * hash, and an archive keeps old mtimes. Runs for every update and restore, also one that
+ * aborts before the deploy: that start is then cold for nothing, which is safe. Never throws.
+ */
+async function dropStandbyImage(serverId, report, client = pterodactyl) {
+    try {
+        if (!await client.readFileOnce(serverId, 'standby/image.json')) return;
+        const names = (await client.listFiles(serverId, '/standby'))
+            .map(entry => entry && entry.name)
+            .filter(name => typeof name === 'string' && name.startsWith('image'));
+        if (names.length && await client.deleteFile(serverId, names, '/standby')) {
+            sessionLogger.info('UpdateManager', `${serverId}: dropped the standby image (${names.join(', ')}), so the next start is cold`);
+            return;
+        }
+        throw new Error(names.length ? 'the panel refused the delete' : 'standby/ could not be listed');
+    } catch (error) {
+        sessionLogger.warn('UpdateManager', `${serverId}: standby image not dropped: ${error.message}`);
+        await report(`\n- Warning: could not delete standby/image* on ${serverId} (${error.message}). Delete it before the next start, or that start can restore the old image.`);
+    }
+}
+
+/** Free space an instance's panel volume needs during an update, in pack sizes: the backup archive and the uploaded pack beside the old files. */
+const VOLUME_PACK_UNITS = 2;
+
+/** Size of a local file, or null when it cannot be read. */
+function fileSize(file) {
+    try {
+        return fs.statSync(file).size;
+    } catch (error) {
+        sessionLogger.warn('UpdateManager', `Could not read the size of ${file}: ${error.message}`);
+        return null;
+    }
+}
+
+/** Sum of the server-side file sizes of an FTB manifest (0 when it lists none). */
+function manifestBytes(manifest) {
+    return ((manifest && manifest.files) || [])
+        .filter(file => !file.clientonly)
+        .reduce((sum, file) => sum + (Number(file.size) || 0), 0);
+}
+
+/**
+ * The panel volume side of the disk check: the panel's disk limit minus what the volume holds
+ * now. Files outside the pack count too (worlds, backups, a standby image and its java: about
+ * 2.6 GB on evol). A volume with no limit, or one the panel gives no numbers for, passes.
+ * @param {number|null} packBytes The size of the new pack (zip, or the manifest total for FTB).
+ * @returns {Promise<string|null>} Error message if a volume is short, else null.
+ */
+async function checkVolumeSpace(packBytes, allServerIds, client = pterodactyl) {
+    if (!packBytes) {
+        sessionLogger.warn('UpdateManager', 'Volume check skipped: no pack size');
+        return null;
+    }
+    const gb = bytes => `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+    const need = packBytes * VOLUME_PACK_UNITS;
+    const short = [];
+    for (const sid of allServerIds) {
+        try {
+            const { limitBytes, usedBytes } = await client.getDiskSpace(sid);
+            if (!limitBytes) continue;
+            const free = limitBytes - usedBytes;
+            sessionLogger.info('UpdateManager', `Volume check ${sid}: ${gb(usedBytes)} of ${gb(limitBytes)} used, ~${gb(need)} needed`);
+            if (free < need) short.push(`${sid} has ${gb(free)} free of ${gb(limitBytes)}, ~${gb(need)} needed`);
+        } catch (error) {
+            sessionLogger.warn('UpdateManager', `Could not check the volume of ${sid}: ${error.message}`);
+        }
+    }
+    return short.length ? `Not enough space on the server volume: ${short.join('; ')}.` : null;
 }
 
 /**
@@ -530,6 +616,10 @@ module.exports = {
         deployMergedTree,
         instanceVaultPath,
         checkDiskSpace,
+        checkVolumeSpace,
+        manifestBytes,
+        dropStandbyImage,
+        supervisorHold,
         editProgress,
         findRemoteFile,
         awaitDecompressed,
@@ -645,7 +735,8 @@ module.exports = {
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        const diskError = checkDiskSpace(`./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`, allServerIds.length);
+        const packZip = `./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`;
+        const diskError = checkDiskSpace(packZip, allServerIds.length) || await checkVolumeSpace(fileSize(packZip), allServerIds);
         if (diskError) {
             progressLog += `\n\n**Aborting: ${diskError} Nothing was touched.**`;
             await editProgress(interaction, progressLog);
@@ -848,6 +939,13 @@ module.exports = {
         await sleep(5000);
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+
+        const volumeError = await checkVolumeSpace(manifestBytes(newManifest), allServerIds);
+        if (volumeError) {
+            progressLog += `\n\n**Aborting: ${volumeError} Nothing was touched.**`;
+            await editProgress(interaction, progressLog);
+            return;
+        }
 
         progressLog += ` Done!`;
         const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
@@ -1214,7 +1312,8 @@ module.exports = {
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        const diskError = checkDiskSpace(`./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`, allServerIds.length);
+        const packZip = `./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`;
+        const diskError = checkDiskSpace(packZip, allServerIds.length) || await checkVolumeSpace(fileSize(packZip), allServerIds);
         if (diskError) {
             progressLog += `\n\n**Aborting: ${diskError} Nothing was touched.**`;
             await editProgress(interaction, progressLog);
@@ -1523,7 +1622,8 @@ module.exports = {
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        const diskError = checkDiskSpace(`./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`, allServerIds.length);
+        const packZip = `./${pack.tag}/downloads/new/${pack.tag}_${newestVersion}.zip`;
+        const diskError = checkDiskSpace(packZip, allServerIds.length) || await checkVolumeSpace(fileSize(packZip), allServerIds);
         if (diskError) {
             progressLog += `\n\n**Aborting: ${diskError} Nothing was touched.**`;
             await editProgress(interaction, progressLog);
