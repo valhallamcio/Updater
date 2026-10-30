@@ -6,6 +6,7 @@ const functions = require("../modules/functions");
 const rebootAlerts = require("../modules/rebootAlerts");
 const managementClient = require("../modules/managementClient");
 const supervisorState = require("../modules/supervisorState");
+const quietSlots = require("../modules/quietSlots");
 const { EmbedBuilder } = require("discord.js");
 const sessionLogger = require("../modules/sessionLogger");
 
@@ -73,6 +74,12 @@ module.exports = {
 
     // serverId -> the warm reboot plan of the running attempt (warmRebootPlan).
     warmPlans: new Map(),
+
+    // Quietest-moment daily reboots (modules/quietSlots), config.json
+    // scheduler.rebootScheduler.quietSlots.enabled. Today's plan: { date, entries, started }.
+    quietPlan: null,
+    quietBusy: false,
+    quietTickMs: 30000,
 
     // Enhanced state tracking with thread-safe operations
     state: {
@@ -174,6 +181,11 @@ module.exports = {
         
         // Start the main monitoring loop
         setInterval(() => this.mainLoop(options), options.interval * 1000);
+        if (this.quietConfig().enabled) {
+            sessionLogger.info('RebootScheduler', 'Quiet slots on: each server with player history reboots at its quietest slot');
+            setInterval(() => this.quietTick().catch(error =>
+                sessionLogger.error('RebootScheduler', 'Quiet slot tick failed', error.message)), this.quietTickMs);
+        }
         // No separate first run: it was a setTimeout of the same interval, so tick one ran twice at once
     },
 
@@ -570,9 +582,12 @@ module.exports = {
         
         // earlyAccess is no longer an exclusion: supporter early-access instances (e.g. il2/mg2
         // SUP) are live, populated servers that need the same reboot rotation as everything else.
+        // A server with a quiet slot today reboots at that slot (quietTick), not in this batch.
+        const quiet = this.quietSlotServerIds();
         const initialEligibleServers = servers.filter(server =>
-            this.shouldRebootServer(server)
+            this.shouldRebootServer(server) && !quiet.has(server.serverId)
         );
+        if (quiet.size) sessionLogger.info('RebootScheduler', `${quiet.size} server(s) reboot at their quiet slot instead of this batch`);
         
         sessionLogger.info('RebootScheduler', `Initial eligible servers: ${initialEligibleServers.map(s => s.tag).join(', ')}`);
         
@@ -650,7 +665,25 @@ module.exports = {
         this.state.failedServers.clear();
         this.state.completedServers.clear();
         this.state.apiCallCount = 0;
-        
+
+        await this.runRebootBatches(this.state.rebootQueue, config);
+
+        sessionLogger.info('RebootScheduler',
+            `Reboot queue processing completed. API calls made: ${this.state.apiCallCount}`);
+
+        await this.completeRebootSequence();
+    },
+
+    /**
+     * Reboots a list of servers in batches: round-robin over the nodes, maxBatchSize per batch,
+     * serverRebootDelay between the servers of a batch, nodeRebootDelay between batches, and
+     * synced group instances one at a time (planSyncGroupStagger). The daily batch and the quiet
+     * slots both run through here.
+     * @param {Array} servers The servers to reboot.
+     * @param {object} config Runtime configuration.
+     * @param {object} [followerOpts] rebootSyncFollowers opts.
+     */
+    runRebootBatches: async function (servers, config = this.defaultConfig, followerOpts = {}) {
         // Discover nodes with error handling
         let realNodes = [];
         try {
@@ -666,14 +699,14 @@ module.exports = {
         
         // Simple round-robin server distribution
         const serverNodeMapping = new Map();
-        this.state.rebootQueue.forEach((server, index) => {
+        servers.forEach((server, index) => {
             const nodeIndex = index % realNodes.length;
             serverNodeMapping.set(server.serverId, realNodes[nodeIndex].id);
         });
-        
+
         // The batches run the first instance of each synced group. The others follow one at a
         // time once the one before is back up, so players can switch to a running instance.
-        const { queue, followers } = await this.planSyncGroupStagger(this.state.rebootQueue);
+        const { queue, followers } = await this.planSyncGroupStagger(servers);
         const staggered = [];
 
         // Process in smaller, manageable batches
@@ -709,7 +742,7 @@ module.exports = {
                     result = { success: false, reason: error.message };
                 }
                 const rest = followers.get(server.serverId);
-                if (rest) staggered.push(this.rebootSyncFollowers(server, result, rest, serverNodeMapping));
+                if (rest) staggered.push(this.rebootSyncFollowers(server, result, rest, serverNodeMapping, followerOpts));
                 return result;
             });
             
@@ -737,11 +770,91 @@ module.exports = {
             sessionLogger.info('RebootScheduler', `Waiting for the staggered reboots of ${staggered.length} sync group(s)`);
             await Promise.allSettled(staggered);
         }
+    },
 
-        sessionLogger.info('RebootScheduler', 
-            `Reboot queue processing completed. API calls made: ${this.state.apiCallCount}`);
-        
-        await this.completeRebootSequence();
+    /** quietSlots config from config.json scheduler.rebootScheduler.quietSlots, with defaults. */
+    quietConfig: function () {
+        return quietSlots.config(this.runtimeConfig && this.runtimeConfig.quietSlots);
+    },
+
+    /**
+     * Today's quiet slot plan for the servers the daily batch would reboot. A Prometheus failure
+     * gives a plan with no slots, so every server keeps the fixed batch.
+     * @param {string} day timeManager.getTodayDateString().
+     */
+    buildQuietPlan: async function (day, cfg = this.quietConfig()) {
+        const servers = (await yggdrasil.getServers()).filter(s => s && s.serverId && this.shouldRebootServer(s));
+        let history = null;
+        let error = null;
+        try {
+            history = await quietSlots.fetchHistory(cfg);
+        } catch (e) {
+            error = e.message;
+            sessionLogger.warn('RebootScheduler', `Quiet slots: Prometheus read failed (${e.message}); every server keeps the fixed batch today`);
+        }
+        const result = quietSlots.plan(servers, history, cfg, error);
+        quietSlots.format(result, cfg).split('\n').forEach(line => sessionLogger.info('RebootScheduler', line));
+        return { date: day, entries: result.entries, started: new Set() };
+    },
+
+    /** serverIds with a quiet slot in today's plan; empty when the feature is off or there is no plan. */
+    quietSlotServerIds: function () {
+        if (!this.quietConfig().enabled || !this.quietPlan || this.quietPlan.date !== timeManager.getTodayDateString()) {
+            return new Set();
+        }
+        return new Set(this.quietPlan.entries.filter(e => e.slot !== null).map(e => e.serverId));
+    },
+
+    /**
+     * Entries of the plan whose countdown is due: from the default warning window before the
+     * slot until the end of the allowed window (a slot missed while VU was down still runs, late).
+     */
+    quietDue: function (plan, cfg, now = Date.now()) {
+        const warnMs = this.getAlertConfig().defaultWarnWindowMinutes * 60000;
+        const windowEndMs = quietSlots.slotTimeMs(plan.date, cfg.windowEnd, cfg);
+        return plan.entries.filter(e => e.slot !== null && !plan.started.has(e.serverId)
+            && now >= quietSlots.slotTimeMs(plan.date, e.slot, cfg) - warnMs && now < windowEndMs);
+    },
+
+    /**
+     * One quiet slot pass: builds today's plan once, then starts the servers whose countdown is
+     * due. The reboots run in the background; the next tick does not wait for them.
+     */
+    quietTick: async function () {
+        const cfg = this.quietConfig();
+        if (!cfg.enabled || this.quietBusy) return;
+        this.quietBusy = true;
+        try {
+            const today = timeManager.getTodayDateString();
+            if (!this.quietPlan || this.quietPlan.date !== today) {
+                this.quietPlan = await this.buildQuietPlan(today, cfg);
+            }
+            const due = this.quietDue(this.quietPlan, cfg);
+            if (!due.length) return;
+            due.forEach(e => this.quietPlan.started.add(e.serverId));
+            const servers = (await yggdrasil.getServers()).filter(s => due.some(e => e.serverId === s.serverId));
+            this.runQuietBatch(servers).catch(error =>
+                sessionLogger.error('RebootScheduler', `Quiet slot reboot failed: ${error.message}`));
+        } finally {
+            this.quietBusy = false;
+        }
+    },
+
+    /**
+     * Reboots the servers of one quiet slot like the daily batch does: the 6 h uptime filter,
+     * then runRebootBatches. Adds them to today's stats.
+     */
+    runQuietBatch: async function (servers) {
+        sessionLogger.info('RebootScheduler', `Quiet slot: ${servers.map(s => s.name || s.tag).join(', ')}`);
+        const { eligible } = await this.filterServersByUptime(servers, 6);
+        if (!eligible.length) return;
+        this.state.todayStats.totalServers = (this.state.todayStats.totalServers || 0) + eligible.length;
+        await this.runRebootBatches(eligible, this.runtimeConfig || this.defaultConfig, { quiet: true });
+        try {
+            await mongo.updateRebootHistory(timeManager.getTodayDateString(), this.state.todayStats);
+        } catch (error) {
+            sessionLogger.warn('RebootScheduler', `Quiet slot stats not saved: ${error.message}`);
+        }
     },
 
     /** Gap between two instances of one synced group: config syncGroupStaggerMinutes, default 15. */
@@ -831,7 +944,7 @@ module.exports = {
                     skip(notRun, 'cancelled');
                     return results;
                 }
-                if (!opts.scheduled && !this.state.isRebootInProgress) {
+                if (!opts.scheduled && !opts.quiet && !this.state.isRebootInProgress) {
                     sessionLogger.warn('RebootScheduler',
                         `Sync group: ${notRun.map(s => s.name).join(', ')} not rebooted, because the reboot sequence ended`);
                     skip(notRun, 'not rebooted: the reboot sequence ended');
