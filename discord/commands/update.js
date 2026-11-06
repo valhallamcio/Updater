@@ -31,7 +31,11 @@ module.exports = {
             option.setName('version')
                 .setDescription('Manual overwrite for the version number')
                 .setRequired(false)
-                .setAutocomplete(true)),
+                .setAutocomplete(true))
+        .addBooleanOption(option =>
+            option.setName('force')
+                .setDescription('Let the pack replace our patched jars (the pre-flight refuses that otherwise)')
+                .setRequired(false)),
 
 	async autocomplete(interaction) {
         const focused = interaction.options.getFocused(true);
@@ -78,6 +82,7 @@ module.exports = {
     async execute(interaction) {
         const query = interaction.options.getString('server');
         const versionOverride = interaction.options.getString('version');
+        const updateOptions = { force: interaction.options.getBoolean('force') === true };
         const serverList = await yggdrasil.getServers();
         await interaction.deferReply();
         await interaction.editReply("Update manager is starting...");
@@ -101,16 +106,16 @@ module.exports = {
         let time = Date.now();
         switch (server.platform) {
             case "curseforge":
-                await updater.updateCF(server, versionOverride, message, serverIds);
+                await updater.updateCF(server, versionOverride, message, serverIds, updateOptions);
                 break;
             case "feedthebeast":
-                await updater.updateFTB(server, versionOverride, message, serverIds);
+                await updater.updateFTB(server, versionOverride, message, serverIds, updateOptions);
                 break;
             case "gregtechnewhorizons":
-                await updater.updateGTNH(server, versionOverride, message, serverIds);
+                await updater.updateGTNH(server, versionOverride, message, serverIds, updateOptions);
                 break;
             case "gregtechodyssey":
-                await updater.updateGTO(server, versionOverride, message, serverIds);
+                await updater.updateGTO(server, versionOverride, message, serverIds, updateOptions);
                 break;
             default:
                 await message.edit('Platform not supported!');

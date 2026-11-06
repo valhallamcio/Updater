@@ -27,8 +27,12 @@ const {
 const curseforge = require('../modules/curseforge');
 const {
     download,
+    downloadList,
     upload
 } = require('../modules/downloader');
+const textMerge = require('../modules/textMerge');
+const modloader = require('../modules/modloader');
+const patchedJars = require('../modules/patchedJars');
 const pterodactyl = require('../modules/pterodactyl');
 const supervisorState = require('../modules/supervisorState');
 const unpacker = require('../modules/unpacker');
@@ -133,11 +137,11 @@ async function editProgress(message, content) {
  * so a single panel hiccup would fail an instance that is actually fine.
  * @returns {Object|null} The file entry, or null if it never showed up.
  */
-async function findRemoteFile(client, serverId, fileName, attempts = 3) {
+async function findRemoteFile(client, serverId, fileName, attempts = 3, directory = "/") {
     for (let attempt = 0; attempt < attempts; attempt++) {
         if (attempt > 0) await sleep(2000);
         // is_file may be absent on older panels - only an explicit false rules an entry out
-        const entry = (await client.listFiles(serverId)).find(e => e.name === fileName && e.is_file !== false);
+        const entry = (await client.listFiles(serverId, directory)).find(e => e.name === fileName && e.is_file !== false);
         if (entry) return entry;
     }
     return null;
@@ -556,7 +560,8 @@ async function mergeAndDeployInstance(pack, serverId, options) {
         protectedFiles,
         zipName,
         deleteList,
-        inspect
+        inspect,
+        extraTree
     } = options;
 
     rmRecursive(mainDir);
@@ -567,19 +572,266 @@ async function mergeAndDeployInstance(pack, serverId, options) {
     const note = inspect ? await inspect(mainDir) : "";
 
     const stash = perInstanceFiles.stashProtected(mainDir, protectedFiles);
-    await applyMerge(mainDir);
+    const mergeReport = await applyMerge(mainDir);
     const restored = perInstanceFiles.applyProtectedOverlay(mainDir, stash);
     if (restored.length > 0) {
         sessionLogger.info('UpdateManager', `Re-applied ${restored.join(', ')} for ${serverId}`);
     }
+
+    // The NeoForge payload rides in the same archive. Its libraries/ unpacks over the live
+    // one, which is not in the delete list unless the old pack shipped it.
+    if (extraTree) fs.cpSync(extraTree, mainDir, { recursive: true });
 
     await deployMergedTree(pack, serverId, mainDir, zipName, deleteList);
     safeRm(mainDir);
 
     return {
         manifest: instanceManifest,
-        note
+        note: note + textMerge.formatReport(mergeReport),
+        mergeReport
     };
+}
+
+/* ---------- pre-flight ----------
+ *
+ * Everything that can refuse an update runs before the stop, so a refusal costs no
+ * downtime: the patched-jar guard, the loader version check, the mods.toml ranges of the
+ * new jars, and the download and install of a new NeoForge.
+ */
+
+// Pack paths come as "/mods/a.jar" (comparator) or "./mods/a.jar" (manifests)
+function packRelative(p) {
+    return String(p).replace(/^\.?\/+/, '');
+}
+
+function readTextIfExists(file) {
+    try {
+        return fs.readFileSync(file, 'utf8');
+    } catch (error) {
+        return null;
+    }
+}
+
+function readJsonIfExists(file) {
+    const text = readTextIfExists(file);
+    if (text === null) return null;
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        return null;
+    }
+}
+
+/** Local paths of the jars directly in mods/ that the pack adds or changes. */
+function changedJars(additions, root) {
+    return additions.map(packRelative)
+        .filter(rel => /^mods\/[^/]+\.jar$/i.test(rel))
+        .map(rel => path.join(root, rel))
+        .filter(file => fs.existsSync(file));
+}
+
+/** FTB has no new pack on disk: fetches the added and changed mods/ jars for the range check. */
+async function fetchChangedJars(files, additions, dir) {
+    const added = new Set(additions.map(packRelative));
+    const entryRel = (file) => packRelative(`${file.path.endsWith('/') ? file.path : file.path + '/'}${file.name}`);
+    const jars = files.filter(file => /^mods\/[^/]+\.jar$/i.test(entryRel(file)) && added.has(entryRel(file)));
+    if (jars.length > 0) await downloadList(jars.map(file => ({ ...file })), dir);
+    return jars.map(file => path.join(dir, entryRel(file)));
+}
+
+/**
+ * Decides the loader side of an update, before the stop. Reads each instance's running
+ * loader off its startup, checks the new jars' mods.toml ranges against the version each
+ * instance will run, and for a NeoForge bump checks the panel key and Java, then builds
+ * the library payload. Forge bumps are only reported.
+ * @param {Object} input {target ({loader, version} or null), newJars (paths or an async function), workDir, java}.
+ * @param {Object} client Panel client, injectable for tests.
+ * @param {Object} ops modloader functions, injectable for tests.
+ * @returns {Promise<{abort: string|null, note: string, bump: Object|null}>}
+ *   bump is {version, switchIds, from, payloadDir, files} when instances switch NeoForge.
+ */
+async function planLoader(allServerIds, input, client = pterodactyl, ops = modloader) {
+    const target = input.target || null;
+    const result = { abort: null, note: "", bump: null };
+    if (target && !['neoforge', 'forge'].includes(target.loader)) {
+        result.note = `\n- Loader: ${target.loader} ${target.version}, not checked.`;
+        return result;
+    }
+
+    const running = {};
+    for (const sid of allServerIds) {
+        try {
+            running[sid] = ops.loaderFromStartup((await client.getStartup(sid)).startup_command);
+        } catch (error) {
+            result.abort = `could not read the startup command of ${sid} to check its mod loader (${error.message})`;
+            return result;
+        }
+    }
+
+    const loader = target ? target.loader : (Object.values(running).find(Boolean) || {}).loader;
+    if (!loader) {
+        result.note = `\n- Loader: the pack names none and no startup shows one, not checked.`;
+        return result;
+    }
+    const name = loader === 'neoforge' ? 'NeoForge' : 'Forge';
+    const lines = [];
+    const unknown = allServerIds.filter(sid => !running[sid] || running[sid].loader !== loader);
+    if (unknown.length > 0) lines.push(`the startup of ${unknown.join(', ')} names no ${name} version, so its loader was not checked`);
+    const needs = target ? allServerIds.filter(sid => !unknown.includes(sid) && ops.compareVersions(target.version, running[sid].version) > 0) : [];
+
+    // The version each instance runs after the update
+    const effective = {};
+    for (const sid of allServerIds) {
+        effective[sid] = needs.includes(sid) || unknown.includes(sid) ? (target && target.version) : running[sid].version;
+    }
+    const versions = [...new Set(Object.values(effective).filter(Boolean))];
+    if (versions.length > 0) {
+        let jars;
+        try {
+            jars = typeof input.newJars === 'function' ? await input.newJars() : (input.newJars || []);
+        } catch (error) {
+            result.abort = `could not fetch the new jars to check their ${name} ranges (${error.message})`;
+            return result;
+        }
+        for (const version of versions) {
+            const excluded = await ops.checkJars(jars, loader, version);
+            if (excluded.length > 0) {
+                const on = allServerIds.filter(sid => effective[sid] === version);
+                result.abort = `${excluded.map(e => `\`${e.jar}\` needs ${name} ${e.range}`).join(', ')}, but ${on.join(', ')} would run ${name} ${version}`;
+                return result;
+            }
+        }
+        lines.push(`${jars.length} new or changed jar(s) accept ${name} ${versions.join(' / ')}`);
+    }
+
+    const head = `Loader: ${name} ${target ? target.version : '(not named by the pack)'}`;
+    if (needs.length === 0) {
+        result.note = `\n- ${[`${head}, no switch needed`, ...lines].join('. ')}.`;
+        return result;
+    }
+    const from = Object.fromEntries(needs.map(sid => [sid, running[sid].version]));
+    const fromText = needs.map(sid => `${from[sid]} on ${sid}`).join(', ');
+
+    if (loader === 'forge') {
+        result.note = `\n- ${[head, ...lines].join('. ')}. **The pack wants Forge ${target.version}, newer than ${fromText}. The updater does not switch Forge: change the startup on the panel before the next start.**`;
+        return result;
+    }
+
+    try {
+        for (const sid of needs) ops.planStartupSwitch(await client.getApplicationServer(sid), target.version);
+        const java = input.java || process.env.NEOFORGE_INSTALLER_JAVA || 'java';
+        await ops.checkJava(java, ops.requiredJava(target.version));
+        const bases = [...new Set(Object.values(from))];
+        const prepared = await ops.prepareNeoForge(target.version, input.workDir, {
+            java,
+            baseVersion: bases.length === 1 ? bases[0] : null
+        });
+        result.bump = {
+            version: target.version,
+            switchIds: needs,
+            from,
+            payloadDir: prepared.payloadDir,
+            files: prepared.files
+        };
+        const size = `${(prepared.bytes / 1024 ** 2).toFixed(1)} MB`;
+        result.note = `\n- ${[`${head}: switching ${fromText} after the deploy, ${prepared.files.length} library file(s) ready (${size})`, ...lines].join('. ')}.`;
+    } catch (error) {
+        result.abort = `the pack needs NeoForge ${target.version} (${fromText}), but the switch cannot be prepared: ${error.message}`;
+    }
+    return result;
+}
+
+/**
+ * PRE-FLIGHT - runs the patched-jar guard and the loader plan while the instances still run.
+ * @param {Object} input {oldSizes, deletions, force, loader} - loader is planLoader's input, or null to skip it.
+ * @param {function} report Appends to the progress message.
+ * @returns {Promise<Object|null>} {bump} to go on, or null after reporting why the update stops.
+ */
+async function runPreflight(allServerIds, input, report, client = pterodactyl, ops = modloader) {
+    await report(`\n- Pre-flight checks...`);
+    let guard;
+    let loader = { note: "", bump: null };
+    try {
+        guard = await patchedJars.checkInstances({
+            client,
+            serverIds: allServerIds,
+            oldSizes: input.oldSizes,
+            deletions: input.deletions,
+            force: input.force,
+            pause: input.pause
+        });
+        if (!guard.abort && input.loader) loader = await planLoader(allServerIds, input.loader, client, ops);
+    } catch (error) {
+        sessionLogger.error('UpdateManager', 'Pre-flight failed:', error.message);
+        guard = { abort: `the pre-flight checks failed (${error.message})` };
+    }
+    const abort = guard.abort || loader.abort;
+    if (abort) {
+        sessionLogger.warn('UpdateManager', `Update refused before the stop: ${abort}`);
+        await report(`\n\n**Aborting before the stop: ${abort}. Nothing was touched.**`);
+        return null;
+    }
+    await report(` Done!${guard.note}${loader.note}`);
+    return { bump: loader.bump };
+}
+
+/**
+ * After the deploy, moves one instance's startup to the NeoForge the payload brought.
+ * The panel only changes at the PATCH, so a failure before it leaves the old startup.
+ * The old startup is kept next to the instance's backup for a manual rollback.
+ * @param {Object} deps {client, ops, recordDir} - injectable for tests.
+ * @returns {Promise<string|null>} The version switched from, or null when already on it.
+ * @throws If the new unix_args.txt is not on the panel, or the change cannot be confirmed.
+ */
+async function switchLoader(pack, serverId, version, deps = {}) {
+    const client = deps.client || pterodactyl;
+    const ops = deps.ops || modloader;
+    const dir = `/libraries/net/neoforged/neoforge/${version}`;
+    if (!await findRemoteFile(client, serverId, 'unix_args.txt', 3, dir)) {
+        throw new Error(`${dir}/unix_args.txt is not on ${serverId} after the unpack`);
+    }
+    const server = await client.getApplicationServer(serverId);
+    const plan = ops.planStartupSwitch(server, version);
+    if (!plan) return null;
+
+    const record = path.join(deps.recordDir || `./vault/${pack.tag}/instances/${serverId}`, `startup-before-neoforge-${version}.json`);
+    fs.mkdirSync(path.dirname(record), { recursive: true });
+    fs.writeFileSync(record, JSON.stringify({ id: server.id, uuid: server.uuid, egg: server.egg, container: server.container }, null, 1));
+    sessionLogger.info('UpdateManager', `Switching ${serverId} from NeoForge ${plan.from} to ${version}, old startup saved to ${record}`);
+
+    await client.updateStartup(server.id, plan.body);
+    const after = await client.getApplicationServer(serverId);
+    if (!ops.startupRuns(after, version)) {
+        throw new Error(`the panel does not show NeoForge ${version} in the startup of ${serverId} after the change`);
+    }
+    return plan.from;
+}
+
+/** The pre-flight's library payload for one instance, or null when it does not switch. */
+function loaderPayload(bump, serverId) {
+    return bump && bump.switchIds.includes(serverId) ? bump.payloadDir : null;
+}
+
+/**
+ * Runs the planned NeoForge switch on a deployed instance. Never throws: the files are
+ * already updated, so a failure only keeps the instance from starting on the old loader.
+ * @returns {Promise<{note: string, failed: boolean}>}
+ */
+async function applyLoaderSwitch(pack, serverId, bump) {
+    if (!loaderPayload(bump, serverId)) return { note: "", failed: false };
+    try {
+        const from = await switchLoader(pack, serverId, bump.version);
+        return { note: ` NeoForge ${from || bump.from[serverId]} -> ${bump.version}.`, failed: false };
+    } catch (error) {
+        sessionLogger.error('UpdateManager', `NeoForge switch failed on ${serverId}:`, error.message);
+        return { note: ` **NeoForge switch FAILED: ${error.message}. It stays stopped.**`, failed: true };
+    }
+}
+
+/** Appends a warning for instances whose NeoForge switch failed after their files were updated. */
+function loaderFailedWarning(ids, bump) {
+    if (ids.length === 0) return "";
+    return `\n\n**WARNING: the NeoForge ${bump.version} switch failed on ${ids.join(', ')}. Their files ARE updated, so they were NOT started on the old loader. Check that \`libraries/net/neoforged/neoforge/${bump.version}/unix_args.txt\` is on the server and that the panel startup names ${bump.version} (tickets-valhalla/scripts/neoforge-startup-switch.py), then start them. Do not re-run the update.**`;
 }
 
 /**
@@ -626,6 +878,10 @@ module.exports = {
         verifyBooted,
         startInstances,
         freezeAndShutdown,
+        planLoader,
+        runPreflight,
+        switchLoader,
+        changedJars,
         BOOT_WATCH_TIMEOUT_MS,
         BOOT_WATCH_POLL_MS,
         BOOT_WATCH_MAX_FLAPS,
@@ -638,7 +894,7 @@ module.exports = {
      * @param {object} interaction Object with the interaction data.(for Discord)
      */
 
-    updateCF: async function (pack, versionOverride, interaction, serverIds = null) {
+    updateCF: async function (pack, versionOverride, interaction, serverIds = null, options = {}) {
         assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
@@ -749,7 +1005,31 @@ module.exports = {
             toCompressList.push(file);
         });
 
-        progressLog += ` Done!`;
+        // What the pack itself changed - identical for every instance, so computed once.
+        // Before the stop: the pre-flight checks read it.
+        progressLog += ` Done!\n- Comparing pack versions...`;
+        await editProgress(interaction, progressLog);
+        const changeList = await comparator.compare(`./${pack.tag}/compare/old`, `./${pack.tag}/compare/new`);
+        progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
+        await editProgress(interaction, progressLog);
+
+        const preflight = await runPreflight(allServerIds, {
+            oldSizes: patchedJars.sizesFromDir(`./${pack.tag}/compare/old/mods`),
+            deletions: changeList.deletions,
+            force: options.force === true,
+            loader: {
+                target: [
+                    modloader.parseVariablesTxt(readTextIfExists(`./${pack.tag}/compare/new/variables.txt`)),
+                    modloader.loaderFromManifest(readJsonIfExists(`./${pack.tag}/compare/new/manifest.json`)),
+                    modloader.loaderFromManifest(packManifest)
+                ].find(Boolean) || null,
+                newJars: changedJars(changeList.additions, `./${pack.tag}/compare/new`),
+                workDir: `./${pack.tag}/loader`
+            }
+        }, report);
+        if (!preflight) return;
+        const bump = preflight.bump;
+
         const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
@@ -776,17 +1056,14 @@ module.exports = {
             return;
         }
 
-        // What the pack itself changed - identical for every instance, so computed once
-        progressLog += ` Done!\n- Comparing pack versions...`;
-        await editProgress(interaction, progressLog);
-        const changeList = await comparator.compare(`./${pack.tag}/compare/old`, `./${pack.tag}/compare/new`);
-        progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
+        progressLog += ` Done!`;
         await editProgress(interaction, progressLog);
 
         // PHASE B - each instance is merged from its OWN files and deployed on its own
         const instanceManifests = {};
         const failedInstances = [];
         const wipedInstances = [];
+        const loaderFailed = [];
         const mainDir = `./${pack.tag}/compare/main`;
 
         for (const sid of allServerIds) {
@@ -801,14 +1078,16 @@ module.exports = {
                     protectedFiles,
                     zipName: `update_${pack.tag}_${sid}_${pack.newestFileID}.zip`,
                     deleteList: toCompressList,
+                    extraTree: loaderPayload(bump, sid),
                     inspect: async (dir) => {
                         const customChanges = await comparator.findCustomChanges(dir, `./${pack.tag}/compare/old`);
-                        const overWrites = customChanges.editedFiles.filter(file => changeList.additions.includes(file));
-                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}, overwritten: ${overWrites.length}.`;
+                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}.`;
                     }
                 });
                 instanceManifests[sid] = result.manifest;
-                progressLog += `${result.note} Done!`;
+                const switched = await applyLoaderSwitch(pack, sid, bump);
+                if (switched.failed) loaderFailed.push(sid);
+                progressLog += `${result.note} Done!${switched.note}`;
             } catch (error) {
                 sessionLogger.error('UpdateManager', `Deploy failed on ${sid}:`, error.message);
                 progressLog += ` **FAILED: ${error.message}**`;
@@ -822,9 +1101,11 @@ module.exports = {
         // An instance whose deploy failed must not boot in a half-written state
         progressLog += `\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await editProgress(interaction, progressLog);
-        const notStarted = await startInstances(allServerIds, failedInstances);
+        const notStarted = await startInstances(allServerIds, [...failedInstances, ...loaderFailed]);
 
-        progressLog += ` Done!${notStartedWarning(notStarted)}${await safeInstanceDiff(instanceManifests, allServerIds)}`;
+        progressLog += ` Done!${notStartedWarning(notStarted)}${loaderFailedWarning(loaderFailed, bump)}${await safeInstanceDiff(instanceManifests, allServerIds)}`;
+        // They are down until the loader is fixed, so the freeze stays for them too
+        notStarted.push(...loaderFailed);
         progressLog += `\n- Update sequence completed. Cleaning up...`;
         await editProgress(interaction, progressLog);
         safeRm(`./${pack.tag}`);
@@ -887,7 +1168,7 @@ module.exports = {
      * @param {object} pack Object with the server data.
      * @param {object} interaction Object with the interaction data.(for Discord)
      */
-    updateFTB: async function (pack, versionOverride, interaction, serverIds = null) {
+    updateFTB: async function (pack, versionOverride, interaction, serverIds = null, options = {}) {
         assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
@@ -947,7 +1228,30 @@ module.exports = {
             return;
         }
 
-        progressLog += ` Done!`;
+        // What the pack itself changed - identical for every instance, so computed once.
+        // Before the stop: the pre-flight checks read it.
+        progressLog += ` Done!\n- Comparing pack manifests...`;
+        await editProgress(interaction, progressLog);
+        const oldFilelist = oldManifest.files.filter(obj => !obj.clientonly);
+        const newFilelist = newManifest.files.filter(obj => !obj.clientonly);
+        const changeList = await comparator.findManifestChanges(oldFilelist, newFilelist);
+        progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
+        await editProgress(interaction, progressLog);
+
+        const preflight = await runPreflight(allServerIds, {
+            oldSizes: patchedJars.sizesFromManifest(oldFilelist),
+            deletions: changeList.deletions,
+            force: options.force === true,
+            loader: {
+                target: modloader.loaderFromManifest(newManifest),
+                newJars: () => fetchChangedJars(newFilelist, changeList.additions, `./${pack.tag}/precheck`),
+                workDir: `./${pack.tag}/loader`
+            }
+        }, report);
+        safeRm(`./${pack.tag}/precheck`);
+        if (!preflight) return;
+        const bump = preflight.bump;
+
         const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
@@ -974,15 +1278,7 @@ module.exports = {
             return;
         }
 
-        // What the pack itself changed - identical for every instance, so computed once
-        progressLog += ` Done!\n- Comparing pack manifests...`;
-        await editProgress(interaction, progressLog);
-
-        const oldFilelist = oldManifest.files.filter(obj => !obj.clientonly);
-        const newFilelist = newManifest.files.filter(obj => !obj.clientonly);
-        const changeList = await comparator.findManifestChanges(oldFilelist, newFilelist);
-
-        progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
+        progressLog += ` Done!`;
         await editProgress(interaction, progressLog);
 
         // PHASE B - each instance is merged from its OWN files and deployed on its own.
@@ -991,6 +1287,7 @@ module.exports = {
         const instanceManifests = {};
         const failedInstances = [];
         const wipedInstances = [];
+        const loaderFailed = [];
         const mainDir = `./${pack.tag}/compare/main`;
 
         for (const sid of allServerIds) {
@@ -1001,19 +1298,21 @@ module.exports = {
                 const result = await mergeAndDeployInstance(pack, sid, {
                     archivePath: archives[sid],
                     mainDir,
-                    applyMerge: async (dir) => merger.mergeFromManifest(dir, changeList, newManifest),
+                    applyMerge: async (dir) => merger.mergeFromManifest(dir, changeList, newManifest, oldManifest),
                     protectedFiles,
                     zipName: `update_${pack.tag}_${sid}_${pack.newestFileID}.zip`,
                     deleteList: toCompressList,
+                    extraTree: loaderPayload(bump, sid),
                     inspect: async (dir) => {
                         const currentManifest = manifest.generate(dir);
                         const customChanges = await comparator.findCustomManifestChanges(currentManifest, oldFilelist);
-                        const overWrites = customChanges.editedFiles.filter(file => changeList.additions.includes(file));
-                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}, overwritten: ${overWrites.length}.`;
+                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}.`;
                     }
                 });
                 instanceManifests[sid] = result.manifest;
-                progressLog += `${result.note} Done!`;
+                const switched = await applyLoaderSwitch(pack, sid, bump);
+                if (switched.failed) loaderFailed.push(sid);
+                progressLog += `${result.note} Done!${switched.note}`;
             } catch (error) {
                 sessionLogger.error('UpdateManager', `Deploy failed on ${sid}:`, error.message);
                 progressLog += ` **FAILED: ${error.message}**`;
@@ -1027,9 +1326,11 @@ module.exports = {
         // An instance whose deploy failed must not boot in a half-written state
         progressLog += `\n- Starting ${allServerIds.length > 1 ? 'all instances' : 'the server'}...`;
         await editProgress(interaction, progressLog);
-        const notStarted = await startInstances(allServerIds, failedInstances);
+        const notStarted = await startInstances(allServerIds, [...failedInstances, ...loaderFailed]);
 
-        progressLog += ` Done!${notStartedWarning(notStarted)}${await safeInstanceDiff(instanceManifests, allServerIds)}`;
+        progressLog += ` Done!${notStartedWarning(notStarted)}${loaderFailedWarning(loaderFailed, bump)}${await safeInstanceDiff(instanceManifests, allServerIds)}`;
+        // They are down until the loader is fixed, so the freeze stays for them too
+        notStarted.push(...loaderFailed);
         progressLog += `\n- Update sequence completed. Cleaning up...`;
         await editProgress(interaction, progressLog);
         safeRm(`./${pack.tag}`);
@@ -1213,7 +1514,7 @@ module.exports = {
      * @param {string} versionOverride Optional specific version to update to.
      * @param {object} interaction Object with the interaction data (for Discord).
      */
-    updateGTNH: async function (pack, versionOverride, interaction, serverIds = null) {
+    updateGTNH: async function (pack, versionOverride, interaction, serverIds = null, options = {}) {
         assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
@@ -1326,36 +1627,10 @@ module.exports = {
             toCompressList.push(file);
         });
         
-        progressLog += ` Done!`;
-        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
-
-        // PHASE A - back up every instance before anything destructive happens
-        const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
-        progressLog += ` Done!\n- Backing up ${allServerIds.length > 1 ? `all ${allServerIds.length} instances` : 'the server'}...`;
-        await editProgress(interaction, progressLog);
-
-        let archives;
-        try {
-            archives = await backupAllInstances(pack, allServerIds, toCompressList, vaultFileName, protectedFiles);
-        } catch (error) {
-            sessionLogger.error('UpdateManager', 'Backup phase failed:', error.message);
-            progressLog += `\n\n**Aborting: backup failed (${error.message}). Server files are untouched, starting everything back up.**`;
-            await editProgress(interaction, progressLog);
-            const notRestarted = await startInstances(allServerIds);
-            if (notRestarted.length > 0) {
-                progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
-                await editProgress(interaction, progressLog);
-            }
-            await playerSync.releaseFreeze(syncFreeze, {
-                report,
-                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
-            });
-            return;
-        }
-
         progressLog += ` Done!\n- Comparing pack versions...`;
         await editProgress(interaction, progressLog);
-        // Compare old reference pack with new reference pack - same for every instance
+        // Compare old reference pack with new reference pack - same for every instance.
+        // Before the stop: the pre-flight checks read it.
         const changeList = await comparator.compare(`./${pack.tag}/compare/old`, `./${pack.tag}/compare/new`);
         progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
         await editProgress(interaction, progressLog);
@@ -1421,6 +1696,43 @@ module.exports = {
             return !gtnh.isExcluded(item);
         });
 
+        const preflight = await runPreflight(allServerIds, {
+            oldSizes: patchedJars.sizesFromDir(`./${pack.tag}/compare/old/mods`),
+            deletions: filteredChangeList.deletions,
+            force: options.force === true,
+            loader: null
+        }, report);
+        if (!preflight) return;
+
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
+
+        // PHASE A - back up every instance before anything destructive happens
+        const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
+        progressLog += ` Done!\n- Backing up ${allServerIds.length > 1 ? `all ${allServerIds.length} instances` : 'the server'}...`;
+        await editProgress(interaction, progressLog);
+
+        let archives;
+        try {
+            archives = await backupAllInstances(pack, allServerIds, toCompressList, vaultFileName, protectedFiles);
+        } catch (error) {
+            sessionLogger.error('UpdateManager', 'Backup phase failed:', error.message);
+            progressLog += `\n\n**Aborting: backup failed (${error.message}). Server files are untouched, starting everything back up.**`;
+            await editProgress(interaction, progressLog);
+            const notRestarted = await startInstances(allServerIds);
+            if (notRestarted.length > 0) {
+                progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
+                await editProgress(interaction, progressLog);
+            }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
+            return;
+        }
+
+        progressLog += ` Done!`;
+        await editProgress(interaction, progressLog);
+
         // PHASE B - each instance is merged from its OWN files and deployed on its own
         const instanceManifests = {};
         const failedInstances = [];
@@ -1441,8 +1753,7 @@ module.exports = {
                     deleteList: filteredDeleteList,
                     inspect: async (dir) => {
                         const customChanges = await comparator.findCustomChanges(dir, `./${pack.tag}/compare/old`);
-                        const overWrites = customChanges.editedFiles.filter(file => filteredChangeList.additions.includes(file));
-                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}, overwritten: ${overWrites.length}.`;
+                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}.`;
                     }
                 });
                 instanceManifests[sid] = result.manifest;
@@ -1532,7 +1843,7 @@ module.exports = {
      * @param {object} interaction Object with the interaction data (for Discord).
      * @param {Array} serverIds Pterodactyl server ids of all instances sharing the tag.
      */
-    updateGTO: async function (pack, versionOverride, interaction, serverIds = null) {
+    updateGTO: async function (pack, versionOverride, interaction, serverIds = null, options = {}) {
         assertSafeTag(pack);
         // Sorted so the order is deterministic rather than however the API listed them
         const allServerIds = (serverIds && serverIds.length > 0 ? [...serverIds] : [pack.serverId]).sort();
@@ -1636,36 +1947,10 @@ module.exports = {
             toCompressList.push(file);
         });
 
-        progressLog += ` Done!`;
-        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
-
-        // PHASE A - back up every instance before anything destructive happens
-        const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
-        progressLog += ` Done!\n- Backing up ${allServerIds.length > 1 ? `all ${allServerIds.length} instances` : 'the server'} (protecting ${protectedFiles.join(', ')})...`;
-        await editProgress(interaction, progressLog);
-
-        let archives;
-        try {
-            archives = await backupAllInstances(pack, allServerIds, toCompressList, vaultFileName, protectedFiles);
-        } catch (error) {
-            sessionLogger.error('UpdateManager', 'Backup phase failed:', error.message);
-            progressLog += `\n\n**Aborting: backup failed (${error.message}). Server files are untouched, starting everything back up.**`;
-            await editProgress(interaction, progressLog);
-            const notRestarted = await startInstances(allServerIds);
-            if (notRestarted.length > 0) {
-                progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
-                await editProgress(interaction, progressLog);
-            }
-            await playerSync.releaseFreeze(syncFreeze, {
-                report,
-                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
-            });
-            return;
-        }
-
         progressLog += ` Done!\n- Comparing pack versions...`;
         await editProgress(interaction, progressLog);
-        // Compare old reference pack with new reference pack - same for every instance
+        // Compare old reference pack with new reference pack - same for every instance.
+        // Before the stop: the pre-flight checks read it.
         const changeList = await comparator.compare(`./${pack.tag}/compare/old`, `./${pack.tag}/compare/new`);
         progressLog += ` Done!\n- **Files to delete**: ${changeList.deletions.length}, **Files to add**: ${changeList.additions.length}`;
         await editProgress(interaction, progressLog);
@@ -1720,6 +2005,43 @@ module.exports = {
             return !gto.isExcluded(item);
         });
 
+        const preflight = await runPreflight(allServerIds, {
+            oldSizes: patchedJars.sizesFromDir(`./${pack.tag}/compare/old/mods`),
+            deletions: filteredChangeList.deletions,
+            force: options.force === true,
+            loader: null
+        }, report);
+        if (!preflight) return;
+
+        const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newestVersion}` }, report);
+
+        // PHASE A - back up every instance before anything destructive happens
+        const vaultFileName = `${pack.tag}_${pack.modpackVersion}_${currentVersion}.tar.gz`;
+        progressLog += ` Done!\n- Backing up ${allServerIds.length > 1 ? `all ${allServerIds.length} instances` : 'the server'} (protecting ${protectedFiles.join(', ')})...`;
+        await editProgress(interaction, progressLog);
+
+        let archives;
+        try {
+            archives = await backupAllInstances(pack, allServerIds, toCompressList, vaultFileName, protectedFiles);
+        } catch (error) {
+            sessionLogger.error('UpdateManager', 'Backup phase failed:', error.message);
+            progressLog += `\n\n**Aborting: backup failed (${error.message}). Server files are untouched, starting everything back up.**`;
+            await editProgress(interaction, progressLog);
+            const notRestarted = await startInstances(allServerIds);
+            if (notRestarted.length > 0) {
+                progressLog += `\n**${notRestarted.join(', ')} did not come back up - start them from the panel.**`;
+                await editProgress(interaction, progressLog);
+            }
+            await playerSync.releaseFreeze(syncFreeze, {
+                report,
+                stayReason: notRestarted.length > 0 ? `${notRestarted.join(', ')} did not come back up` : null
+            });
+            return;
+        }
+
+        progressLog += ` Done!`;
+        await editProgress(interaction, progressLog);
+
         // PHASE B - each instance is merged from its OWN files and deployed on its own.
         // Difficulty and ports ride along in the archive rather than being written back
         // afterwards, so there is no post-deploy write that can fail and strand an instance.
@@ -1742,8 +2064,7 @@ module.exports = {
                     deleteList: filteredDeleteList,
                     inspect: async (dir) => {
                         const customChanges = await comparator.findCustomChanges(dir, `./${pack.tag}/compare/old`);
-                        const overWrites = customChanges.editedFiles.filter(file => filteredChangeList.additions.includes(file));
-                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}, overwritten: ${overWrites.length}.`;
+                        return ` custom: ${customChanges.customFiles.length}, edited: ${customChanges.editedFiles.length}.`;
                     }
                 });
                 instanceManifests[sid] = result.manifest;

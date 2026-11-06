@@ -110,18 +110,18 @@ The update process compares THREE versions to preserve custom server modificatio
 1. PREPARATION - Get manifest, extract version, alert players
 2. DOWNLOAD - Download new pack + old reference pack
 3. EXTRACTION - Decompress to ./[tag]/compare/{new,old}/
-4. BACKUP - Shutdown server, compress & download to ./vault/[tag]/
-5. COMPARISON - Three-way comparison to identify:
-   - customFiles[] (admin additions)
-   - editedFiles[] (admin modifications)
-   - deletions[] (modpack removed files)
-   - additions[] (modpack new/updated files)
-   - overwrites[] (conflicts: edited files that will be replaced)
-6. MERGE - Delete old files, add new files, preserve custom files
-7. UPLOAD - Compress merged pack, upload to Pterodactyl
-8. DEPLOYMENT - Delete old server files, decompress update, start server
+4. COMPARISON - old vs new pack: deletions[] / additions[] (runs before the stop)
+5. PRE-FLIGHT - runPreflight(); any refusal happens before the stop, nothing touched
+6. BACKUP - Shutdown server, compress & download to ./vault/[tag]/
+7. MERGE - Delete old files, add new files, preserve custom files, three-way text merge
+8. UPLOAD + DEPLOYMENT - Delete old server files, decompress update, switch NeoForge, start
 9. FINALIZATION - Update MongoDB, send notifications, cleanup temp files
 ```
+
+- **Text merge** (`modules/textMerge`, node-diff3): a text file (extension list, <2 MB, no NUL, valid UTF-8) that live and the pack both changed gets the pack's old->new diff applied onto live. CRLF and trailing whitespace are not edits. A conflict keeps the pack file and is listed in the progress log. FTB fetches the old copies of those few files from the old manifest's URLs.
+- **Patched-jar guard** (`modules/patchedJars`): a live `mods/` jar whose name is in the old pack at another size is our patch. If the pack deletes or changes that name, the update refuses; `/update force:true` overrides.
+- **Loader** (`planLoader`, CF and FTB only): target from `variables.txt` or the manifest, running version from the panel startup. The new jars' mods.toml ranges are checked against the version each instance will run. A NeoForge bump installs the old and new server into `./[tag]/loader`; the files the new install adds or changes ride in the deploy archive, then `switchLoader` confirms `unix_args.txt` and PATCHes the startup (old one saved in the vault). A failed switch keeps that instance stopped. Forge bumps are only reported.
+- A bump needs `PTERODACTYL_ADMIN_APIKEY` (ptla_) and Java (`NEOFORGE_INSTALLER_JAVA`, default `java`) in `.env`. The live container is a Node image without Java, so set both there first.
 
 **Temporary Directories:**
 - `./vault/[tag]/` - Backup storage (permanent)

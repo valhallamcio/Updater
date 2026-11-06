@@ -827,6 +827,61 @@ module.exports = {
             sessionLogger.error('Pterodactyl', `Error getting node for server ${serverID}:`, error.message);
             return null;
         }
+    },
+
+    /**
+     * Reads a server's startup command through the client API.
+     * @param {string} serverID Id of the server on Pterodactyl.
+     * @returns {{startup_command: string, raw_startup_command: string}} startup_command has the variables filled in.
+     * @throws If the panel gives no startup.
+     */
+    getStartup: async function (serverID) {
+        const response = await this.safeApiRequest('GET', `${pterodactylHostName}api/client/servers/${serverID}/startup`);
+        const meta = response.data && response.data.meta;
+        if (!meta || typeof meta.startup_command !== 'string') throw new Error(`the panel gave no startup for ${serverID}`);
+        return meta;
+    },
+
+    /**
+     * Finds a server in the application API, which needs the ptla_ key in
+     * PTERODACTYL_ADMIN_APIKEY. The client key cannot change a startup.
+     * @param {string} identifier The 8-character id the client API uses.
+     * @returns {Object} Application API attributes (id, uuid, egg, container...).
+     * @throws If the key is missing or no server matches.
+     */
+    getApplicationServer: async function (identifier) {
+        const options = { headers: adminHeader() };
+        for (let page = 1; ; page++) {
+            const response = await this.safeApiRequest('GET', `${pterodactylHostName}api/application/servers?per_page=100&page=${page}`, null, options);
+            const hit = (response.data.data || []).map(entry => entry.attributes)
+                .find(server => server.identifier === identifier || String(server.uuid).startsWith(identifier));
+            if (hit) return hit;
+            const pagination = response.data.meta && response.data.meta.pagination;
+            if (!pagination || pagination.current_page >= pagination.total_pages) break;
+        }
+        throw new Error(`no panel server matches ${identifier}`);
+    },
+
+    /**
+     * Changes a server's startup through the application API. Wings reads the startup at
+     * each start, so the change applies at the next start.
+     * @param {number} internalId The application API's numeric server id.
+     * @param {Object} body {startup, environment, egg, image, skip_scripts}, see modloader.planStartupSwitch.
+     * @returns {Object} The server's attributes after the change.
+     */
+    updateStartup: async function (internalId, body) {
+        const response = await this.safeApiRequest('PATCH', `${pterodactylHostName}api/application/servers/${internalId}/startup`, body, { headers: adminHeader() });
+        return response.data.attributes;
     }
 
 };
+
+/** Application API headers. Read at call time, so the key is only needed for a loader switch. */
+function adminHeader() {
+    const key = process.env.PTERODACTYL_ADMIN_APIKEY;
+    if (!key) throw new Error('PTERODACTYL_ADMIN_APIKEY (the panel application key, ptla_) is not set in the updater .env');
+    return {
+        ...header,
+        "Authorization": `Bearer ${key}`
+    };
+}

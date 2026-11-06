@@ -13,20 +13,87 @@
 var fs = require('fs');
 const {
     resolve,
-    sep
+    sep,
+    join,
+    dirname
 } = require('path');
 const {
     downloadList
 } = require('./downloader');
+const {
+    hashFile
+} = require('./functions');
+const textMerge = require('./textMerge');
 const sessionLogger = require('./sessionLogger');
+
+const isFile = (file) => fs.existsSync(file) && fs.statSync(file).isFile();
+
+// Pack paths come as "/config/a.toml" (comparator) or "./config/a.toml" (manifests)
+const packRelative = (path) => String(path).replace(/^\.?\/+/, '');
+
+/**
+ * Sorts the outcome of one three-way file merge into the report and logs it.
+ * @returns {Buffer|null} Content to write over the pack's new file, or null to keep that.
+ */
+function recordOutcome(report, rel, outcome, live) {
+    sessionLogger.info('Merger', `Three-way ${rel}: ${outcome.status}`);
+    switch (outcome.status) {
+        case 'merged':
+            report.merged.push(rel);
+            return outcome.content;
+        case 'same':
+            report.kept.push(rel);
+            return live;
+        case 'conflict':
+            report.conflicts.push(rel);
+            return null;
+        case 'binary':
+            report.overwritten.push(rel);
+            return null;
+        default:
+            return null;
+    }
+}
 
 module.exports = {
     /**
      * Merges the changes from the changeList to the temp directory.
+     * A file the pack changed that the server also edited gets a line-level three-way
+     * merge when it is text. Everything else the pack changed is replaced, as before.
      * @param {String} dir Work directory to merge changes to.
      * @param {Object} changeList ChangeList object containing the changes.
+     * @returns {Object} Merge report from textMerge.emptyReport.
      */
     merge: function (dir, changeList) {
+        const report = textMerge.emptyReport();
+        const deleted = new Set(changeList.deletions);
+        const results = [];
+
+        // Read before the copy below replaces the live files
+        for (const path of changeList.additions) {
+            if (!deleted.has(path)) continue;
+            const livePath = `${dir}/compare/main${path}`;
+            const oldPath = `${dir}/compare/old${path}`;
+            const newPath = `${dir}/compare/new${path}`;
+            if (![livePath, oldPath, newPath].every(isFile)) continue;
+            const rel = packRelative(path);
+            try {
+                if (textMerge.filesEqual(livePath, oldPath)) continue;
+                if (!textMerge.isTextPath(rel) || fs.statSync(livePath).size > textMerge.MAX_TEXT_BYTES) {
+                    recordOutcome(report, rel, { status: 'binary' });
+                    continue;
+                }
+                const live = fs.readFileSync(livePath);
+                const outcome = textMerge.mergeBuffers(live, fs.readFileSync(oldPath), fs.readFileSync(newPath), rel);
+                const content = recordOutcome(report, rel, outcome, live);
+                if (content) results.push({ path, content });
+            } catch (error) {
+                // The pack's new file is the fallback, as before this merge existed
+                sessionLogger.warn('Merger', `Three-way ${rel} failed, taking the pack's file: ${error.message}`);
+                report.overwritten.push(rel);
+            }
+        }
+
         for (let path of changeList.deletions) {
             if (fs.existsSync(`${dir}/compare/main${path}`)) {
                 fs.rmSync(`${dir}/compare/main${path}`, {
@@ -61,15 +128,75 @@ module.exports = {
             }
         }
         sessionLogger.info('Merger', "Added new files");
+
+        for (const {
+                path,
+                content
+            } of results) {
+            fs.writeFileSync(`${dir}/compare/main${path}`, content);
+        }
+        return report;
     },
 
     /**
      * Merges the changes from the changeList to the temp directory.
+     * With the old manifest, a text file the pack changed that the server also edited gets
+     * a three-way merge. FTB ships no old pack on disk, so the old copies of those few
+     * files are fetched from the old manifest's URLs, with its hashes checked.
      * @param {string} dir The directory to merge the changes to.
      * @param {object} changeList Object containing the changes.
      * @param {object} newManifest Object containing the new manifest.
+     * @param {object} oldManifest Manifest of the version the server runs. Without it every changed file is replaced.
+     * @param {object} options baseDir (scratch for the old copies) and fetchList (downloader, injectable for tests).
+     * @returns {Object} Merge report from textMerge.emptyReport.
      */
-    mergeFromManifest: async function (dir, changeList, newManifest) {
+    mergeFromManifest: async function (dir, changeList, newManifest, oldManifest = null, options = {}) {
+        const report = textMerge.emptyReport();
+        const fetchList = options.fetchList || downloadList;
+        const baseDir = options.baseDir || join(dirname(resolve(dir)), 'merge-base');
+        const entryPath = (file) => (file.path.endsWith('/') ? file.path : file.path + '/') + file.name;
+        let candidates = [];
+
+        if (oldManifest) {
+            const root = resolve(dir);
+            const oldByPath = new Map(oldManifest.files.map(file => [entryPath(file), file]));
+            const newByPath = new Map(newManifest.files.map(file => [entryPath(file), file]));
+            const deleted = new Set(changeList.deletions);
+            for (const path of changeList.additions) {
+                const oldEntry = oldByPath.get(path);
+                const newEntry = newByPath.get(path);
+                const rel = packRelative(path);
+                const livePath = join(dir, rel);
+                if (!deleted.has(path) || !oldEntry || !newEntry || !resolve(livePath).startsWith(root + sep) || !isFile(livePath)) continue;
+                const liveSize = fs.statSync(livePath).size;
+                const text = textMerge.isTextPath(rel) && [liveSize, oldEntry.size, newEntry.size]
+                    .every(size => !(size > textMerge.MAX_TEXT_BYTES));
+                // A different size is an edit on its own; the hash is only worth reading when it is not
+                if (liveSize === oldEntry.size && oldEntry.sha1 && hashFile(livePath) === String(oldEntry.sha1).toLowerCase()) continue;
+                if (!text) {
+                    recordOutcome(report, rel, { status: 'binary' });
+                    continue;
+                }
+                candidates.push({
+                    path,
+                    rel,
+                    live: fs.readFileSync(livePath),
+                    oldEntry
+                });
+            }
+
+            if (candidates.length > 0) {
+                try {
+                    fs.rmSync(baseDir, { recursive: true, force: true });
+                    await fetchList(candidates.map(candidate => ({ ...candidate.oldEntry })), baseDir);
+                } catch (error) {
+                    sessionLogger.warn('Merger', `Could not fetch the old copies for the three-way merge, taking the pack's files: ${error.message}`);
+                    for (const candidate of candidates) report.overwritten.push(candidate.rel);
+                    candidates = [];
+                }
+            }
+        }
+
         // Diagnostic logging for deletions
         sessionLogger.info('Merger', `Attempting to delete ${changeList.deletions.length} files`);
         if (changeList.deletions.length > 0) {
@@ -126,7 +253,22 @@ module.exports = {
             sessionLogger.warn('Merger', `WARNING: toDownload is empty but changeList has ${changeList.additions.length} additions! First addition: ${changeList.additions[0]}`);
         }
 
-        await downloadList(toDownload, dir);
+        await fetchList(toDownload, dir);
         sessionLogger.info('Merger', "Added new files");
+
+        for (const candidate of candidates) {
+            const newPath = join(dir, candidate.rel);
+            const oldPath = join(baseDir, candidate.rel);
+            try {
+                const outcome = textMerge.mergeBuffers(candidate.live, fs.readFileSync(oldPath), fs.readFileSync(newPath), candidate.rel);
+                const content = recordOutcome(report, candidate.rel, outcome, candidate.live);
+                if (content) fs.writeFileSync(newPath, content);
+            } catch (error) {
+                sessionLogger.warn('Merger', `Three-way ${candidate.rel} failed, taking the pack's file: ${error.message}`);
+                report.overwritten.push(candidate.rel);
+            }
+        }
+        if (candidates.length > 0) fs.rmSync(baseDir, { recursive: true, force: true });
+        return report;
     }
 };
