@@ -68,6 +68,24 @@ module.exports = {
     },
 
     /**
+     * Gets the data of a modpack file (displayName, fileName, serverPackFileId, ...).
+     * @param {number} modPackId Id of the modpack on CurseForge.
+     * @param {number} versionId Version of the modpack file.
+     * @returns File data, or null on error.
+     */
+    getFileData: async function (modPackId, versionId) {
+        try {
+            const response = await axios.get(`https://api.curseforge.com/v1/mods/${modPackId}/files/${versionId}`, {
+                headers: header
+            });
+            return response.data.data;
+        } catch (error) {
+            sessionLogger.error('CurseForge', `Error getting file data for ${modPackId}/${versionId}:`, error.response ? error.response.status : error.message);
+            return null;
+        }
+    },
+
+    /**
      * Gets the fileId of the server pack file.
      * @param {number} modPackId Id of the modpack on CurseForge.
      * @param {number} versionId Version of the modpack file.

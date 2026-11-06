@@ -188,6 +188,9 @@ Note: server docs consumed by the updater are served by the Yggdrasil API, which
   1. Official API server pack field
   2. Scrape additional files endpoint with browser User-Agent
   3. Heuristic search for "server" in filename
+  4. GitHub releases (`modules/githubServerPack`), only when `config.json` `serverPackSources.<tag>` is set (`{type: "github", repo, asset}`). Yggdrasil drops unknown server-doc fields, so the doc field `serverPackSource` is read but never arrives today.
+  - If either side has no CF pack, both sides come from GitHub. The release tag must equal the CF displayName version (or `v` + it); a missing release or asset aborts before the stop.
+  - The CF backup and wipe lists keep only the old pack names that `listFiles(sid, "/")` shows on each instance (`rootListsPerInstance`, before the stop). Dropped names are logged.
 
 **Feed The Beast** (`modules/modpacksch.js`)
 - Uses modpacks.ch API (no auth required)

@@ -25,6 +25,7 @@ const {
     rmRecursive
 } = require('../modules/functions');
 const curseforge = require('../modules/curseforge');
+const githubServerPack = require('../modules/githubServerPack');
 const {
     download,
     downloadList,
@@ -429,6 +430,52 @@ function checkDiskSpace(packZipPath, instanceCount) {
 }
 
 /**
+ * Keeps the pack's top-level names that the instance root really has, so the backup
+ * and the wipe never name a missing file. A GitHub server pack can ship start scripts
+ * and jars the live server never had.
+ *
+ * listFiles returns [] on an API error, so an empty listing is retried and then
+ * treated as a failure. An instance root is never empty.
+ * @param {string} serverId Pterodactyl server id.
+ * @param {Array} names Top-level names of the old pack.
+ * @param {Object} client Panel client, injectable for tests.
+ * @returns {Promise<{present: Array, dropped: Array}>}
+ * @throws If the root cannot be listed or holds none of the names.
+ */
+async function presentRootNames(serverId, names, client = pterodactyl, attempts = 3, delayMs = 2000) {
+    let listing = [];
+    for (let attempt = 0; attempt < attempts && listing.length === 0; attempt++) {
+        if (attempt > 0) await sleep(delayMs);
+        listing = await client.listFiles(serverId, "/");
+    }
+    if (listing.length === 0) throw new Error(`could not list the server root of ${serverId}`);
+
+    const onPanel = new Set(listing.map(entry => entry.name));
+    const present = names.filter(name => onPanel.has(name));
+    const dropped = names.filter(name => !onPanel.has(name));
+    if (present.length === 0) throw new Error(`none of the pack's top-level names are on ${serverId}`);
+    return { present, dropped };
+}
+
+/**
+ * Runs presentRootNames for every instance and reports the names each one lacks.
+ * @returns {Promise<Object>} Map of serverId -> names to back up and wipe.
+ * @throws Like presentRootNames.
+ */
+async function rootListsPerInstance(allServerIds, names, report, client = pterodactyl) {
+    const lists = {};
+    for (const sid of allServerIds) {
+        const { present, dropped } = await presentRootNames(sid, names, client);
+        lists[sid] = present;
+        if (dropped.length > 0) {
+            sessionLogger.info('UpdateManager', `${sid} lacks pack names ${JSON.stringify(dropped)}, left out of its backup and wipe`);
+            await report(`\n- \`${sid}\` has no ${dropped.slice(0, 5).join(', ')}${dropped.length > 5 ? ` (+${dropped.length - 5} more)` : ""}, left out of its backup and wipe.`);
+        }
+    }
+    return lists;
+}
+
+/**
  * PHASE A - backs up every instance and snapshots its protected files. Runs before
  * anything destructive, so a failure here means the caller can restart the instances
  * with their files untouched.
@@ -436,6 +483,7 @@ function checkDiskSpace(packZipPath, instanceCount) {
  * An existing vault archive is never overwritten: on a re-run after a partial failure
  * that archive is the only rollback point, so this run's copy goes to scratch instead.
  *
+ * @param {Array|Object} toCompressList Names to archive, or a map of serverId -> names.
  * @returns {Object} Map of serverId -> local archive path to merge from.
  * @throws If any instance could not be archived or downloaded.
  */
@@ -443,7 +491,8 @@ async function backupAllInstances(pack, allServerIds, toCompressList, vaultFileN
     const archives = {};
 
     for (const sid of allServerIds) {
-        const remoteArchive = await pterodactyl.compressFile(sid, toCompressList);
+        const names = Array.isArray(toCompressList) ? toCompressList : toCompressList[sid];
+        const remoteArchive = await pterodactyl.compressFile(sid, names);
         if (!remoteArchive) throw new Error(`could not compress server files on ${sid}`);
 
         const downloadLink = await pterodactyl.getDownloadLink(sid, remoteArchive);
@@ -847,6 +896,48 @@ function assertSafeTag(pack) {
 }
 
 /**
+ * Finds the old and new server packs on GitHub releases, for a CurseForge pack that has
+ * no CurseForge server pack. Both come from GitHub, so the two compare roots share one
+ * layout. Each version comes from its CurseForge file name and must match a release tag.
+ * @param {object} pack Server doc.
+ * @param {object} source Raw server pack source (see modules/githubServerPack).
+ * @param {function} report Appends a line to the progress log.
+ * @param {object} [deps] {curseforge, http} for tests.
+ * @returns {Promise<object|null>} {newest, current}, each {tag, name, url, size}, or null after the abort was reported.
+ */
+async function githubServerPacks(pack, source, report, deps = {}) {
+    const cf = deps.curseforge || curseforge;
+    const aborting = '. Aborting update, nothing was touched.';
+    let repo;
+    try {
+        repo = githubServerPack.parseSource(source).repo;
+    } catch (error) {
+        await report(`\n- Bad server pack source for ${pack.tag}: ${error.message}${aborting}`);
+        return null;
+    }
+    await report(`\n- Looking for the server packs in the GitHub releases of \`${repo}\`...`);
+
+    const found = {};
+    for (const [side, fileId] of [['newest', pack.newestFileID], ['current', pack.fileID]]) {
+        const file = await cf.getFileData(pack.modpackID, fileId);
+        const version = githubServerPack.versionOfFile(file);
+        if (!version) {
+            const name = file ? ` (\`${file.displayName || file.fileName}\`)` : '';
+            await report(`\n- Could not read a version from CurseForge file ${fileId}${name}${aborting}`);
+            return null;
+        }
+        try {
+            found[side] = await githubServerPack.resolve(source, version, deps.http);
+        } catch (error) {
+            await report(`\n- ${error.message}${aborting}`);
+            return null;
+        }
+        await report(` Found \`${found[side].name}\` (release ${found[side].tag}).`);
+    }
+    return found;
+}
+
+/**
  * Mentions an update announcement may ping: the pack's own role and nothing else, so a
  * mention smuggled into a version or pack name from upstream stays plain text.
  * @param {object} pack Server doc.
@@ -882,6 +973,9 @@ module.exports = {
         runPreflight,
         switchLoader,
         changedJars,
+        githubServerPacks,
+        presentRootNames,
+        rootListsPerInstance,
         BOOT_WATCH_TIMEOUT_MS,
         BOOT_WATCH_POLL_MS,
         BOOT_WATCH_MAX_FLAPS,
@@ -945,53 +1039,68 @@ module.exports = {
             }
         }
 
-        // Re-check IDs after fallback attempt
-        if (newestServerPackID === null && currentServerPackID === null) {
-            progressLog += `\n- Could not find server pack IDs for **both** the current version (${pack.fileID}) and the new version (${pack.newestFileID}) even after checking additional files. Aborting update.`;
-            await editProgress(interaction, progressLog);
-            return;
-        } else if (newestServerPackID === null) {
-            progressLog += `\n- Could not find server pack ID for the new version (${pack.newestFileID}) even after checking additional files. Aborting update.`;
-            await editProgress(interaction, progressLog);
-            return;
-        } else if (currentServerPackID === null) {
-            progressLog += `\n- Could not find server pack ID for the current version (${pack.fileID}) even after checking additional files. Aborting update.`;
-            await editProgress(interaction, progressLog);
-            return;
-        }
+        let newestServerpackURL;
+        let currentServerPackURL;
+        let newestPackKey = newestServerPackID;
+        let currentPackKey = currentServerPackID;
+        const githubSource = githubServerPack.sourceFor(pack);
 
-        const newestServerpackURL = await curseforge.getFileLink(pack.modpackID, newestServerPackID);
-        const currentServerPackURL = await curseforge.getFileLink(pack.modpackID, currentServerPackID);
+        if (githubSource && (newestServerPackID === null || currentServerPackID === null)) {
+            const github = await githubServerPacks(pack, githubSource, report);
+            if (!github) return;
+            newestServerpackURL = github.newest.url;
+            currentServerPackURL = github.current.url;
+            newestPackKey = `gh_${github.newest.tag}`;
+            currentPackKey = `gh_${github.current.tag}`;
+        } else {
+            // Re-check IDs after fallback attempt
+            if (newestServerPackID === null && currentServerPackID === null) {
+                progressLog += `\n- Could not find server pack IDs for **both** the current version (${pack.fileID}) and the new version (${pack.newestFileID}) even after checking additional files. Aborting update.`;
+                await editProgress(interaction, progressLog);
+                return;
+            } else if (newestServerPackID === null) {
+                progressLog += `\n- Could not find server pack ID for the new version (${pack.newestFileID}) even after checking additional files. Aborting update.`;
+                await editProgress(interaction, progressLog);
+                return;
+            } else if (currentServerPackID === null) {
+                progressLog += `\n- Could not find server pack ID for the current version (${pack.fileID}) even after checking additional files. Aborting update.`;
+                await editProgress(interaction, progressLog);
+                return;
+            }
+
+            newestServerpackURL = await curseforge.getFileLink(pack.modpackID, newestServerPackID);
+            currentServerPackURL = await curseforge.getFileLink(pack.modpackID, currentServerPackID);
+        }
 
         safeRm(`./${pack.tag}`);
 
         progressLog += `\n- Downloading new server pack...`;
         await editProgress(interaction, progressLog);
-        await download(newestServerpackURL, `./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`);
+        await download(newestServerpackURL, `./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`);
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Downloading reference server pack...`;
         await editProgress(interaction, progressLog);
-        await download(currentServerPackURL, `./${pack.tag}/downloads/old/${pack.tag}_${currentServerPackID}.zip`);
+        await download(currentServerPackURL, `./${pack.tag}/downloads/old/${pack.tag}_${currentPackKey}.zip`);
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Decompressing new pack files...`;
         await editProgress(interaction, progressLog);
-        await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`, `./${pack.tag}/compare/new`);
+        await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`, `./${pack.tag}/compare/new`);
         await checkMods(`./${pack.tag}/compare/new`);
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
         progressLog += ` Done!\n- Decompressing reference pack files...`;
         await editProgress(interaction, progressLog);
-        await decompress(`./${pack.tag}/downloads/old/${pack.tag}_${currentServerPackID}.zip`, `./${pack.tag}/compare/old`);
+        await decompress(`./${pack.tag}/downloads/old/${pack.tag}_${currentPackKey}.zip`, `./${pack.tag}/compare/old`);
         await checkMods(`./${pack.tag}/compare/old`);
 
         for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        const packZip = `./${pack.tag}/downloads/new/${pack.tag}_${newestServerPackID}.zip`;
+        const packZip = `./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`;
         const diskError = checkDiskSpace(packZip, allServerIds.length) || await checkVolumeSpace(fileSize(packZip), allServerIds);
         if (diskError) {
             progressLog += `\n\n**Aborting: ${diskError} Nothing was touched.**`;
@@ -1030,6 +1139,16 @@ module.exports = {
         if (!preflight) return;
         const bump = preflight.bump;
 
+        // Before the stop, so a panel that cannot list the root costs no downtime
+        let rootLists;
+        try {
+            rootLists = await rootListsPerInstance(allServerIds, toCompressList, report);
+        } catch (error) {
+            progressLog += `\n\n**Aborting: ${error.message}. Nothing was touched.**`;
+            await editProgress(interaction, progressLog);
+            return;
+        }
+
         const syncFreeze = await freezeAndShutdown(pack, allServerIds, { reason: `update ${pack.tag} ${newVersionNumber}` }, report);
 
         // PHASE A - back up every instance before anything destructive happens
@@ -1039,7 +1158,7 @@ module.exports = {
 
         let archives;
         try {
-            archives = await backupAllInstances(pack, allServerIds, toCompressList, vaultFileName, protectedFiles);
+            archives = await backupAllInstances(pack, allServerIds, rootLists, vaultFileName, protectedFiles);
         } catch (error) {
             sessionLogger.error('UpdateManager', 'Backup phase failed:', error.message);
             progressLog += `\n\n**Aborting: backup failed (${error.message}). Server files are untouched, starting everything back up.**`;
@@ -1077,7 +1196,7 @@ module.exports = {
                     applyMerge: async () => merger.merge(`./${pack.tag}`, changeList),
                     protectedFiles,
                     zipName: `update_${pack.tag}_${sid}_${pack.newestFileID}.zip`,
-                    deleteList: toCompressList,
+                    deleteList: rootLists[sid],
                     extraTree: loaderPayload(bump, sid),
                     inspect: async (dir) => {
                         const customChanges = await comparator.findCustomChanges(dir, `./${pack.tag}/compare/old`);
