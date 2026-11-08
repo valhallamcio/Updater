@@ -207,7 +207,7 @@ module.exports = {
 
     /**
      * @param {object} interaction The slash command.
-     * @param {object} deps Injectable for tests: servers (the server list), run (runOnInstance).
+     * @param {object} deps Injectable for tests: servers (the server list), run (runOnInstance), sendCommand.
      */
     async execute(interaction, deps = {}) {
         const query = interaction.options.getString('server');
@@ -222,8 +222,11 @@ module.exports = {
             await interaction.reply(`Sent \`${command}\` to **all** servers! 🚀`);
             return;
         } else if (query === 'Bifrost') {
-            sendCommand(velocityID, command);
-            await interaction.reply(`Sent \`${command}\` to **Bifrost**! 🚀`);
+            // The proxy console has no slash commands: "/ban x" finds no command and prints the help.
+            // Backend consoles and the link op strip one slash themselves, so they get the line as typed.
+            const line = command.replace(/^\/+/, '');
+            (deps.sendCommand || sendCommand)(velocityID, line);
+            await interaction.reply(`Sent \`${line}\` to **Bifrost**! 🚀`);
 
         } else {
             // A tag names every instance of the pack. An id or an instance name names one.

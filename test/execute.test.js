@@ -162,3 +162,16 @@ test('runOnInstance: no link session goes to the console, and its errors are rep
     const slow = await runOnInstance(EVOL[2], 'list', { ...deps, consoleTimeoutMs: 5, sendAdvancedCommand: () => new Promise(() => {}) });
     assert.strictEqual(slow.timedOut, true);
 });
+
+test('execute: Bifrost gets the line without leading slashes, and the reply shows what was sent', async () => {
+    const sent = [];
+    const fake = fakeInteraction('Bifrost', '//ban xyuhdxes griefing');
+    await executeCommand.execute(fake.interaction, {
+        servers: SERVERS,
+        run: async () => { throw new Error('must not be called'); },
+        sendCommand: (id, line) => { sent.push([id, line]); }
+    });
+    const { velocityID } = require('../config/config.json').pterodactyl;
+    assert.deepStrictEqual(sent, [[velocityID, 'ban xyuhdxes griefing']]);
+    assert.strictEqual(fake.replies[0], 'Sent `ban xyuhdxes griefing` to **Bifrost**! 🚀');
+});
