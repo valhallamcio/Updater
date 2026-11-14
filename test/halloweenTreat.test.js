@@ -11,7 +11,7 @@
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert');
 const treat = require('../modules/halloweenTreat');
-const command = require('../discord/commands/treat');
+const command = require('../discord/retired-commands/treat');
 
 const NOW = Date.parse('2026-10-28T12:00:00Z');
 const MINUTE = 60 * 1000;

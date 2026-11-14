@@ -17,7 +17,7 @@ const mongo = require('../../modules/mongo');
 const yggdrasil = require('../../modules/yggdrasil');
 const { normalizeUuid } = require('../../modules/uuidUtils');
 const haunted = require('../../modules/hauntedWrapped');
-const linkFlow = require('./util/linkFlow');
+const linkFlow = require('../commands/util/linkFlow');
 
 const cooldowns = new Map();
 const COOLDOWN_MS = 30 * 1000;

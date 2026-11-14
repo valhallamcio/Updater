@@ -13,7 +13,7 @@ const { SlashCommandBuilder } = require('discord.js');
 const mongo = require('../../modules/mongo');
 const sessionLogger = require('../../modules/sessionLogger');
 const { createTreat } = require('../../modules/halloweenTreat');
-const linkFlow = require('./util/linkFlow');
+const linkFlow = require('../commands/util/linkFlow');
 
 const LOG = 'Treat';
 
