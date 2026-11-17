@@ -206,7 +206,10 @@ module.exports = {    /**
      */
     getVersion: function (versionString) {
 
-        const versionRegex = /(\bv\d+[a-zA-Z]*\b|v\d+[a-zA-Z]*|\d+\.\d+\.\d+([a-zA-Z_]\w*)?|\d+\.\d+([a-zA-Z_]\w*)?)($|\s|\.zip)/g;
+        // The version must end the name or sit before a space, : ; , ) ] or .zip (a lookahead, so the
+        // separator is not part of the match). "Fantasy MC Fabric 1.9.0: Holy Affairs" used to give null,
+        // and the null modpack_version made the post-update Yggdrasil PATCH fail with 400 (fmcf 2026-11-17).
+        const versionRegex = /(\bv\d+[a-zA-Z]*\b|v\d+[a-zA-Z]*|\d+\.\d+\.\d+([a-zA-Z_]\w*)?|\d+\.\d+([a-zA-Z_]\w*)?)(?=$|[\s:;,)\]]|\.zip)/g;
 
         if (typeof versionString !== 'string') return null;
 

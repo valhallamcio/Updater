@@ -45,6 +45,15 @@ test('getVersion tolerates non-string input', () => {
     assert.strictEqual(functions.getVersion('Pack v1.2.3.zip'), '1.2.3');
 });
 
+test('getVersion takes a version followed by punctuation', () => {
+    assert.strictEqual(functions.getVersion('Fantasy MC Fabric 1.9.0: Holy Affairs'), '1.9.0');
+    assert.strictEqual(functions.getVersion('Pack 1.2.0, beta'), '1.2.0');
+    assert.strictEqual(functions.getVersion('Pack [1.4.0]'), '1.4.0');
+    assert.strictEqual(functions.getVersion('Pack 1.0.3 (hotfix)'), '1.0.3');
+    assert.strictEqual(functions.getVersion('Contained_Opolis-6.6'), '6.6');
+    assert.strictEqual(functions.getVersion('Arcadia Shadowfall-v1.2.0'), '1.2.0');
+});
+
 test('updateCheck skips unsupported platforms and survives per-server failures', async () => {
     const n = await updateCheck();
     assert.strictEqual(n, 1, 'only the real update is counted');
