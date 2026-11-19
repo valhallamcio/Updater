@@ -87,6 +87,7 @@ schedulers/       # Auto-discovered background tasks (plugin architecture)
      - `rebootScheduler.js` - Scheduled server reboots
      - `serverStatusMonitor.js` - Live Discord status embeds
      - `tabConfigUpdater.js` - Tab list configuration updates with backups
+     - `imageScamFilter.js` - Scores guild image posts with SubQ Snap (`modules/scamImages.js`, `modules/subq.js`, key `SUBQ_API_KEY`); a hit deletes, times out, sweeps the author's burst and posts a card. `scripts/scam-image-eval.js` scores a folder with the same request
 
 ## Critical Architecture Concepts
 
@@ -337,7 +338,7 @@ await webhook.sendEmbed(webhookUrl, {
 - All schedulers can be independently enabled/disabled via config
 - The three-way comparison is critical for preserving admin customizations
 - Never skip backups - they're the only way to recover from failed updates
-- Discord bot uses minimal intents (GatewayIntentBits.Guilds only)
+- Discord bot intents: Guilds and GuildVoiceStates. GuildMessages and MessageContent are added only while `scheduler.imageScamFilter.active` is true (read at boot)
 - Server shutdown is required before file operations to prevent corruption
 - Temporary directories under `./[tag]/` are cleaned up after successful updates
 - The `requiresUpdate` flag in MongoDB is set by `checkForUpdates` scheduler

@@ -14,6 +14,7 @@ const {
     Client,
     GatewayIntentBits
 } = require('discord.js');
+const config = require('../config/config.json');
 const commands = require('./commands');
 const events = require('./events');
 const sessionLogger = require('../modules/sessionLogger');
@@ -22,11 +23,18 @@ require('dotenv').config();
 
 const token = process.env.DISCORD_TOKEN;
 
-const client = new Client({
-    // GuildVoiceStates is what the voiceChannels scheduler reconciles on - without
-    // it the member count of a voice channel is always zero.
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
-});
+// GuildVoiceStates is what the voiceChannels scheduler reconciles on - without
+// it the member count of a voice channel is always zero.
+const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
+// The image scam filter reads every guild message. Attachments and embeds come empty
+// without MessageContent, a privileged intent: the Fenrir app has it on (the "limited"
+// flag, for bots in under 100 guilds).
+const scamFilter = config.scheduler && config.scheduler.imageScamFilter;
+if (scamFilter && scamFilter.active) {
+    intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+}
+
+const client = new Client({ intents });
 
 module.exports = {
     launchBot: async function () {
