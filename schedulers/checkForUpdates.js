@@ -102,10 +102,20 @@ async function checkServer(server) {
         throw new Error(`could not resolve latest version id for modpack ${server.modpackID} on ${server.platform}`);
     }
 
+    const newVersionNumber = server.fileID === newestUpdateId
+        ? null
+        : (functions.getVersion(packManifest && packManifest.name) || 'unknown');
+    // A pack updated outside /update (kit or by hand) keeps its old fileID while
+    // modpackVersion already shows the new version. Same version = up to date:
+    // sync fileID, no staff alert (GTNH fleet "v2.9.1 -> v2.9.1", 2026-11-22).
+    const sameVersion = newVersionNumber !== null && newVersionNumber !== 'unknown'
+        && server.modpackVersion != null && String(server.modpackVersion) === newVersionNumber;
+
     if (server.fileID === newestUpdateId) {
         sessionLogger.info('CheckForUpdates', `No updates found for ${server.name}.`);
+    } else if (sameVersion) {
+        sessionLogger.warn('CheckForUpdates', `${server.name} is on v${newVersionNumber} with stale fileID ${server.fileID}; syncing to ${newestUpdateId}, no alert.`);
     } else {
-        const newVersionNumber = functions.getVersion(packManifest && packManifest.name) || 'unknown';
 
         sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
         updateRequired = true;
@@ -131,10 +141,9 @@ async function checkServer(server) {
         }
     }
 
-    await yggdrasil.updateServer(server.tag, {
-        newestFileID: newestUpdateId,
-        requiresUpdate: updateRequired
-    });
+    const fields = { newestFileID: newestUpdateId, requiresUpdate: updateRequired };
+    if (sameVersion) fields.fileID = newestUpdateId;
+    await yggdrasil.updateServer(server.tag, fields);
 
     return updateRequired ? 1 : 0;
 }

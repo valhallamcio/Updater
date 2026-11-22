@@ -15,6 +15,7 @@ const servers = [
     { tag: 'mecm', name: 'No Platform', platform: '', modpackID: 2, fileID: 20, newestFileID: 20, modpackVersion: '1.0' },
     { tag: 'boom', name: 'API Down', platform: 'feedthebeast', modpackID: 3, fileID: 30, newestFileID: 30, modpackVersion: '1.0' },
     { tag: 'upd', name: 'Has Update', platform: 'curseforge', modpackID: 4, fileID: 40, newestFileID: 40, modpackVersion: '1.0' },
+    { tag: 'same', name: 'Hand Updated', platform: 'gregtechnewhorizons', modpackID: 5, fileID: 50, newestFileID: 50, modpackVersion: '2.9.1' },
 ];
 
 stub('modules/yggdrasil.js', {
@@ -22,11 +23,11 @@ stub('modules/yggdrasil.js', {
     updateServer: async (tag, fields) => { patches.push({ tag, ...fields }); },
 });
 stub('modules/curseforge.js', {
-    getLatestVersionId: async (id) => (id === 4 ? 41 : 10),
+    getLatestVersionId: async (id) => (id === 4 ? 41 : id === 5 ? 51 : 10),
     getPackData: async () => ({ logo: { url: 'x' }, slug: 's' }),
 });
 stub('modules/modpacksch.js', {
-    getCFPackManifest: async (id, ver) => (id === 4 ? { name: 'Has Update 1.1.zip' } : {}),
+    getCFPackManifest: async (id, ver) => (id === 4 ? { name: 'Has Update 1.1.zip' } : id === 5 ? { name: 'GT New Horizons 2.9.1' } : {}),
     getLatestFTBVersionId: async () => { throw new Error('ftb api down'); },
     getFTBPackManifest: async () => ({}),
     getFTBPackData: async () => ({ art: [{ url: 'x' }] }),
@@ -60,5 +61,6 @@ test('updateCheck skips unsupported platforms and survives per-server failures',
     assert.deepStrictEqual(patches, [
         { tag: 'ok', newestFileID: 10, requiresUpdate: false },
         { tag: 'upd', newestFileID: 41, requiresUpdate: true },
-    ], 'unsupported/failed servers are never PATCHed');
+        { tag: 'same', newestFileID: 51, requiresUpdate: false, fileID: 51 },
+    ], 'unsupported/failed servers are never PATCHed; same version syncs fileID');
 });
