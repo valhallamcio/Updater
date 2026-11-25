@@ -14,6 +14,7 @@ const curseforge = require("../modules/curseforge");
 const modpacksch = require("../modules/modpacksch");
 const yggdrasil = require("../modules/yggdrasil");
 const functions = require("../modules/functions");
+const { compareVersions } = require("../modules/modloader");
 const {
     EmbedBuilder
 } = require("discord.js");
@@ -70,6 +71,19 @@ module.exports = {
 const SUPPORTED_PLATFORMS = new Set(["curseforge", "gregtechnewhorizons", "feedthebeast"]);
 
 /**
+ * Orders the platform's newest version against the installed one.
+ * @returns {number|null} -1, 0 or 1. Null when either side does not start with a digit
+ *   ('unknown', a pack name), so an unreadable version still alerts.
+ */
+function compareToInstalled(latest, installed) {
+    if (installed == null) return null;
+    const a = String(latest).trim().replace(/^v/i, '');
+    const b = String(installed).trim().replace(/^v/i, '');
+    if (!/^\d/.test(a) || !/^\d/.test(b)) return null;
+    return compareVersions(a, b);
+}
+
+/**
  * Checks a single server for updates and syncs newestFileID/requiresUpdate to Yggdrasil.
  * @param {object} server Server doc from Yggdrasil.
  * @returns {Promise<number>} 1 if an update is available, 0 otherwise.
@@ -108,13 +122,18 @@ async function checkServer(server) {
     // A pack updated outside /update (kit or by hand) keeps its old fileID while
     // modpackVersion already shows the new version. Same version = up to date:
     // sync fileID, no staff alert (GTNH fleet "v2.9.1 -> v2.9.1", 2026-11-22).
-    const sameVersion = newVersionNumber !== null && newVersionNumber !== 'unknown'
-        && server.modpackVersion != null && String(server.modpackVersion) === newVersionNumber;
+    // Older version = no alert either. GTNH went to 2.9.2 from GitHub, then CF got
+    // a 2.9.1 re-upload as its newest file ("v2.9.2 -> v2.9.1" x8, 2026-11-25).
+    const versionOrder = newVersionNumber === null ? null : compareToInstalled(newVersionNumber, server.modpackVersion);
+    const sameVersion = versionOrder === 0;
+    const olderVersion = versionOrder !== null && versionOrder < 0;
 
     if (server.fileID === newestUpdateId) {
         sessionLogger.info('CheckForUpdates', `No updates found for ${server.name}.`);
     } else if (sameVersion) {
         sessionLogger.warn('CheckForUpdates', `${server.name} is on v${newVersionNumber} with stale fileID ${server.fileID}; syncing to ${newestUpdateId}, no alert.`);
+    } else if (olderVersion) {
+        sessionLogger.info('CheckForUpdates', `${server.name} is on v${server.modpackVersion}; newest file ${newestUpdateId} is older (v${newVersionNumber}), no alert.`);
     } else {
 
         sessionLogger.info('CheckForUpdates', `Update found for ${server.name}! (v${server.modpackVersion} -> v${newVersionNumber})`);
