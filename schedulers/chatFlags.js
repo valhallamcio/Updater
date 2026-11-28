@@ -77,7 +77,7 @@ const DECIDED = {
     dismissed: 'Dismissed'
 };
 const SOURCE = { hardlist: 'Hard word list', symbol: 'Hate symbol', jev: 'AI filter' };
-const SCORES = ['hate', 'harass', 'threat', 'selfharm'];
+const SCORES = ['hate', 'harass', 'threat', 'selfharm', 'sexual', 'doxx'];
 // Characters for the context lines on a card with no window.
 const CONTEXT_MAX = 3400;
 // A card with a window: the player's lines get up to OWN_LINES_MAX, and the window gets
@@ -184,7 +184,7 @@ function linesPart(heading, part) {
 
 /**
  * The classifier scores as whole percentages.
- * @param {object|null} scores `{hate, harass, threat, selfharm}` from 0 to 1, or null.
+ * @param {object|null} scores `{hate, harass, threat, selfharm, sexual, doxx}` from 0 to 1, or null. A flag filed before a rule existed lacks its key.
  * @returns {string} One line for the card.
  */
 function formatScores(scores) {

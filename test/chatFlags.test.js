@@ -228,7 +228,7 @@ test('an open flag is posted once, with the player, the scores and the context o
 
     const review = sent[1].embeds[0].toJSON();
     assert.strictEqual(review.title, 'Chat flag: needs review');
-    assert.strictEqual(fields(review).get('Scores'), 'hate 61%, harass 20%, threat 3%, selfharm 0%');
+    assert.strictEqual(fields(review).get('Scores'), 'hate 61%, harass 20%, threat 3%, selfharm 0%, sexual n/a, doxx n/a');
     assert.strictEqual(fields(review).get('Source'), 'AI filter');
     assert.deepStrictEqual(buttonIds(sent[1]), ['chatflag:mute:flag-2', 'chatflag:ban:flag-2', 'chatflag:dismiss:flag-2']);
 
