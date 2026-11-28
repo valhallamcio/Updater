@@ -86,6 +86,37 @@ module.exports = {
     },
 
     /**
+     * Gets the data of many files in one request (any mod or pack).
+     * @param {Array<number>} fileIds CurseForge file ids.
+     * @returns {Promise<Array>} File data, in no set order. Ids CurseForge does not know are missing.
+     * @throws On any request error. A server pack build must not go on with half the data.
+     */
+    getFiles: async function (fileIds) {
+        const response = await axios.post('https://api.curseforge.com/v1/mods/files', {
+            fileIds
+        }, {
+            headers: header
+        });
+        return response.data.data;
+    },
+
+    /**
+     * Gets the data of many mods in one request (name, slug, classId).
+     * @param {Array<number>} modIds CurseForge mod (project) ids.
+     * @returns {Promise<Array>} Mod data, in no set order. Ids CurseForge does not know are missing.
+     * @throws On any request error.
+     */
+    getMods: async function (modIds) {
+        const response = await axios.post('https://api.curseforge.com/v1/mods', {
+            modIds,
+            filterPcOnly: false
+        }, {
+            headers: header
+        });
+        return response.data.data;
+    },
+
+    /**
      * Gets the fileId of the server pack file.
      * @param {number} modPackId Id of the modpack on CurseForge.
      * @param {number} versionId Version of the modpack file.

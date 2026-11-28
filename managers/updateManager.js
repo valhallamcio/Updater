@@ -26,6 +26,7 @@ const {
 } = require('../modules/functions');
 const curseforge = require('../modules/curseforge');
 const githubServerPack = require('../modules/githubServerPack');
+const cfClientServerPack = require('../modules/cfClientServerPack');
 const {
     download,
     downloadList,
@@ -56,7 +57,8 @@ const playerSync = require('../modules/playerSync');
 const sessionLogger = require('../modules/sessionLogger');
 const {
     active,
-    announcementChannelId
+    announcementChannelId,
+    staffChannelId
 } = require("../config/config.json").discord;
 
 
@@ -938,6 +940,105 @@ async function githubServerPacks(pack, source, report, deps = {}) {
 }
 
 /**
+ * Where updateCF takes its two server packs from. CurseForge when both versions have one.
+ * Otherwise the configured source supplies both sides, so the two compare roots share one
+ * layout. An unknown source type goes the GitHub way, which reports it as a bad source.
+ * @param {object|null} source Raw source from serverPackSources (see githubServerPack.sourceFor).
+ * @param {number|null} newestServerPackID CurseForge server pack id of the new version.
+ * @param {number|null} currentServerPackID CurseForge server pack id of the current version.
+ * @returns {'curseforge'|'github'|'cf-client'|'missing'}
+ */
+function serverPackOrigin(source, newestServerPackID, currentServerPackID) {
+    if (newestServerPackID !== null && currentServerPackID !== null) return 'curseforge';
+    if (!source) return 'missing';
+    return source.type === 'cf-client' ? 'cf-client' : 'github';
+}
+
+/**
+ * Builds the new and the reference server packs from the CurseForge client packs
+ * (modules/cfClientServerPack), before the stop.
+ * @param {object} pack Server doc.
+ * @param {Array} exclude The source's exclude list.
+ * @param {object} zips {newest, current}: where each zip goes.
+ * @param {function} report Appends a line to the progress log.
+ * @param {object} [deps] {builder} for tests.
+ * @returns {Promise<boolean>} false after the abort was reported.
+ */
+async function buildClientServerPacks(pack, exclude, zips, report, deps = {}) {
+    const builder = deps.builder || cfClientServerPack;
+    const sides = [['new', pack.newestFileID, zips.newest], ['reference', pack.fileID, zips.current]];
+    for (const [label, fileId, zip] of sides) {
+        await report(`\n- Building the ${label} server pack from client pack file ${fileId}...`);
+        let built;
+        try {
+            built = await builder.build(pack.modpackID, fileId, zip, { exclude });
+        } catch (error) {
+            sessionLogger.error('UpdateManager', `Client server pack build of ${pack.tag} file ${fileId} failed:`, error.message);
+            await report(` **FAILED: ${error.message}.** Aborting update, nothing was touched.`);
+            return false;
+        }
+        const skipped = built.skipped.map(s => `${s.fileName} (${s.reasons.join(', ')})`);
+        sessionLogger.info('UpdateManager', `${pack.tag} file ${fileId}: ${built.kept.length} mod file(s) kept, skipped: ${skipped.join('; ') || 'none'}`);
+        if (built.unusedExclude.length > 0) {
+            sessionLogger.warn('UpdateManager', `${pack.tag} file ${fileId}: exclude entries that match nothing: ${built.unusedExclude.join(', ')}`);
+        }
+        await report(` Done! ${built.kept.length} mod file(s), ${built.skipped.length} skipped.`);
+    }
+    return true;
+}
+
+/**
+ * True when every instance of the update is marked unreleased. Same rule as the role
+ * assigner's hidden packs: one released instance makes the pack public.
+ * @param {Array<string>} serverIds Every instance the update ran on.
+ * @param {Array<string>} unreleasedServerIds serverIds of the docs with unreleased: true.
+ * @returns {boolean}
+ */
+function isHiddenPack(serverIds, unreleasedServerIds) {
+    const unreleased = new Set(unreleasedServerIds);
+    return serverIds.length > 0 && serverIds.every(sid => unreleased.has(sid));
+}
+
+/**
+ * Posts the update announcement. A hidden pack carries a code name, so it gets a short note
+ * in the staff channel instead of the public post and its role ping. The Yggdrasil API drops
+ * the unreleased field, so the ids come from bifrost.servers. When that read fails the note
+ * goes to staff too: a held announcement costs less than a leaked code name.
+ * @param {object} pack Server doc.
+ * @param {Array<string>} allServerIds Every instance the update ran on.
+ * @param {object} message The public webhook message.
+ * @param {object} versions {oldVersion, newVersion} for the staff note.
+ * @param {object} [deps] {sendWebhook, findUnreleasedServerIds, announcementChannelId, staffChannelId} for tests.
+ * @returns {Promise<'public'|'staff'>} Where the post went.
+ */
+async function announceUpdate(pack, allServerIds, message, versions, deps = {}) {
+    const send = deps.sendWebhook || sendWebhook;
+    const findUnreleased = deps.findUnreleasedServerIds || (() => require('../modules/mongo').findUnreleasedServerIds());
+    let hidden = null;
+    let readError = null;
+    try {
+        hidden = isHiddenPack(allServerIds, await findUnreleased());
+    } catch (error) {
+        readError = error;
+        sessionLogger.warn('UpdateManager', `Could not read the unreleased servers for ${pack.tag}: ${error.message}`);
+    }
+    if (hidden === false) {
+        await send(deps.announcementChannelId || announcementChannelId, message);
+        return 'public';
+    }
+    const why = readError
+        ? `The unreleased servers could not be read (${readError.message}), so the public announcement was held.`
+        : 'Every instance is unreleased, so there is no public announcement.';
+    await send(deps.staffChannelId || staffChannelId, {
+        content: `**${pack.name}** (\`${pack.tag}\`) updated ${versions.oldVersion} -> ${versions.newVersion}. ${why}`,
+        allowedMentions: { parse: [] },
+        username: message.username,
+        avatarURL: message.avatarURL
+    });
+    return 'staff';
+}
+
+/**
  * Mentions an update announcement may ping: the pack's own role and nothing else, so a
  * mention smuggled into a version or pack name from upstream stays plain text.
  * @param {object} pack Server doc.
@@ -974,6 +1075,10 @@ module.exports = {
         switchLoader,
         changedJars,
         githubServerPacks,
+        serverPackOrigin,
+        buildClientServerPacks,
+        isHiddenPack,
+        announceUpdate,
         presentRootNames,
         rootListsPerInstance,
         BOOT_WATCH_TIMEOUT_MS,
@@ -1043,10 +1148,22 @@ module.exports = {
         let currentServerPackURL;
         let newestPackKey = newestServerPackID;
         let currentPackKey = currentServerPackID;
-        const githubSource = githubServerPack.sourceFor(pack);
+        const packSource = githubServerPack.sourceFor(pack);
+        const origin = serverPackOrigin(packSource, newestServerPackID, currentServerPackID);
+        let clientExclude = null;
 
-        if (githubSource && (newestServerPackID === null || currentServerPackID === null)) {
-            const github = await githubServerPacks(pack, githubSource, report);
+        if (origin === 'cf-client') {
+            try {
+                clientExclude = cfClientServerPack.parseSource(packSource).exclude;
+            } catch (error) {
+                await report(`\n- Bad server pack source for ${pack.tag}: ${error.message}. Aborting update, nothing was touched.`);
+                return;
+            }
+            await report(`\n- No CurseForge server pack for one or both versions, so both are built from the client packs.`);
+            newestPackKey = `client-${pack.newestFileID}`;
+            currentPackKey = `client-${pack.fileID}`;
+        } else if (origin === 'github') {
+            const github = await githubServerPacks(pack, packSource, report);
             if (!github) return;
             newestServerpackURL = github.newest.url;
             currentServerPackURL = github.current.url;
@@ -1074,19 +1191,33 @@ module.exports = {
 
         safeRm(`./${pack.tag}`);
 
-        progressLog += `\n- Downloading new server pack...`;
-        await editProgress(interaction, progressLog);
-        await download(newestServerpackURL, `./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`);
+        if (clientExclude) {
+            const built = await buildClientServerPacks(pack, clientExclude, {
+                newest: `./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`,
+                current: `./${pack.tag}/downloads/old/${pack.tag}_${currentPackKey}.zip`
+            }, report);
+            if (!built) {
+                safeRm(`./${pack.tag}`);
+                return;
+            }
 
-        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+            for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+        } else {
+            progressLog += `\n- Downloading new server pack...`;
+            await editProgress(interaction, progressLog);
+            await download(newestServerpackURL, `./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`);
 
-        progressLog += ` Done!\n- Downloading reference server pack...`;
-        await editProgress(interaction, progressLog);
-        await download(currentServerPackURL, `./${pack.tag}/downloads/old/${pack.tag}_${currentPackKey}.zip`);
+            for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
 
-        for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+            progressLog += ` Done!\n- Downloading reference server pack...`;
+            await editProgress(interaction, progressLog);
+            await download(currentServerPackURL, `./${pack.tag}/downloads/old/${pack.tag}_${currentPackKey}.zip`);
 
-        progressLog += ` Done!\n- Decompressing new pack files...`;
+            for (const sid of allServerIds) await pterodactyl.sendCommand(sid, alert);
+            progressLog += ` Done!`;
+        }
+
+        progressLog += `\n- Decompressing new pack files...`;
         await editProgress(interaction, progressLog);
         await decompress(`./${pack.tag}/downloads/new/${pack.tag}_${newestPackKey}.zip`, `./${pack.tag}/compare/new`);
         await checkMods(`./${pack.tag}/compare/new`);
@@ -1269,7 +1400,7 @@ module.exports = {
             avatarURL: packData.logo.url,
         };
 
-        await sendWebhook(announcementChannelId, updateWebhook);
+        await announceUpdate(pack, allServerIds, updateWebhook, { oldVersion: pack.modpackVersion, newVersion: newVersionNumber });
 
         // In-game "pack updated" card for players who join on the old client version.
         // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
@@ -1494,7 +1625,7 @@ module.exports = {
             avatarURL: packData.art[0].url,
         };
 
-        await sendWebhook(announcementChannelId, updateWebhook);
+        await announceUpdate(pack, allServerIds, updateWebhook, { oldVersion: pack.modpackVersion, newVersion: newVersionNumber });
 
         // In-game "pack updated" card for players who join on the old client version.
         // Fire-and-forget on purpose: it swallows its own errors and never delays an update.
@@ -1937,7 +2068,7 @@ module.exports = {
         };
 
         if (active) {
-            await sendWebhook(announcementChannelId, updateWebhook);
+            await announceUpdate(pack, allServerIds, updateWebhook, { oldVersion: currentVersion, newVersion: newestVersion });
         }
 
         // In-game "pack updated" card for players who join on the old client version.
@@ -2245,7 +2376,7 @@ module.exports = {
         };
 
         if (active) {
-            await sendWebhook(announcementChannelId, updateWebhook);
+            await announceUpdate(pack, allServerIds, updateWebhook, { oldVersion: currentVersion, newVersion: newestVersion });
         }
 
         // In-game "pack updated" card for players who join on the old client version.
