@@ -15,6 +15,7 @@ const {
     EmbedBuilder
 } = require('discord.js');
 const yggdrasil = require('../../modules/yggdrasil');
+const { isPrivateServer, publicServers } = require('../../modules/privateServers');
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -22,7 +23,8 @@ module.exports = {
         .setDescription('Shows online players!'),
     async execute(interaction) {
         await interaction.deferReply();
-        const servers = await yggdrasil.getServers();
+        const allServers = await yggdrasil.getServers();
+        const servers = publicServers(allServers);
         const rawData = await yggdrasil.getPlayersDetailed();
 
         const embed = new EmbedBuilder()
@@ -33,7 +35,11 @@ module.exports = {
         let onlineCount = 0;
 
         const tagGroups = {};
-        for (const [tag, players] of Object.entries(rawData)) {
+        for (const [tag, listed] of Object.entries(rawData)) {
+            // A player on a private instance is not on Discord at all.
+            const privateCopies = allServers.filter(s => s.tag === tag && isPrivateServer(s));
+            const players = privateCopies.length === 0 ? listed : listed.filter(p =>
+                !privateCopies.some(s => s.name === p.instance || s.id === p.instance || s.serverId === p.instance));
             if (players.length === 0) continue;
             // A tag can have several docs (supporter-split packs ship a hidden
             // `...SUP` early-access copy alongside the public copy). Pick the

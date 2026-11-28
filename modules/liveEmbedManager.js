@@ -2,6 +2,7 @@ const { EmbedBuilder } = require('discord.js');
 const crypto = require('crypto');
 const mongo = require('./mongo');
 const yggdrasil = require('./yggdrasil');
+const { publicServers } = require('./privateServers');
 const sessionLogger = require('./sessionLogger');
 
 
@@ -133,7 +134,8 @@ async function removeEmbed(messageId) {
  * @param {Array} servers Array of server objects from Yggdrasil API.
  * @returns {EmbedBuilder} The generated embed.
  */
-function generateServerEmbed(servers) {
+function generateServerEmbed(allServers) {
+    const servers = publicServers(allServers);
     const embed = new EmbedBuilder()
         .setColor(0x9c59b6)
         .setTitle('Server List')
@@ -192,7 +194,8 @@ function generateServerEmbed(servers) {
  * Generates a hash of the current server state for change detection.
  */
 function generateServerStateHash(servers) {
-    const stateData = servers.map(server => ({
+    // A server that turns private leaves the list, so the hash changes and the embed is redrawn.
+    const stateData = publicServers(servers).map(server => ({
         tag: server.tag,
         name: server.name,
         modpackVersion: server.modpackVersion,

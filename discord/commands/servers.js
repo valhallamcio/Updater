@@ -16,6 +16,7 @@ const {
     EmbedBuilder
 } = require('discord.js');
 const yggdrasil = require('../../modules/yggdrasil');
+const { publicServers } = require('../../modules/privateServers');
 
 
 
@@ -24,7 +25,7 @@ module.exports = {
         .setName('servers')
         .setDescription('Shows online servers!'),
     async execute(interaction) {
-        const serverList = await yggdrasil.getServers();
+        const serverList = publicServers(await yggdrasil.getServers());
 
         const embed = new EmbedBuilder()
             .setColor(0x9c59b6)
